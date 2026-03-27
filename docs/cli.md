@@ -76,6 +76,63 @@ larql attention-walk google/gemma-3-4b-it -o attention.larql.json
 larql attention-walk google/gemma-3-4b-it --layer 12 -o attention-L12.larql.json
 ```
 
+### `larql vector-extract`
+
+Extract full weight vectors to intermediate NDJSON files for SurrealDB ingestion.
+
+```
+larql vector-extract <MODEL> --output <OUTPUT> [OPTIONS]
+```
+
+| Flag | Description |
+|---|---|
+| `<MODEL>` | Model path or HuggingFace model ID |
+| `-o, --output <OUTPUT>` | Output directory for `.vectors.jsonl` files |
+| `--components <COMPONENTS>` | Components to extract (comma-separated): `ffn_down`, `ffn_gate`, `ffn_up`, `attn_ov`, `attn_qk`, `embeddings` |
+| `--layers <LAYERS>` | Layers to extract (comma-separated). Default: all |
+| `--top-k <TOP_K>` | Top-k tokens for metadata per vector [default: 10] |
+| `--resume` | Resume from existing output files |
+
+**Examples:**
+
+```bash
+# Extract all components
+larql vector-extract google/gemma-3-4b-it -o vectors/
+
+# Extract only FFN down projections from layers 25-33
+larql vector-extract google/gemma-3-4b-it -o vectors/ \
+    --components ffn_down --layers 25,26,27,28,29,30,31,32,33
+```
+
+### `larql vector-load`
+
+Load extracted vectors into SurrealDB with HNSW indexes.
+
+```
+larql vector-load <INPUT> --ns <NS> --db <DB> [OPTIONS]
+```
+
+| Flag | Description |
+|---|---|
+| `<INPUT>` | Directory containing `.vectors.jsonl` files |
+| `--surreal <URL>` | SurrealDB endpoint [default: `http://localhost:8000`] |
+| `--ns <NS>` | SurrealDB namespace |
+| `--db <DB>` | SurrealDB database |
+| `--user <USER>` | Username [default: `root`] |
+| `--pass <PASS>` | Password [default: `root`] |
+| `--tables <TABLES>` | Tables to load (comma-separated). Default: all |
+| `--layers <LAYERS>` | Layers to load (comma-separated). Default: all |
+| `--batch-size <N>` | Batch size for INSERT transactions [default: 500] |
+| `--resume` | Resume interrupted load (skips completed layers) |
+| `--schema-only` | Create schema only (no data load) |
+
+**Examples:**
+
+```bash
+larql vector-load vectors/ --ns larql --db gemma3_4b
+larql vector-load vectors/ --ns larql --db gemma3_4b --layers 25,26,33 --batch-size 1000
+```
+
 ### `larql bfs`
 
 BFS extraction from a running model endpoint.

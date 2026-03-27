@@ -1,8 +1,12 @@
 //! Extract full vectors from model weight matrices to intermediate NDJSON files.
 //!
 //! Same safetensors loading and BLAS matmuls as weight_walker, but captures the
-//! full float vector alongside top-k token metadata. Output is one `.vectors.jsonl`
-//! file per component type (ffn_down, ffn_gate, etc.).
+//! full weight vector (hidden-dim) alongside top-k token metadata. Output is one
+//! `.vectors.jsonl` file per component type (ffn_down, ffn_gate, etc.).
+//!
+//! The stored vector is the raw weight direction (dim = hidden_size), NOT the
+//! vocab-projected logits. The vocab projection is computed only to derive
+//! top-k token metadata (same matmul as weight_walker).
 //!
 //! Zero forward passes. Pure matrix multiplication.
 
@@ -35,7 +39,7 @@ pub const ALL_COMPONENTS: &[&str] = &[
 pub struct VectorRecord {
     pub id: String,
     pub layer: usize,
-    pub index: usize,
+    pub feature: usize,
     pub vector: Vec<f32>,
     pub dim: usize,
     pub top_token: String,
@@ -44,12 +48,12 @@ pub struct VectorRecord {
     pub top_k: Vec<TopKEntry>,
 }
 
-/// A top-k token entry with score.
+/// A top-k token entry with logit score.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct TopKEntry {
     pub token: String,
     pub token_id: u32,
-    pub score: f32,
+    pub logit: f32,
 }
 
 /// Header line written as first line of each NDJSON file.
@@ -252,8 +256,9 @@ impl VectorExtractor {
 
     /// Extract FFN down vectors for a single layer.
     ///
-    /// W_down columns projected through the embedding give the output direction
-    /// of each feature — what it WRITES to the residual stream.
+    /// The stored vector is `w_down.column(feat)` — the raw weight direction in
+    /// hidden space (dim = hidden_size). The vocab projection (`embed @ w_down`)
+    /// is computed only to derive top-k token metadata.
     pub fn extract_ffn_down(
         &self,
         layer: usize,
@@ -268,11 +273,12 @@ impl VectorExtractor {
             .get(&format!("{prefix}down_proj.weight"))
             .ok_or_else(|| WalkerError::MissingTensor(format!("{prefix}down_proj.weight")))?;
 
+        // w_down shape: (hidden, intermediate)
         let n_features = w_down.shape()[1];
         callbacks.on_layer_start(COMPONENT_FFN_DOWN, layer, n_features);
 
-        // BLAS matmul: (vocab, hidden) @ (hidden, intermediate) → (vocab, intermediate)
-        let all_output = self.weights.embed.dot(w_down);
+        // Vocab projection for top-k metadata: (vocab, hidden) @ (hidden, intermediate) → (vocab, intermediate)
+        let logits = self.weights.embed.dot(w_down);
 
         let progress_interval = (n_features / 20).max(1);
         let mut count = 0;
@@ -282,41 +288,39 @@ impl VectorExtractor {
                 callbacks.on_progress(COMPONENT_FFN_DOWN, layer, feat_idx, n_features);
             }
 
-            // Full vector: the vocab-projected column for this feature
-            let vector: Vec<f32> = all_output.column(feat_idx).to_vec();
+            // Raw weight vector in hidden space (dim = hidden_size)
+            let vector: Vec<f32> = w_down.column(feat_idx).to_vec();
 
-            // Top-k tokens for metadata
-            let top_k_pairs = partial_top_k_column(&all_output, feat_idx, config.top_k);
+            // Top-k tokens from vocab projection
+            let top_k_pairs = partial_top_k_column(&logits, feat_idx, config.top_k);
             let top_k: Vec<TopKEntry> = top_k_pairs
                 .iter()
-                .filter_map(|&(idx, score)| {
+                .filter_map(|&(idx, logit)| {
                     decode_token(&self.tokenizer, idx as u32).map(|token| TopKEntry {
                         token,
                         token_id: idx as u32,
-                        score,
+                        logit,
                     })
                 })
                 .collect();
 
             let (top_token, top_token_id, c_score) = if let Some(first) = top_k.first() {
-                (first.token.clone(), first.token_id, first.score)
+                (first.token.clone(), first.token_id, first.logit)
             } else {
                 (String::new(), 0, 0.0)
             };
 
-            let record = VectorRecord {
+            writer.write_record(&VectorRecord {
                 id: format!("L{layer}_F{feat_idx}"),
                 layer,
-                index: feat_idx,
+                feature: feat_idx,
                 dim: vector.len(),
                 vector,
                 top_token,
                 top_token_id,
                 c_score,
                 top_k,
-            };
-
-            writer.write_record(&record)?;
+            })?;
             count += 1;
         }
 
@@ -326,8 +330,9 @@ impl VectorExtractor {
 
     /// Extract FFN gate vectors for a single layer.
     ///
-    /// W_gate rows projected through the embedding give the input direction
-    /// of each feature — what TRIGGERS it.
+    /// The stored vector is `w_gate.row(feat)` — the raw weight direction in
+    /// hidden space (dim = hidden_size). The vocab projection (`embed @ w_gate.T`)
+    /// is computed only to derive top-k token metadata.
     pub fn extract_ffn_gate(
         &self,
         layer: usize,
@@ -342,11 +347,12 @@ impl VectorExtractor {
             .get(&format!("{prefix}gate_proj.weight"))
             .ok_or_else(|| WalkerError::MissingTensor(format!("{prefix}gate_proj.weight")))?;
 
+        // w_gate shape: (intermediate, hidden)
         let n_features = w_gate.shape()[0];
         callbacks.on_layer_start(COMPONENT_FFN_GATE, layer, n_features);
 
-        // BLAS matmul: (vocab, hidden) @ (intermediate, hidden).T → (vocab, intermediate)
-        let all_input = self.weights.embed.dot(&w_gate.t());
+        // Vocab projection for top-k metadata: (vocab, hidden) @ (intermediate, hidden).T → (vocab, intermediate)
+        let logits = self.weights.embed.dot(&w_gate.t());
 
         let progress_interval = (n_features / 20).max(1);
         let mut count = 0;
@@ -356,41 +362,39 @@ impl VectorExtractor {
                 callbacks.on_progress(COMPONENT_FFN_GATE, layer, feat_idx, n_features);
             }
 
-            // Full vector: the vocab-projected column for this feature
-            let vector: Vec<f32> = all_input.column(feat_idx).to_vec();
+            // Raw weight vector in hidden space (dim = hidden_size)
+            let vector: Vec<f32> = w_gate.row(feat_idx).to_vec();
 
-            // Top-k tokens for metadata
-            let top_k_pairs = partial_top_k_column(&all_input, feat_idx, config.top_k);
+            // Top-k tokens from vocab projection
+            let top_k_pairs = partial_top_k_column(&logits, feat_idx, config.top_k);
             let top_k: Vec<TopKEntry> = top_k_pairs
                 .iter()
-                .filter_map(|&(idx, score)| {
+                .filter_map(|&(idx, logit)| {
                     decode_token(&self.tokenizer, idx as u32).map(|token| TopKEntry {
                         token,
                         token_id: idx as u32,
-                        score,
+                        logit,
                     })
                 })
                 .collect();
 
             let (top_token, top_token_id, c_score) = if let Some(first) = top_k.first() {
-                (first.token.clone(), first.token_id, first.score)
+                (first.token.clone(), first.token_id, first.logit)
             } else {
                 (String::new(), 0, 0.0)
             };
 
-            let record = VectorRecord {
+            writer.write_record(&VectorRecord {
                 id: format!("L{layer}_F{feat_idx}"),
                 layer,
-                index: feat_idx,
+                feature: feat_idx,
                 dim: vector.len(),
                 vector,
                 top_token,
                 top_token_id,
                 c_score,
                 top_k,
-            };
-
-            writer.write_record(&record)?;
+            })?;
             count += 1;
         }
 
@@ -399,6 +403,9 @@ impl VectorExtractor {
     }
 
     /// Orchestrate extraction of all requested components across requested layers.
+    ///
+    /// Returns `None` for unimplemented components so the caller can decide
+    /// how to report them (keeps eprintln out of core, same as weight_walker).
     pub fn extract_all(
         &self,
         config: &ExtractConfig,
@@ -416,6 +423,20 @@ impl VectorExtractor {
         };
 
         for component in &config.components {
+            // Skip unimplemented components
+            if !matches!(
+                component.as_str(),
+                COMPONENT_FFN_DOWN | COMPONENT_FFN_GATE
+            ) {
+                summaries.push(ComponentSummary {
+                    component: component.clone(),
+                    vectors_written: 0,
+                    output_path: output_dir.join(format!("{component}.vectors.jsonl")),
+                    elapsed_secs: 0.0,
+                });
+                continue;
+            }
+
             let file_path = output_dir.join(format!("{component}.vectors.jsonl"));
             let comp_start = std::time::Instant::now();
 
@@ -433,32 +454,30 @@ impl VectorExtractor {
                 .collect();
 
             if pending.is_empty() {
-                eprintln!("  {component}: all layers already completed, skipping");
+                summaries.push(ComponentSummary {
+                    component: component.clone(),
+                    vectors_written: 0,
+                    output_path: file_path,
+                    elapsed_secs: 0.0,
+                });
                 continue;
             }
 
             callbacks.on_component_start(component, pending.len());
 
             // Open writer (append for resume, create for fresh)
-            let mut writer = if resume && file_path.exists() {
-                let (w, existing) = VectorWriter::append(&file_path)?;
-                eprintln!(
-                    "  {component}: resuming ({} existing records, {} layers remaining)",
-                    existing,
-                    pending.len()
-                );
-                w
+            let (mut writer, _existing) = if resume && file_path.exists() {
+                VectorWriter::append(&file_path)?
             } else {
                 let mut w = VectorWriter::create(&file_path)?;
-                let header = VectorFileHeader {
+                w.write_header(&VectorFileHeader {
                     _header: true,
                     component: component.clone(),
                     model: self.model_name.clone(),
                     dimension: self.weights.hidden_size,
                     extraction_date: current_date(),
-                };
-                w.write_header(&header)?;
-                w
+                })?;
+                (w, 0)
             };
 
             let mut total_written = 0;
@@ -473,10 +492,7 @@ impl VectorExtractor {
                     COMPONENT_FFN_GATE => {
                         self.extract_ffn_gate(layer, config, &mut writer, callbacks)?
                     }
-                    other => {
-                        eprintln!("  {other}: not yet implemented, skipping");
-                        break;
-                    }
+                    _ => 0,
                 };
 
                 let elapsed_ms = layer_start.elapsed().as_secs_f64() * 1000.0;

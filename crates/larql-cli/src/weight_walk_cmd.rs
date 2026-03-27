@@ -7,6 +7,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use larql_core::walker::weight_walker::{LayerResult, WalkCallbacks, WalkConfig, WeightWalker};
 use larql_core::*;
 
+fn round4(v: f64) -> f64 {
+    (v * 10000.0).round() / 10000.0
+}
+
 #[derive(Args)]
 pub struct WeightWalkArgs {
     /// Model path or HuggingFace model ID (e.g. google/gemma-3-4b-it).
@@ -62,14 +66,15 @@ impl WalkCallbacks for ProgressCallbacks {
         self.bar.inc(1);
         let s = &result.stats;
         eprintln!(
-            "  L{:2}: {:6} edges  ({:.0}s)  conf: avg={:.4} max={:.4}  c_in={:.2} c_out={:.2}",
+            "  L{:2}: {:6} edges  ({:.0}s)  conf={:.4}  sel={:.4}  c_in={:.2}  c_out={:.2}  loops={:.1}%",
             result.layer,
             result.edges_found,
             result.elapsed_ms / 1000.0,
             s.mean_confidence,
-            s.max_confidence,
+            s.mean_selectivity,
             s.mean_c_in,
             s.mean_c_out,
+            s.self_loop_pct,
         );
     }
 
@@ -201,27 +206,47 @@ pub fn run(args: WeightWalkArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  Entities:          {}", graph.node_count());
     eprintln!("  Relations:         {}", graph.list_relations().len());
 
-    // Layer stats summary
-    eprintln!("\n  Layer Confidence Ranking:");
-    let mut ranked = results.clone();
-    ranked.sort_by(|a, b| {
+    // Layer rankings — by selectivity (factual signal) and by confidence (combined)
+    eprintln!("\n  By Selectivity (factual signal):");
+    let mut by_sel = results.clone();
+    by_sel.sort_by(|a, b| {
+        b.stats
+            .mean_selectivity
+            .partial_cmp(&a.stats.mean_selectivity)
+            .unwrap()
+    });
+    for (i, r) in by_sel.iter().take(5).enumerate() {
+        eprintln!(
+            "    #{:2} L{:2}  sel={:.4}  conf={:.4}  c_in={:.2}  loops={:.1}%  edges={}",
+            i + 1,
+            r.layer,
+            r.stats.mean_selectivity,
+            r.stats.mean_confidence,
+            r.stats.mean_c_in,
+            r.stats.self_loop_pct,
+            r.edges_found,
+        );
+    }
+
+    eprintln!("\n  By Confidence (combined c_in×c_out):");
+    let mut by_conf = results.clone();
+    by_conf.sort_by(|a, b| {
         b.stats
             .mean_confidence
             .partial_cmp(&a.stats.mean_confidence)
             .unwrap()
     });
-    for (i, r) in ranked.iter().take(5).enumerate() {
+    for (i, r) in by_conf.iter().take(5).enumerate() {
         eprintln!(
-            "    #{:2} L{:2}  mean={:.4}  max={:.4}  edges={}",
+            "    #{:2} L{:2}  conf={:.4}  sel={:.4}  c_out={:.2}  loops={:.1}%  edges={}",
             i + 1,
             r.layer,
             r.stats.mean_confidence,
-            r.stats.max_confidence,
+            r.stats.mean_selectivity,
+            r.stats.mean_c_out,
+            r.stats.self_loop_pct,
             r.edges_found,
         );
-    }
-    if ranked.len() > 5 {
-        eprintln!("    ... ({} more layers)", ranked.len() - 5);
     }
 
     // Write stats file if requested
@@ -229,16 +254,36 @@ pub fn run(args: WeightWalkArgs) -> Result<(), Box<dyn std::error::Error>> {
         let layer_stats: Vec<serde_json::Value> = results
             .iter()
             .map(|r| {
+                let s = &r.stats;
+                let top_subj: Vec<serde_json::Value> = s
+                    .top_subjects
+                    .iter()
+                    .map(|(name, count, avg_c)| {
+                        serde_json::json!({"entity": name, "count": count, "avg_confidence": round4(*avg_c)})
+                    })
+                    .collect();
+                let top_obj: Vec<serde_json::Value> = s
+                    .top_objects
+                    .iter()
+                    .map(|(name, count, avg_c)| {
+                        serde_json::json!({"entity": name, "count": count, "avg_confidence": round4(*avg_c)})
+                    })
+                    .collect();
                 serde_json::json!({
                     "layer": r.layer,
                     "features_scanned": r.features_scanned,
                     "edges_found": r.edges_found,
                     "elapsed_ms": r.elapsed_ms,
-                    "mean_confidence": r.stats.mean_confidence,
-                    "max_confidence": r.stats.max_confidence,
-                    "min_confidence": r.stats.min_confidence,
-                    "mean_c_in": r.stats.mean_c_in,
-                    "mean_c_out": r.stats.mean_c_out,
+                    "mean_confidence": round4(s.mean_confidence),
+                    "max_confidence": round4(s.max_confidence),
+                    "mean_selectivity": round4(s.mean_selectivity),
+                    "max_selectivity": round4(s.max_selectivity),
+                    "mean_c_in": round4(s.mean_c_in),
+                    "mean_c_out": round4(s.mean_c_out),
+                    "self_loop_count": s.self_loop_count,
+                    "self_loop_pct": round4(s.self_loop_pct),
+                    "top_subjects": top_subj,
+                    "top_objects": top_obj,
                 })
             })
             .collect();

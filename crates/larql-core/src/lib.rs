@@ -5,6 +5,7 @@ pub mod algo;
 pub mod core;
 pub mod engine;
 pub mod io;
+pub mod loader;
 pub mod walker;
 
 // Re-export the essential types at crate root.

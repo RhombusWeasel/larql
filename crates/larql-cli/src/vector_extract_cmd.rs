@@ -67,7 +67,8 @@ impl ExtractCallbacks for ProgressCallbacks {
         vectors_written: usize,
         elapsed_ms: f64,
     ) {
-        self.feature_bar.set_position(self.feature_bar.length().unwrap_or(0));
+        self.feature_bar
+            .set_position(self.feature_bar.length().unwrap_or(0));
         self.component_bar.inc(1);
         eprintln!(
             "  {component} L{layer:2}: {vectors_written:6} vectors  ({:.0}s)",
@@ -76,7 +77,7 @@ impl ExtractCallbacks for ProgressCallbacks {
     }
 
     fn on_component_done(&mut self, component: &str, total_written: usize) {
-        eprintln!("  {component}: {total_written} vectors total");
+        eprintln!("  {component}: {total_written} vectors total\n");
     }
 }
 
@@ -100,11 +101,16 @@ pub fn run(args: VectorExtractArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("Loading model: {}", args.model);
     let extractor = VectorExtractor::load(&args.model)?;
-    eprintln!("  {} layers, hidden_size={}", extractor.num_layers(), extractor.hidden_size());
+    eprintln!(
+        "  {} layers, hidden_size={}",
+        extractor.num_layers(),
+        extractor.hidden_size()
+    );
     eprintln!("  components: {}", components.join(", "));
     if let Some(ref layers) = args.layers {
         eprintln!("  layers: {:?}", layers);
     }
+    eprintln!();
 
     let config = ExtractConfig {
         components,
@@ -138,10 +144,14 @@ pub fn run(args: VectorExtractArgs) -> Result<(), Box<dyn std::error::Error>> {
     callbacks.feature_bar.finish_and_clear();
 
     let elapsed = start.elapsed();
-    eprintln!("\nCompleted in {:.1}min", elapsed.as_secs_f64() / 60.0);
+    eprintln!("Completed in {:.1}min", elapsed.as_secs_f64() / 60.0);
     eprintln!("  Total vectors: {}", summary.total_vectors);
 
     for cs in &summary.components {
+        if cs.vectors_written == 0 {
+            eprintln!("  {}: skipped (not yet implemented)", cs.component);
+            continue;
+        }
         let size = std::fs::metadata(&cs.output_path)
             .map(|m| m.len())
             .unwrap_or(0);

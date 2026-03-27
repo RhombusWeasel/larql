@@ -14,4 +14,5 @@ path = "src/main.rs"
 larql-core = { path = "../larql-core" }
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde_json = { workspace = true }

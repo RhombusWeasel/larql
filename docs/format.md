@@ -105,7 +105,8 @@ Edges from `weight-walk` include confidence scoring metadata:
     "layer": 26,
     "feature": 9298,
     "c_in": 8.7,
-    "c_out": 12.4
+    "c_out": 12.4,
+    "selectivity": 0.72
   }
 }
 ```
@@ -116,10 +117,13 @@ Edges from `weight-walk` include confidence scoring metadata:
 | `feature` | int | FFN feature index within the layer |
 | `c_in` | f64 | Raw input selectivity — W_gate projection magnitude |
 | `c_out` | f64 | Raw output strength — W_down projection magnitude |
+| `selectivity` | f64 | Normalized input selectivity — `c_in / max(c_in)` per layer [0, 1] |
 
-**Confidence computation:**
-- `c_in × c_out` = raw product (how strongly this feature maps input → output)
-- `c` = raw product / max(raw product) across the layer, giving [0, 1] per-layer normalized confidence
+**Scoring:**
+- `c` (confidence) = `(c_in × c_out) / max(c_in × c_out)` per layer. Combined signal strength.
+- `selectivity` = `c_in / max(c_in)` per layer. How specifically this feature fires for one entity.
+
+**Which to filter on:** Confidence correlates with structural edges (early layers, function words). Selectivity correlates with factual edges (late layers, proper nouns). For factual knowledge extraction, filter on `selectivity` + late layers. See [confidence.md](confidence.md) for details.
 
 #### Attention walk edges
 

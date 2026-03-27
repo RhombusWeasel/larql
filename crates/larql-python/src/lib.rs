@@ -154,6 +154,20 @@ impl PyEdge {
             .with_confidence(c)
             .with_source(parse_source(&src));
 
+        // Parse metadata dict
+        if let Some(meta_obj) = d.get_item("meta")? {
+            let json_mod = d.py().import("json")?;
+            let meta_str: String = json_mod.call_method1("dumps", (meta_obj,))?.extract()?;
+            if let Ok(meta_map) =
+                serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(
+                    &meta_str,
+                )
+            {
+                edge.metadata = Some(meta_map);
+            }
+        }
+
+        // Parse injection
         if let Some(inj) = d.get_item("inj")? {
             let vals: Vec<f64> = inj.extract()?;
             if vals.len() == 2 {

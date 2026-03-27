@@ -33,6 +33,12 @@ pub struct LayerStats {
     pub min_confidence: f64,
     pub mean_c_in: f64,
     pub mean_c_out: f64,
+    pub mean_selectivity: f64,
+    pub max_selectivity: f64,
+    pub self_loop_count: usize,
+    pub self_loop_pct: f64,
+    pub top_subjects: Vec<(String, usize, f64)>,  // (entity, count, avg_confidence)
+    pub top_objects: Vec<(String, usize, f64)>,
 }
 
 /// Configuration for the weight walker.
@@ -225,25 +231,43 @@ impl WeightWalker {
         }
 
         // Phase 2: per-layer normalization
-        // confidence = (c_in × c_out) / max(c_in × c_out) across this layer
+        // confidence = (c_in × c_out) / max(c_in × c_out)
+        // selectivity = c_in / max(c_in) — factual signal
         let max_product = raw_edges
             .iter()
             .map(|e| e.c_in * e.c_out)
             .fold(f32::MIN, f32::max)
             .max(f32::EPSILON);
 
+        let max_cin = raw_edges
+            .iter()
+            .map(|e| e.c_in)
+            .fold(f32::MIN, f32::max)
+            .max(f32::EPSILON);
+
         let mut sum_conf = 0.0f64;
+        let mut sum_sel = 0.0f64;
         let mut sum_cin = 0.0f64;
         let mut sum_cout = 0.0f64;
         let mut max_conf = 0.0f64;
         let mut min_conf = 1.0f64;
+        let mut max_sel = 0.0f64;
+        let mut self_loops = 0usize;
+
+        // Entity tracking for top-N stats
+        let mut subj_counts: std::collections::HashMap<String, (usize, f64)> =
+            std::collections::HashMap::new();
+        let mut obj_counts: std::collections::HashMap<String, (usize, f64)> =
+            std::collections::HashMap::new();
 
         // Phase 3: add normalized edges to graph
         for raw in &raw_edges {
             let product = raw.c_in * raw.c_out;
             let confidence = (product / max_product) as f64;
+            let selectivity = (raw.c_in / max_cin) as f64;
 
             sum_conf += confidence;
+            sum_sel += selectivity;
             sum_cin += raw.c_in as f64;
             sum_cout += raw.c_out as f64;
             if confidence > max_conf {
@@ -252,6 +276,25 @@ impl WeightWalker {
             if confidence < min_conf {
                 min_conf = confidence;
             }
+            if selectivity > max_sel {
+                max_sel = selectivity;
+            }
+            if raw.subject == raw.object {
+                self_loops += 1;
+            }
+
+            // Track entity frequencies
+            let se = subj_counts
+                .entry(raw.subject.clone())
+                .or_insert((0, 0.0));
+            se.0 += 1;
+            se.1 += confidence;
+
+            let oe = obj_counts
+                .entry(raw.object.clone())
+                .or_insert((0, 0.0));
+            oe.0 += 1;
+            oe.1 += confidence;
 
             let edge = Edge::new(&raw.subject, &raw.relation, &raw.object)
                 .with_confidence(confidence)
@@ -265,11 +308,20 @@ impl WeightWalker {
                 .with_metadata(
                     "c_out",
                     serde_json::Value::from(round4(raw.c_out as f64)),
+                )
+                .with_metadata(
+                    "selectivity",
+                    serde_json::Value::from(round4(selectivity)),
                 );
             graph.add_edge(edge);
         }
 
         let n = raw_edges.len();
+
+        // Build top entities by count
+        let top_subjects = top_entities(&subj_counts, 10);
+        let top_objects = top_entities(&obj_counts, 10);
+
         let stats = if n > 0 {
             LayerStats {
                 mean_confidence: sum_conf / n as f64,
@@ -277,6 +329,16 @@ impl WeightWalker {
                 min_confidence: min_conf,
                 mean_c_in: sum_cin / n as f64,
                 mean_c_out: sum_cout / n as f64,
+                mean_selectivity: sum_sel / n as f64,
+                max_selectivity: max_sel,
+                self_loop_count: self_loops,
+                self_loop_pct: if n > 0 {
+                    (self_loops as f64 / n as f64) * 100.0
+                } else {
+                    0.0
+                },
+                top_subjects,
+                top_objects,
             }
         } else {
             LayerStats::default()
@@ -294,6 +356,22 @@ impl WeightWalker {
         callbacks.on_checkpoint(graph);
         Ok(result)
     }
+}
+
+/// Extract top-N entities by count, with average confidence.
+fn top_entities(
+    counts: &std::collections::HashMap<String, (usize, f64)>,
+    n: usize,
+) -> Vec<(String, usize, f64)> {
+    let mut sorted: Vec<_> = counts
+        .iter()
+        .map(|(name, (count, sum_conf))| {
+            (name.clone(), *count, sum_conf / *count as f64)
+        })
+        .collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.truncate(n);
+    sorted
 }
 
 fn round4(v: f64) -> f64 {

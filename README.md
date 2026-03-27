@@ -145,19 +145,20 @@ make python-build   # build Python extension (requires virtualenv)
 
 ### What's working
 
-- **Weight walker** — 8.2M edges from Gemma 3-4B in 40 minutes. BLAS-accelerated. Per-layer confidence scoring. Resume. Progress reporting.
-- **Attention walker** — OV circuit extraction from attention heads.
+- **Weight walker** — 8.2M edges from Gemma 3-4B in 40 minutes. BLAS-accelerated. Per-layer confidence + selectivity scoring. Resume. Progress.
+- **Attention walker** — OV circuit extraction from attention heads. Same confidence/selectivity scoring.
+- **Vector extractor** — extracts raw weight vectors to NDJSON for SurrealDB ingestion. Supports FFN, attention, and embedding components.
 - **Core graph engine** — insert, remove, deduplicate, select, reverse select, describe, walk, search, subgraph, count, node, stats, components.
 - **BFS extraction** — template-based probing, multi-token chaining, checkpoint callbacks.
 - **Serialization** — JSON and MessagePack with format auto-detection.
-- **CLI** — seven commands: `weight-walk`, `attention-walk`, `bfs`, `stats`, `query`, `describe`, `validate`.
-- **PyO3 binding** — full Python API parity. `chuk-larql` uses Rust as native backend.
-- **Test suite** — 102 tests across 10 test files, all passing.
+- **CLI** — nine commands: `weight-walk`, `attention-walk`, `vector-extract`, `vector-load`, `bfs`, `stats`, `query`, `describe`, `validate`.
+- **PyO3 binding** — full Python API parity. `chuk-larql` uses Rust as native backend. 79 Python tests passing.
+- **Test suite** — 102 Rust tests across 10 test files, all passing.
 
 ### What's next
 
 - CI / GitHub Actions
-- `larql filter` command (post-extraction confidence filtering)
+- `larql filter` command (post-extraction confidence/selectivity filtering)
 - Packed binary edge format for runtime graphs
 - Crate publishing
 
