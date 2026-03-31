@@ -1906,4 +1906,43 @@ mod tests {
         parse(r#"DIFF "gemma3-4b.vindex" CURRENT;"#).unwrap();
         parse(r#"COMPILE CURRENT INTO MODEL "gemma3-4b-edited/" FORMAT safetensors;"#).unwrap();
     }
+
+    // ══════════════════════════════════════════════════════════════
+    // INFER STATEMENT
+    // ══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_infer_minimal() {
+        let stmt = parse(r#"INFER "The capital of France is" TOP 5;"#).unwrap();
+        match stmt {
+            Statement::Infer { prompt, top, compare } => {
+                assert_eq!(prompt, "The capital of France is");
+                assert_eq!(top, Some(5));
+                assert!(!compare);
+            }
+            _ => panic!("expected Infer"),
+        }
+    }
+
+    #[test]
+    fn parse_infer_with_compare() {
+        let stmt = parse(r#"INFER "test prompt" TOP 3 COMPARE;"#).unwrap();
+        match stmt {
+            Statement::Infer { prompt, top, compare } => {
+                assert_eq!(prompt, "test prompt");
+                assert_eq!(top, Some(3));
+                assert!(compare);
+            }
+            _ => panic!("expected Infer"),
+        }
+    }
+
+    #[test]
+    fn parse_infer_no_top() {
+        let stmt = parse(r#"INFER "test";"#).unwrap();
+        match stmt {
+            Statement::Infer { top, .. } => assert!(top.is_none()),
+            _ => panic!("expected Infer"),
+        }
+    }
 }

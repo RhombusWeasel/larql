@@ -111,3 +111,78 @@ pub fn token_embedding_pub(
     avg /= ids.len() as f32;
     Some(avg)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use larql_inference::clustering::ClusterResult;
+
+    fn make_test_classifier() -> RelationClassifier {
+        let clusters = ClusterResult {
+            k: 3,
+            centres: vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.5, 0.5]],
+            labels: vec!["capital".into(), "language".into(), "continent".into()],
+            counts: vec![100, 80, 60],
+            top_tokens: vec![
+                vec!["paris".into(), "berlin".into()],
+                vec!["french".into(), "german".into()],
+                vec!["europe".into(), "asia".into()],
+            ],
+        };
+
+        let mut assignments = std::collections::HashMap::new();
+        assignments.insert((26, 9515), 0); // capital cluster
+        assignments.insert((24, 4532), 1); // language cluster
+        assignments.insert((25, 3603), 2); // continent cluster
+
+        RelationClassifier {
+            clusters: Some(clusters),
+            feature_assignments: assignments,
+        }
+    }
+
+    #[test]
+    fn label_for_known_feature() {
+        let rc = make_test_classifier();
+        assert_eq!(rc.label_for_feature(26, 9515), Some("capital"));
+        assert_eq!(rc.label_for_feature(24, 4532), Some("language"));
+        assert_eq!(rc.label_for_feature(25, 3603), Some("continent"));
+    }
+
+    #[test]
+    fn label_for_unknown_feature() {
+        let rc = make_test_classifier();
+        assert_eq!(rc.label_for_feature(0, 0), None);
+        assert_eq!(rc.label_for_feature(99, 99), None);
+    }
+
+    #[test]
+    fn cluster_for_feature() {
+        let rc = make_test_classifier();
+        assert_eq!(rc.cluster_for_feature(26, 9515), Some(0));
+        assert_eq!(rc.cluster_for_feature(24, 4532), Some(1));
+        assert_eq!(rc.cluster_for_feature(0, 0), None);
+    }
+
+    #[test]
+    fn cluster_info() {
+        let rc = make_test_classifier();
+        let (label, count, tops) = rc.cluster_info(0).unwrap();
+        assert_eq!(label, "capital");
+        assert_eq!(count, 100);
+        assert_eq!(tops, &["paris", "berlin"]);
+    }
+
+    #[test]
+    fn num_clusters() {
+        let rc = make_test_classifier();
+        assert_eq!(rc.num_clusters(), 3);
+        assert!(rc.has_clusters());
+    }
+
+    #[test]
+    fn from_nonexistent_vindex() {
+        let rc = RelationClassifier::from_vindex(std::path::Path::new("/nonexistent"));
+        assert!(rc.is_none());
+    }
+}

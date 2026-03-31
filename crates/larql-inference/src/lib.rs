@@ -11,7 +11,9 @@ pub mod model;
 pub mod route_ffn;
 pub mod residual;
 pub mod tokenizer;
-pub mod vector_index;
+pub mod vindex;
+/// Backward-compatible alias: `crate::vector_index` → `crate::vindex`.
+pub use vindex as vector_index;
 pub mod walker;
 
 // Re-export dependencies for downstream crates.
@@ -42,7 +44,7 @@ pub use ffn::experimental::entity_routed::EntityRoutedFfn;
 pub use ffn::experimental::feature_list::FeatureListFfn;
 pub use ffn::experimental::graph::GraphFfn;
 pub use route_ffn::{RouteFfn, RouteGuidedFfn, RouteTable};
-pub use vector_index::{
+pub use vindex::{
     load_feature_labels, load_model_weights_from_vindex, load_vindex_config,
     load_vindex_embeddings, load_vindex_tokenizer, write_model_weights, VectorIndex, VindexConfig,
     WalkFfn, WalkTrace,

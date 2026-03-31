@@ -133,6 +133,19 @@ fn main() {
         r#"EXPLAIN WALK "prompt" LAYERS 24-33 VERBOSE;"#,
     );
 
+    // ── Inference Statements ──
+    section("Inference");
+
+    demo(
+        "INFER (minimal)",
+        r#"INFER "The capital of France is" TOP 5;"#,
+    );
+
+    demo(
+        "INFER (with compare)",
+        r#"INFER "The capital of France is" TOP 5 COMPARE;"#,
+    );
+
     // ── Mutation Statements ──
     section("Mutation");
 
@@ -224,8 +237,9 @@ fn main() {
         "SHOW RELATIONS WITH EXAMPLES;",
         r#"DESCRIBE "France";"#,
         r#"SELECT entity, target, confidence FROM EDGES WHERE relation = "capital-of" ORDER BY confidence DESC LIMIT 10;"#,
-        r#"WALK "The capital of France is" TOP 5 COMPARE;"#,
+        r#"WALK "France" TOP 10;"#,
         r#"EXPLAIN WALK "The capital of France is";"#,
+        r#"INFER "The capital of France is" TOP 5 COMPARE;"#,
         r#"WALK "Where does John Coyle live?" TOP 5;"#,
         r#"INSERT INTO EDGES (entity, relation, target) VALUES ("John Coyle", "lives-in", "Colchester");"#,
         r#"DESCRIBE "John Coyle";"#,
