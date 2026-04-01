@@ -1839,9 +1839,12 @@ fn extract_mutate_reload_verifies_mutation() {
     index.set_gate_vector(0, slot, &gate_vec);
     index.set_feature_meta(0, slot, make_meta("INSERTED", 999, 0.99));
 
-    // Save back (binary only — no JSONL)
+    // Save back — save_gate_vectors writes a new file, which is safe because
+    // set_gate_vector promoted layer 0 to heap. But other layers still mmap the
+    // old file. Drop the index after save to release the mmap cleanly.
     index.save_gate_vectors(&dir).unwrap();
     index.save_down_meta(&dir).unwrap();
+    drop(index);
 
     // Reload and verify mutation persisted (binary format round-trip)
     let index2 = larql_vindex::VectorIndex::load_vindex(&dir, &mut lcb).unwrap();

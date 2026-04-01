@@ -12,6 +12,7 @@ pub enum ServerError {
     BadRequest(String),
 
     #[error("inference not available: {0}")]
+    #[allow(dead_code)]
     InferenceUnavailable(String),
 
     #[error("internal error: {0}")]

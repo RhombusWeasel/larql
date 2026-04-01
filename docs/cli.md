@@ -19,6 +19,75 @@ The primary workflow: extract a vindex, launch the REPL, or build from a Vindexf
 | `lql` | Execute a single LQL statement |
 | `walk` | Walk the model as a local vector index (gate KNN + down lookup) |
 | `vindex-bench` | Benchmark vindex walk: accuracy vs dense, throughput |
+| `serve` | Serve a vindex over HTTP (knowledge queries, patches, multi-model) |
+
+### `larql serve`
+
+Serve a vindex over HTTP. Loads a vindex into memory and exposes REST endpoints for knowledge queries, feature walks, edge selection, and patch management.
+
+```
+larql serve <VINDEX_PATH> [OPTIONS]
+larql serve --dir <DIR> [OPTIONS]
+```
+
+| Flag | Description | Default |
+|---|---|---|
+| `<VINDEX_PATH>` | Path to .vindex directory or `hf://` URL | — |
+| `--dir <DIR>` | Serve all .vindex directories in folder | — |
+| `--port <PORT>` | Listen port | 8080 |
+| `--host <HOST>` | Bind address | 0.0.0.0 |
+| `--no-infer` | Disable inference endpoint (browse-only, saves memory) | false |
+| `--cors` | Enable CORS headers for browser access | false |
+| `--api-key <KEY>` | Require Bearer token auth (health exempt) | — |
+| `--max-concurrent <N>` | Max concurrent requests | 100 |
+| `--tls-cert <PATH>` | TLS certificate for HTTPS | — |
+| `--tls-key <PATH>` | TLS private key for HTTPS | — |
+| `--log-level <LEVEL>` | Logging level | info |
+
+**Endpoints:**
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/v1/describe?entity=France` | Knowledge edges (with probe relation labels) |
+| GET | `/v1/walk?prompt=...&top=5` | Feature scan for a prompt |
+| POST | `/v1/select` | SQL-style edge query |
+| POST | `/v1/infer` | Full forward pass (walk/dense/compare) |
+| GET | `/v1/relations` | List known relation types |
+| GET | `/v1/stats` | Model and index statistics |
+| POST | `/v1/patches/apply` | Apply a patch in-memory |
+| GET | `/v1/patches` | List active patches |
+| DELETE | `/v1/patches/{name}` | Remove a patch |
+| GET | `/v1/health` | Health check (auth exempt) |
+| GET | `/v1/models` | List loaded models |
+
+**Multi-model:** When using `--dir`, each model gets its own namespace: `/v1/{model_id}/describe`, etc.
+
+**Examples:**
+
+```bash
+# Development — single model
+larql serve output/gemma3-4b-v2.vindex --port 8080
+
+# Multi-model server
+larql serve --dir ./vindexes/ --port 8080
+
+# From HuggingFace
+larql serve "hf://chrishayuk/gemma-3-4b-it-vindex" --port 8080
+
+# Browse-only with CORS for web clients
+larql serve output/gemma3-4b-v2.vindex --no-infer --cors --port 8080
+
+# With auth + HTTPS
+larql serve output/gemma3-4b.vindex --api-key "sk-abc123" --tls-cert cert.pem --tls-key key.pem
+
+# Query from the REPL
+larql repl
+> USE REMOTE "http://localhost:8080";
+> DESCRIBE "France";
+> INFER "The capital of France is" TOP 5;
+```
+
+See `crates/larql-server/README.md` and `docs/vindex-server-spec.md` for full API documentation.
 
 ## Legacy extraction commands
 

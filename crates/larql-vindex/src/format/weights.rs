@@ -283,16 +283,11 @@ pub fn load_model_weights(
     });
     let arch = larql_models::detect_from_json(&arch_json);
 
-    // Load embeddings
+    // Load embeddings (mmap'd)
     callbacks.on_file_start("embeddings", &dir.join("embeddings.bin").display().to_string());
-    let embed_bytes = std::fs::read(dir.join("embeddings.bin"))?;
-    let embed_floats: Vec<f32> = unsafe {
-        std::slice::from_raw_parts(
-            embed_bytes.as_ptr() as *const f32,
-            embed_bytes.len() / 4,
-        )
-    }
-    .to_vec();
+    let embed_file = std::fs::File::open(dir.join("embeddings.bin"))?;
+    let embed_mmap = unsafe { memmap2::Mmap::map(&embed_file)? };
+    let embed_floats = crate::config::dtype::decode_floats(&embed_mmap, config.dtype);
     let embed = Array2::from_shape_vec((config.vocab_size, config.hidden_size), embed_floats)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
     callbacks.on_file_done("embeddings", config.vocab_size, 0.0);
@@ -310,8 +305,8 @@ pub fn load_model_weights(
     let entries: Vec<WeightEntry> = serde_json::from_str(&manifest_text)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
 
-    // Cache loaded file data to avoid re-reading
-    let mut file_cache: HashMap<String, Vec<u8>> = HashMap::new();
+    // Cache mmap'd files to avoid re-mapping
+    let mut mmap_cache: HashMap<String, memmap2::Mmap> = HashMap::new();
 
     let mut tensors: HashMap<String, Array2<f32>> = HashMap::new();
     let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
@@ -325,9 +320,20 @@ pub fn load_model_weights(
             entry.file.clone()
         };
 
-        let data = file_cache.entry(filename.clone()).or_insert_with(|| {
-            std::fs::read(dir.join(&filename)).unwrap_or_default()
-        });
+        if !mmap_cache.contains_key(&filename) {
+            let fpath = dir.join(&filename);
+            if fpath.exists() {
+                if let Ok(f) = std::fs::File::open(&fpath) {
+                    if let Ok(m) = unsafe { memmap2::Mmap::map(&f) } {
+                        mmap_cache.insert(filename.clone(), m);
+                    }
+                }
+            }
+        }
+        let data = match mmap_cache.get(&filename) {
+            Some(m) => m.as_ref(),
+            None => continue,
+        };
 
         if data.is_empty() {
             continue;
@@ -363,10 +369,11 @@ pub fn load_model_weights(
         }
     }
 
-    // Gate vectors: read from gate_vectors.bin and inject into tensors
+    // Gate vectors: mmap gate_vectors.bin and inject into tensors
     // (the forward pass needs them as tensors, but they're stored in the query index)
-    let gate_bytes = std::fs::read(dir.join("gate_vectors.bin"))?;
-    let gate_floats = crate::config::dtype::decode_floats(&gate_bytes, config.dtype);
+    let gate_file = std::fs::File::open(dir.join("gate_vectors.bin"))?;
+    let gate_mmap = unsafe { memmap2::Mmap::map(&gate_file)? };
+    let gate_floats = crate::config::dtype::decode_floats(&gate_mmap, config.dtype);
     let bpf = crate::config::dtype::bytes_per_float(config.dtype);
     for info in &config.layers {
         let float_offset = info.offset as usize / bpf;

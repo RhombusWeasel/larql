@@ -89,7 +89,7 @@ larql serve "hf://chrishayuk/gemma-3-4b-it-vindex" [OPTIONS]
 | `--no-infer` | Disable INFER endpoint (browse-only, reduces memory) | false |
 | `--cors` | Enable CORS for browser access | false |
 | `--max-concurrent <N>` | Max concurrent requests | 100 |
-| `--cache-ttl <SECS>` | Cache TTL for DESCRIBE results | 0 (no cache) |
+| `--api-key <KEY>` | Require Bearer token auth (health exempt) | — |
 | `--log-level <LEVEL>` | Logging level | info |
 | `--tls-cert <PATH>` | TLS certificate for HTTPS | — |
 | `--tls-key <PATH>` | TLS private key | — |
@@ -209,9 +209,9 @@ GET /v1/walk?prompt=Einstein&top=5&layers=24-33
 {
   "prompt": "The capital of France is",
   "hits": [
-    {"layer": 24, "feature": 4532, "gate_score": 26.1, "target": "French", "relation": "language"},
-    {"layer": 25, "feature": 4207, "gate_score": 14.4, "target": "Europe", "relation": "continent"},
-    {"layer": 27, "feature": 9515, "gate_score": 1436.9, "target": "Paris", "relation": "capital"}
+    {"layer": 24, "feature": 4532, "gate_score": 26.1, "target": "French"},
+    {"layer": 25, "feature": 4207, "gate_score": 14.4, "target": "Europe"},
+    {"layer": 27, "feature": 9515, "gate_score": 1436.9, "target": "Paris"}
   ],
   "latency_ms": 0.4
 }
@@ -551,9 +551,9 @@ At 12ms per DESCRIBE, a single server handles ~80 queries/second. With 4 instanc
 
 ## 8. Security
 
-### 8.1 Authentication
+### 8.1 Authentication (implemented)
 
-Optional API key authentication:
+Optional API key authentication. `/v1/health` is exempt (always accessible).
 
 ```bash
 larql serve gemma3-4b.vindex --port 8080 --api-key "sk-abc123"
@@ -564,13 +564,19 @@ GET /v1/describe?entity=France
 Authorization: Bearer sk-abc123
 ```
 
-### 8.2 Rate Limiting
+Requests without a valid token receive 401 Unauthorized.
 
-Per-IP rate limiting to prevent abuse:
+### 8.2 Concurrency Limit (implemented)
+
+Max concurrent requests via tower middleware:
 
 ```bash
-larql serve gemma3-4b.vindex --rate-limit 100/min
+larql serve gemma3-4b.vindex --max-concurrent 100
 ```
+
+### 8.3 Rate Limiting (future)
+
+Per-IP rate limiting is not yet implemented. The concurrency limit covers most abuse cases.
 
 ### 8.3 Patch Validation
 
@@ -614,6 +620,8 @@ SHOW PATCHES;
 ```
 
 The user doesn't know or care whether the vindex is local or remote. Same statements, same output format.
+
+**Implementation status:** `USE REMOTE` is implemented. Supported statements over remote: DESCRIBE, WALK, INFER, STATS, SHOW RELATIONS. Mutations (INSERT/DELETE/UPDATE) and local patch overlay on remote results are not yet supported.
 
 ---
 

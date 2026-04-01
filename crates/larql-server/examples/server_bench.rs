@@ -189,6 +189,37 @@ fn main() {
         patched.feature_meta(7, 1023)
     });
 
+    println!("\n── Probe label lookup ──");
+    // Build synthetic probe labels (10% of features labelled)
+    let mut probe_labels: std::collections::HashMap<(usize, usize), String> =
+        std::collections::HashMap::new();
+    for l in 0..8 {
+        for f in (0..1024).step_by(10) {
+            probe_labels.insert((l, f), format!("rel_L{}_F{}", l, f));
+        }
+    }
+    println!("  {} probe labels loaded", probe_labels.len());
+
+    bench("probe_label hit", 1000, 100000, || {
+        probe_labels.get(&(4, 500))
+    });
+    bench("probe_label miss", 1000, 100000, || {
+        probe_labels.get(&(4, 501))
+    });
+    bench("describe + label merge", 20, 1000, || {
+        let trace = patched.walk(&query_strong, &all_layers, 20);
+        let mut edges: Vec<(String, f32, Option<&str>)> = Vec::new();
+        for (layer, hits) in &trace.layers {
+            for hit in hits {
+                let label = probe_labels.get(&(*layer, hit.feature)).map(|s| s.as_str());
+                edges.push((hit.meta.top_token.clone(), hit.gate_score, label));
+            }
+        }
+        edges.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        edges.truncate(20);
+        edges
+    });
+
     println!("\n── Relations simulation (token aggregation) ──");
     bench("relations (scan knowledge layers)", 20, 500, || {
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();

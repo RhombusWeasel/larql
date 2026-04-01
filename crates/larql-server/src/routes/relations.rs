@@ -12,7 +12,9 @@ use crate::state::{AppState, LoadedModel};
 
 #[derive(Deserialize, Default)]
 pub struct RelationsParams {
+    /// Filter by label source (future use).
     #[serde(default)]
+    #[allow(dead_code)]
     pub source: Option<String>,
 }
 

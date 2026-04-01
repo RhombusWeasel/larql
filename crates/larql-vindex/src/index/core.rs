@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::sync::Arc;
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView2};
 
 use crate::error::VindexError;
 
@@ -43,15 +44,36 @@ pub trait IndexLoadCallbacks {
 pub struct SilentLoadCallbacks;
 impl IndexLoadCallbacks for SilentLoadCallbacks {}
 
+/// Per-layer gate vector offset info for mmap mode.
+#[derive(Clone)]
+pub struct GateLayerSlice {
+    pub float_offset: usize,  // offset into the f32 slice
+    pub num_features: usize,
+}
+
 /// The full model as a local vector index.
 ///
 /// Gate vectors for KNN matching + down token metadata for output lookup.
-/// Loaded from the NDJSON files produced by `vector-extract`.
+/// Supports two storage modes:
+/// - **Heap**: gate vectors copied into per-layer Array2 (in-memory builds, mutations)
+/// - **Mmap**: gate vectors sliced directly from mmap'd file (zero-copy, zero heap)
 #[derive(Clone)]
 pub struct VectorIndex {
-    /// Per-layer gate vectors: gate_vectors[layer] is (num_features, hidden_size).
-    /// Used for KNN via BLAS matmul.
+    /// Per-layer gate vectors (heap mode): gate_vectors[layer] is (num_features, hidden_size).
     pub(crate) gate_vectors: Vec<Option<Array2<f32>>>,
+
+    /// Mmap'd gate vector bytes (zero-copy mode). When set, gate_knn slices
+    /// directly from this instead of using gate_vectors heap arrays.
+    /// For f32: bytes are reinterpreted as &[f32] directly (zero-copy).
+    /// For f16: bytes are decoded per-layer on demand.
+    /// Arc for Clone support — the mmap is shared, not copied.
+    pub(crate) gate_mmap_bytes: Option<Arc<memmap2::Mmap>>,
+
+    /// Storage dtype for mmap'd data (needed for f16 decoding).
+    pub(crate) gate_mmap_dtype: crate::config::dtype::StorageDtype,
+
+    /// Per-layer slice info for mmap mode.
+    pub(crate) gate_mmap_slices: Vec<GateLayerSlice>,
 
     /// Per-layer, per-feature output token metadata from down projections.
     /// down_meta[layer][feature] = FeatureMeta with top tokens.
@@ -65,7 +87,7 @@ pub struct VectorIndex {
 }
 
 impl VectorIndex {
-    /// Create a new VectorIndex from components.
+    /// Create a new VectorIndex from heap-allocated components (in-memory builds).
     pub fn new(
         gate_vectors: Vec<Option<Array2<f32>>>,
         down_meta: Vec<Option<Vec<Option<FeatureMeta>>>>,
@@ -74,10 +96,51 @@ impl VectorIndex {
     ) -> Self {
         Self {
             gate_vectors,
+            gate_mmap_bytes: None,
+            gate_mmap_dtype: crate::config::dtype::StorageDtype::F32,
+            gate_mmap_slices: Vec::new(),
             down_meta,
             num_layers,
             hidden_size,
         }
+    }
+
+    /// Create a VectorIndex with zero-copy mmap'd gate vectors.
+    /// For f32: bytes reinterpreted directly as &[f32] — zero heap allocation.
+    /// For f16: decoded per-layer on demand during gate_knn.
+    pub fn new_mmap(
+        gate_mmap: memmap2::Mmap,
+        gate_slices: Vec<GateLayerSlice>,
+        dtype: crate::config::dtype::StorageDtype,
+        down_meta: Vec<Option<Vec<Option<FeatureMeta>>>>,
+        num_layers: usize,
+        hidden_size: usize,
+    ) -> Self {
+        Self {
+            gate_vectors: vec![None; num_layers],
+            gate_mmap_bytes: Some(Arc::new(gate_mmap)),
+            gate_mmap_dtype: dtype,
+            gate_mmap_slices: gate_slices,
+            down_meta,
+            num_layers,
+            hidden_size,
+        }
+    }
+
+    /// Returns true if this index uses mmap'd gate vectors (zero heap copy).
+    pub fn is_mmap(&self) -> bool {
+        self.gate_mmap_bytes.is_some()
+    }
+
+    /// Estimated heap bytes used by gate vectors (0 if mmap'd).
+    pub fn gate_heap_bytes(&self) -> usize {
+        if self.is_mmap() {
+            return 0;
+        }
+        self.gate_vectors.iter()
+            .filter_map(|v| v.as_ref())
+            .map(|m| m.len() * std::mem::size_of::<f32>())
+            .sum()
     }
 
     /// Load gate vectors from an NDJSON file (ffn_gate.vectors.jsonl).
@@ -206,7 +269,10 @@ impl VectorIndex {
 
         Ok(VectorIndex {
             gate_vectors,
-            down_meta: gate_meta, // gate meta initially; down loaded separately
+            gate_mmap_bytes: None,
+            gate_mmap_dtype: crate::config::dtype::StorageDtype::F32,
+            gate_mmap_slices: Vec::new(),
+            down_meta: gate_meta,
             num_layers,
             hidden_size,
         })
@@ -302,6 +368,7 @@ impl VectorIndex {
     /// Gate KNN: find the top-K features at a layer whose gate vectors have
     /// the highest dot product with the input residual. Uses BLAS matmul.
     ///
+    /// In mmap mode, slices directly from the mmap'd file — zero heap allocation.
     /// Returns (feature_index, dot_product) sorted by absolute magnitude descending.
     pub fn gate_knn(
         &self,
@@ -309,15 +376,56 @@ impl VectorIndex {
         residual: &Array1<f32>,
         top_k: usize,
     ) -> Vec<(usize, f32)> {
+        // Try mmap path first (zero-copy for f32, per-layer decode for f16)
+        if let Some(ref mmap) = self.gate_mmap_bytes {
+            if let Some(slice) = self.gate_mmap_slices.get(layer) {
+                if slice.num_features == 0 { return vec![]; }
+                let bpf = crate::config::dtype::bytes_per_float(self.gate_mmap_dtype);
+                let byte_offset = slice.float_offset * bpf;
+                let byte_count = slice.num_features * self.hidden_size * bpf;
+                let byte_end = byte_offset + byte_count;
+                if byte_end > mmap.len() { return vec![]; }
+
+                match self.gate_mmap_dtype {
+                    crate::config::dtype::StorageDtype::F32 => {
+                        // Zero-copy: reinterpret mmap bytes as &[f32]
+                        let float_count = slice.num_features * self.hidden_size;
+                        let data = unsafe {
+                            let ptr = mmap[byte_offset..byte_end].as_ptr() as *const f32;
+                            std::slice::from_raw_parts(ptr, float_count)
+                        };
+                        let view = ArrayView2::from_shape(
+                            (slice.num_features, self.hidden_size), data
+                        ).unwrap();
+                        let scores = view.dot(residual);
+                        return Self::top_k_from_scores(&scores, top_k);
+                    }
+                    crate::config::dtype::StorageDtype::F16 => {
+                        // Per-layer decode from f16 bytes
+                        let raw = &mmap[byte_offset..byte_end];
+                        let floats = crate::config::dtype::f16_bytes_to_f32(raw);
+                        let view = ArrayView2::from_shape(
+                            (slice.num_features, self.hidden_size), &floats
+                        ).unwrap();
+                        let scores = view.dot(residual);
+                        return Self::top_k_from_scores(&scores, top_k);
+                    }
+                }
+            }
+            return vec![];
+        }
+
+        // Heap path (in-memory builds, mutations)
         let gate_matrix = match self.gate_vectors.get(layer).and_then(|v| v.as_ref()) {
             Some(m) => m,
             None => return vec![],
         };
 
-        // gate_proj = gate_matrix @ residual → (num_features,)
         let scores = gate_matrix.dot(residual);
+        Self::top_k_from_scores(&scores, top_k)
+    }
 
-        // Top-K by dot product magnitude
+    fn top_k_from_scores(scores: &Array1<f32>, top_k: usize) -> Vec<(usize, f32)> {
         let mut indexed: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
         let k = top_k.min(indexed.len());
         if k > 0 && k < indexed.len() {
@@ -376,6 +484,12 @@ impl VectorIndex {
 
     /// Number of features indexed at a layer.
     pub fn num_features(&self, layer: usize) -> usize {
+        // Check mmap first
+        if self.gate_mmap_bytes.is_some() {
+            return self.gate_mmap_slices.get(layer)
+                .map(|s| s.num_features)
+                .unwrap_or(0);
+        }
         self.gate_vectors
             .get(layer)
             .and_then(|v| v.as_ref())
@@ -385,6 +499,9 @@ impl VectorIndex {
 
     /// Total gate vectors loaded across all layers.
     pub fn total_gate_vectors(&self) -> usize {
+        if self.gate_mmap_bytes.is_some() {
+            return self.gate_mmap_slices.iter().map(|s| s.num_features).sum();
+        }
         self.gate_vectors
             .iter()
             .filter_map(|v| v.as_ref())
@@ -403,6 +520,13 @@ impl VectorIndex {
 
     /// Layers that have gate vectors loaded.
     pub fn loaded_layers(&self) -> Vec<usize> {
+        if self.gate_mmap_bytes.is_some() {
+            return self.gate_mmap_slices.iter()
+                .enumerate()
+                .filter(|(_, s)| s.num_features > 0)
+                .map(|(i, _)| i)
+                .collect();
+        }
         self.gate_vectors
             .iter()
             .enumerate()
@@ -418,8 +542,18 @@ impl VectorIndex {
             .map(|v| v.as_slice())
     }
 
-    /// Access gate vectors matrix for a specific layer.
+    /// Access gate vectors matrix for a specific layer (heap mode only).
+    /// Returns None in mmap mode — use gate_knn() directly instead.
     pub fn gate_vectors_at(&self, layer: usize) -> Option<&Array2<f32>> {
         self.gate_vectors.get(layer).and_then(|v| v.as_ref())
+    }
+
+    /// Number of features at a layer (works in both heap and mmap mode).
+    pub fn num_features_at(&self, layer: usize) -> usize {
+        if self.gate_mmap_bytes.is_some() {
+            self.gate_mmap_slices.get(layer).map(|s| s.num_features).unwrap_or(0)
+        } else {
+            self.num_features(layer)
+        }
     }
 }

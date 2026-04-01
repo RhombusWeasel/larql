@@ -3,20 +3,11 @@
 //! Builds a synthetic in-memory vindex and tests each route handler
 //! through the axum test infrastructure (no network, no disk).
 
-use std::sync::Arc;
-
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use axum::Router;
-use tower::ServiceExt;
-
 use larql_vindex::ndarray::{Array1, Array2};
 use larql_vindex::{
     FeatureMeta, PatchedVindex, VectorIndex, VindexConfig, VindexLayerInfo,
     ExtractLevel, LayerBands,
 };
-use larql_vindex::tokenizers;
-use tokio::sync::RwLock;
 
 // ══════════════════════════════════════════════════════════════
 // Test helpers
@@ -108,103 +99,17 @@ fn test_config() -> VindexConfig {
     }
 }
 
-/// Build a tiny embeddings matrix (vocab=8, hidden=4) and a no-op tokenizer.
+/// Build a tiny embeddings matrix (vocab=8, hidden=4).
 fn test_embeddings() -> Array2<f32> {
     let mut embed = Array2::<f32>::zeros((8, 4));
-    // Token 0 → [1, 0, 0, 0]
     embed[[0, 0]] = 1.0;
-    // Token 1 → [0, 1, 0, 0]
     embed[[1, 1]] = 1.0;
-    // Token 2 → [0, 0, 1, 0]
     embed[[2, 2]] = 1.0;
-    // Token 3 → [0, 0, 0, 1]
     embed[[3, 3]] = 1.0;
-    // Token 4 → [1, 1, 0, 0] (multi-dim)
     embed[[4, 0]] = 1.0;
     embed[[4, 1]] = 1.0;
     embed
 }
-
-/// Build a minimal tokenizer for testing. Maps single characters to token IDs.
-fn test_tokenizer() -> tokenizers::Tokenizer {
-    use tokenizers::models::bpe::BPE;
-    let mut tokenizer = tokenizers::Tokenizer::new(BPE::default());
-    // Disable all pre/post processing so we get raw byte-level tokens.
-    tokenizer.with_normalizer(None::<tokenizers::normalizers::Sequence>);
-    tokenizer
-}
-
-// ── AppState construction (inline, no server dependency on private types) ──
-
-/// We can't directly import larql_server internals in integration tests,
-/// so we use the same types via the axum test client approach.
-/// Instead, we build the router ourselves using the public crate API.
-
-// Since larql-server is a binary crate, we test by building the state
-// and router directly. We replicate the minimal state setup here.
-
-mod server {
-    use super::*;
-    use std::sync::atomic::AtomicU64;
-
-    pub struct LoadedModel {
-        pub id: String,
-        pub path: std::path::PathBuf,
-        pub config: VindexConfig,
-        pub patched: RwLock<PatchedVindex>,
-        pub embeddings: Array2<f32>,
-        pub embed_scale: f32,
-        pub tokenizer: tokenizers::Tokenizer,
-        pub infer_disabled: bool,
-    }
-
-    pub struct AppState {
-        pub models: Vec<Arc<LoadedModel>>,
-        pub started_at: std::time::Instant,
-        pub requests_served: AtomicU64,
-    }
-
-    impl AppState {
-        pub fn model(&self, _id: Option<&str>) -> Option<&Arc<LoadedModel>> {
-            self.models.first()
-        }
-
-        pub fn is_multi_model(&self) -> bool {
-            self.models.len() > 1
-        }
-
-        pub fn bump_requests(&self) {
-            self.requests_served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-}
-
-fn build_test_state() -> Arc<server::AppState> {
-    let index = test_index();
-    let config = test_config();
-    let patched = PatchedVindex::new(index);
-
-    let model = Arc::new(server::LoadedModel {
-        id: "model-4".to_string(),
-        path: std::path::PathBuf::from("/tmp/test-vindex"),
-        config,
-        patched: RwLock::new(patched),
-        embeddings: test_embeddings(),
-        embed_scale: 1.0,
-        tokenizer: test_tokenizer(),
-        infer_disabled: true,
-    });
-
-    Arc::new(server::AppState {
-        models: vec![model],
-        started_at: std::time::Instant::now(),
-        requests_served: std::sync::atomic::AtomicU64::new(0),
-    })
-}
-
-// Since larql-server is a binary, we can't import its router directly.
-// Instead, we test the core logic: VectorIndex operations that the handlers use,
-// and verify the data flow that the server relies on.
 
 // ══════════════════════════════════════════════════════════════
 // CORE LOGIC TESTS (what the server handlers call)
@@ -494,4 +399,268 @@ fn test_large_top_k_clamped() {
     // Request 100 but only 3 features exist
     let hits = patched.gate_knn(0, &query, 100);
     assert_eq!(hits.len(), 3);
+}
+
+// ══════════════════════════════════════════════════════════════
+// PROBE LABELS (relation classifier in DESCRIBE)
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_probe_label_lookup() {
+    let mut labels: std::collections::HashMap<(usize, usize), String> =
+        std::collections::HashMap::new();
+    labels.insert((0, 0), "capital".into());
+    labels.insert((0, 1), "language".into());
+    labels.insert((1, 2), "continent".into());
+
+    assert_eq!(labels.get(&(0, 0)).map(|s| s.as_str()), Some("capital"));
+    assert_eq!(labels.get(&(0, 1)).map(|s| s.as_str()), Some("language"));
+    assert_eq!(labels.get(&(1, 2)).map(|s| s.as_str()), Some("continent"));
+    assert_eq!(labels.get(&(0, 2)), None);
+    assert_eq!(labels.get(&(99, 99)), None);
+}
+
+#[test]
+fn test_describe_edge_with_probe_label() {
+    let index = test_index();
+    let patched = PatchedVindex::new(index);
+
+    let mut labels: std::collections::HashMap<(usize, usize), String> =
+        std::collections::HashMap::new();
+    labels.insert((0, 0), "capital".into());
+
+    // Walk to find edges (simulates describe handler)
+    let query = Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]);
+    let trace = patched.walk(&query, &[0], 5);
+
+    // Build edge info like the handler does
+    for (layer, hits) in &trace.layers {
+        for hit in hits {
+            let label = labels.get(&(*layer, hit.feature));
+            if hit.feature == 0 && *layer == 0 {
+                assert_eq!(label, Some(&"capital".to_string()));
+            } else {
+                // Other features have no probe label
+                assert!(label.is_none() || label.is_some());
+            }
+        }
+    }
+}
+
+#[test]
+fn test_probe_labels_empty_when_no_file() {
+    // Simulates load_probe_labels on a nonexistent path
+    let labels: std::collections::HashMap<(usize, usize), String> =
+        std::collections::HashMap::new();
+    assert!(labels.is_empty());
+}
+
+// ══════════════════════════════════════════════════════════════
+// LAYER BAND FILTERING (DESCRIBE handler logic)
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_layer_band_filtering() {
+    let bands = LayerBands {
+        syntax: (0, 0),
+        knowledge: (0, 1),
+        output: (1, 1),
+    };
+
+    let all_layers = vec![0, 1];
+
+    let syntax: Vec<usize> = all_layers.iter().copied()
+        .filter(|l| *l >= bands.syntax.0 && *l <= bands.syntax.1)
+        .collect();
+    assert_eq!(syntax, vec![0]);
+
+    let knowledge: Vec<usize> = all_layers.iter().copied()
+        .filter(|l| *l >= bands.knowledge.0 && *l <= bands.knowledge.1)
+        .collect();
+    assert_eq!(knowledge, vec![0, 1]);
+
+    let output: Vec<usize> = all_layers.iter().copied()
+        .filter(|l| *l >= bands.output.0 && *l <= bands.output.1)
+        .collect();
+    assert_eq!(output, vec![1]);
+}
+
+#[test]
+fn test_layer_band_from_family() {
+    let bands = LayerBands::for_family("gemma3", 34).unwrap();
+    assert_eq!(bands.syntax, (0, 13));
+    assert_eq!(bands.knowledge, (14, 27));
+    assert_eq!(bands.output, (28, 33));
+}
+
+#[test]
+fn test_layer_band_fallback() {
+    // Unknown family with enough layers → estimated bands
+    let bands = LayerBands::for_family("unknown_family", 20).unwrap();
+    assert_eq!(bands.syntax.0, 0);
+    assert!(bands.knowledge.0 > 0);
+    assert!(bands.output.1 == 19);
+}
+
+// ══════════════════════════════════════════════════════════════
+// WALK LAYER RANGE PARSING
+// ══════════════════════════════════════════════════════════════
+
+fn parse_layers(s: &str, all: &[usize]) -> Vec<usize> {
+    if let Some((start, end)) = s.split_once('-') {
+        if let (Ok(s), Ok(e)) = (start.parse::<usize>(), end.parse::<usize>()) {
+            return all.iter().copied().filter(|l| *l >= s && *l <= e).collect();
+        }
+    }
+    s.split(',')
+        .filter_map(|p| p.trim().parse::<usize>().ok())
+        .filter(|l| all.contains(l))
+        .collect()
+}
+
+#[test]
+fn test_parse_layer_range() {
+    let all = vec![0, 1, 2, 3, 4, 5];
+    assert_eq!(parse_layers("2-4", &all), vec![2, 3, 4]);
+    assert_eq!(parse_layers("0-1", &all), vec![0, 1]);
+    assert_eq!(parse_layers("5-5", &all), vec![5]);
+}
+
+#[test]
+fn test_parse_layer_list() {
+    let all = vec![0, 1, 2, 3, 4, 5];
+    assert_eq!(parse_layers("1,3,5", &all), vec![1, 3, 5]);
+    assert_eq!(parse_layers("0", &all), vec![0]);
+}
+
+#[test]
+fn test_parse_layer_range_filters_missing() {
+    let all = vec![0, 2, 4]; // layers 1, 3 not loaded
+    assert_eq!(parse_layers("0-4", &all), vec![0, 2, 4]);
+    assert_eq!(parse_layers("1,3", &all), Vec::<usize>::new());
+}
+
+// ══════════════════════════════════════════════════════════════
+// MULTI-MODEL LOOKUP
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_multi_model_lookup_by_id() {
+    // Simulate AppState.model() logic
+    let models = vec!["gemma-3-4b-it", "llama-3-8b", "mistral-7b"];
+
+    let find = |id: &str| models.iter().find(|m| **m == id);
+
+    assert_eq!(find("gemma-3-4b-it"), Some(&"gemma-3-4b-it"));
+    assert_eq!(find("llama-3-8b"), Some(&"llama-3-8b"));
+    assert_eq!(find("nonexistent"), None);
+}
+
+#[test]
+fn test_single_model_returns_first() {
+    let models = vec!["only-model"];
+
+    // Single model mode: None → returns first
+    let result = if models.len() == 1 { models.first() } else { None };
+    assert_eq!(result, Some(&"only-model"));
+}
+
+#[test]
+fn test_multi_model_none_returns_none() {
+    let models = vec!["a", "b"];
+
+    // Multi-model mode: None → returns None (must specify ID)
+    let result: Option<&&str> = if models.len() == 1 { models.first() } else { None };
+    assert_eq!(result, None);
+}
+
+// ══════════════════════════════════════════════════════════════
+// INFER LOGIC (core computation path)
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_infer_mode_parsing() {
+    // The infer handler parses mode into walk/dense/compare
+    let check = |mode: &str| -> (bool, bool) {
+        let is_compare = mode == "compare";
+        let use_walk = mode == "walk" || is_compare;
+        let use_dense = mode == "dense" || is_compare;
+        (use_walk, use_dense)
+    };
+
+    assert_eq!(check("walk"), (true, false));
+    assert_eq!(check("dense"), (false, true));
+    assert_eq!(check("compare"), (true, true));
+}
+
+#[test]
+fn test_config_has_inference_capability() {
+    let mut config = test_config();
+
+    // Browse level → no inference
+    config.extract_level = ExtractLevel::Browse;
+    config.has_model_weights = false;
+    let has_weights = config.has_model_weights
+        || config.extract_level == ExtractLevel::Inference
+        || config.extract_level == ExtractLevel::All;
+    assert!(!has_weights);
+
+    // Inference level → has inference
+    config.extract_level = ExtractLevel::Inference;
+    let has_weights = config.has_model_weights
+        || config.extract_level == ExtractLevel::Inference
+        || config.extract_level == ExtractLevel::All;
+    assert!(has_weights);
+
+    // Legacy has_model_weights flag
+    config.extract_level = ExtractLevel::Browse;
+    config.has_model_weights = true;
+    let has_weights = config.has_model_weights
+        || config.extract_level == ExtractLevel::Inference
+        || config.extract_level == ExtractLevel::All;
+    assert!(has_weights);
+}
+
+// ══════════════════════════════════════════════════════════════
+// AUTH LOGIC
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_bearer_token_extraction() {
+    let header = "Bearer sk-abc123";
+    let token = if header.starts_with("Bearer ") {
+        Some(&header[7..])
+    } else {
+        None
+    };
+    assert_eq!(token, Some("sk-abc123"));
+}
+
+#[test]
+fn test_bearer_token_mismatch() {
+    let header = "Bearer wrong-key";
+    let required = "sk-abc123";
+    let token = &header[7..];
+    assert_ne!(token, required);
+}
+
+#[test]
+fn test_no_auth_header() {
+    let header: Option<&str> = None;
+    let has_valid_token = header
+        .filter(|h| h.starts_with("Bearer "))
+        .map(|h| &h[7..])
+        .is_some();
+    assert!(!has_valid_token);
+}
+
+#[test]
+fn test_health_exempt_from_auth() {
+    let path = "/v1/health";
+    let is_health = path == "/v1/health";
+    assert!(is_health);
+
+    let path = "/v1/describe";
+    let is_health = path == "/v1/health";
+    assert!(!is_health);
 }

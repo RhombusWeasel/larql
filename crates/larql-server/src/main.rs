@@ -1,5 +1,6 @@
 //! larql-server — HTTP server for vindex knowledge queries.
 
+mod auth;
 mod error;
 mod routes;
 mod state;
@@ -7,6 +8,7 @@ mod state;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::middleware;
 use clap::Parser;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -16,7 +18,7 @@ use larql_vindex::{
     load_vindex_config, load_vindex_embeddings, load_vindex_tokenizer,
 };
 
-use state::{AppState, LoadedModel, model_id_from_name};
+use state::{AppState, LoadedModel, model_id_from_name, load_probe_labels};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -51,9 +53,25 @@ struct Cli {
     #[arg(long)]
     cors: bool,
 
+    /// API key for authentication (clients send Authorization: Bearer <key>).
+    #[arg(long)]
+    api_key: Option<String>,
+
+    /// Max concurrent requests.
+    #[arg(long, default_value = "100")]
+    max_concurrent: usize,
+
     /// Logging level.
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// TLS certificate path for HTTPS.
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+
+    /// TLS private key path for HTTPS.
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
 }
 
 fn load_single_vindex(path_str: &str, no_infer: bool) -> Result<LoadedModel, BoxError> {
@@ -74,6 +92,10 @@ fn load_single_vindex(path_str: &str, no_infer: bool) -> Result<LoadedModel, Box
     let index = VectorIndex::load_vindex(&path, &mut cb)?;
     let total_features: usize = config.layers.iter().map(|l| l.num_features).sum();
 
+    let has_weights = config.has_model_weights
+        || config.extract_level == larql_vindex::ExtractLevel::Inference
+        || config.extract_level == larql_vindex::ExtractLevel::All;
+
     info!(
         "  Model: {} ({} layers, {} features)",
         model_name, config.num_layers, total_features
@@ -86,6 +108,19 @@ fn load_single_vindex(path_str: &str, no_infer: bool) -> Result<LoadedModel, Box
 
     let patched = PatchedVindex::new(index);
 
+    let probe_labels = load_probe_labels(&path);
+    if !probe_labels.is_empty() {
+        info!("  Labels: {} probe-confirmed", probe_labels.len());
+    }
+
+    if no_infer {
+        info!("  Infer: disabled (--no-infer)");
+    } else if has_weights {
+        info!("  Infer: available (weights detected, will lazy-load on first request)");
+    } else {
+        info!("  Infer: not available (no model weights in vindex)");
+    }
+
     Ok(LoadedModel {
         id,
         path,
@@ -95,6 +130,8 @@ fn load_single_vindex(path_str: &str, no_infer: bool) -> Result<LoadedModel, Box
         embed_scale,
         tokenizer,
         infer_disabled: no_infer,
+        weights: std::sync::OnceLock::new(),
+        probe_labels,
     })
 }
 
@@ -114,7 +151,14 @@ fn discover_vindexes(dir: &PathBuf) -> Vec<PathBuf> {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    let cli = Cli::parse();
+    // Accept both `larql-server <path>` and `larql-server serve <path>`.
+    let args: Vec<String> = std::env::args().collect();
+    let filtered: Vec<String> = if args.len() > 1 && args[1] == "serve" {
+        std::iter::once(args[0].clone()).chain(args[2..].iter().cloned()).collect()
+    } else {
+        args
+    };
+    let cli = Cli::parse_from(filtered);
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -154,6 +198,7 @@ async fn main() -> Result<(), BoxError> {
         models: models.clone(),
         started_at: std::time::Instant::now(),
         requests_served: std::sync::atomic::AtomicU64::new(0),
+        api_key: cli.api_key.clone(),
     });
 
     let is_multi = state.is_multi_model();
@@ -162,26 +207,56 @@ async fn main() -> Result<(), BoxError> {
         for m in &state.models {
             info!("  /v1/{}/...", m.id);
         }
-        routes::multi_model_router(state)
+        routes::multi_model_router(Arc::clone(&state))
     } else {
         let m = &models[0];
         info!("Single-model mode: {}", m.config.model);
-        routes::single_model_router(state)
+        routes::single_model_router(Arc::clone(&state))
     };
 
+    // Auth middleware (if --api-key set).
+    if cli.api_key.is_some() {
+        app = app.layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::auth_middleware,
+        ));
+        info!("Auth: API key required");
+    }
+
+    // CORS middleware.
     if cli.cors {
         use tower_http::cors::CorsLayer;
         app = app.layer(CorsLayer::permissive());
         info!("CORS: enabled");
     }
 
+    // Concurrency limit.
+    app = app.layer(tower::limit::ConcurrencyLimitLayer::new(cli.max_concurrent));
+    info!("Max concurrent: {}", cli.max_concurrent);
+
+    // Trace middleware.
     app = app.layer(tower_http::trace::TraceLayer::new_for_http());
 
     let addr = format!("{}:{}", cli.host, cli.port);
-    info!("Listening: http://{}", addr);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    // TLS or plain HTTP.
+    if let (Some(cert_path), Some(key_path)) = (&cli.tls_cert, &cli.tls_key) {
+        info!("TLS: enabled ({}, {})", cert_path.display(), key_path.display());
+        info!("Listening: https://{}", addr);
+
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            cert_path, key_path,
+        )
+        .await?;
+
+        axum_server::bind_rustls(addr.parse()?, tls_config)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        info!("Listening: http://{}", addr);
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        axum::serve(listener, app).await?;
+    }
 
     Ok(())
 }

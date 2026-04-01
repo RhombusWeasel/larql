@@ -197,6 +197,22 @@ struct ServeArgs {
     #[arg(long)]
     cors: bool,
 
+    /// API key for authentication.
+    #[arg(long)]
+    api_key: Option<String>,
+
+    /// Max concurrent requests.
+    #[arg(long, default_value = "100")]
+    max_concurrent: usize,
+
+    /// TLS certificate path.
+    #[arg(long)]
+    tls_cert: Option<std::path::PathBuf>,
+
+    /// TLS private key path.
+    #[arg(long)]
+    tls_key: Option<std::path::PathBuf>,
+
     /// Logging level.
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -284,11 +300,25 @@ fn main() {
             cmd_args.push(args.host.clone());
             cmd_args.push("--log-level".into());
             cmd_args.push(args.log_level.clone());
+            cmd_args.push("--max-concurrent".into());
+            cmd_args.push(args.max_concurrent.to_string());
             if args.no_infer {
                 cmd_args.push("--no-infer".into());
             }
             if args.cors {
                 cmd_args.push("--cors".into());
+            }
+            if let Some(ref key) = args.api_key {
+                cmd_args.push("--api-key".into());
+                cmd_args.push(key.clone());
+            }
+            if let Some(ref cert) = args.tls_cert {
+                cmd_args.push("--tls-cert".into());
+                cmd_args.push(cert.display().to_string());
+            }
+            if let Some(ref key) = args.tls_key {
+                cmd_args.push("--tls-key".into());
+                cmd_args.push(key.display().to_string());
             }
 
             // Try to find larql-server binary next to this binary.

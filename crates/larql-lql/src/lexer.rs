@@ -118,6 +118,7 @@ pub enum Keyword {
     Remove,
     Patch,
     Patches,
+    Remote,
 }
 
 impl Keyword {
@@ -207,6 +208,7 @@ impl Keyword {
             "REMOVE" => Some(Self::Remove),
             "PATCH" => Some(Self::Patch),
             "PATCHES" => Some(Self::Patches),
+            "REMOTE" => Some(Self::Remote),
             _ => None,
         }
     }

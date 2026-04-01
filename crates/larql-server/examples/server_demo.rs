@@ -2,7 +2,7 @@
 //!
 //! Run: cargo run -p larql-server --example server_demo
 
-use larql_vindex::ndarray::{Array1, Array2};
+use larql_vindex::ndarray::Array2;
 use larql_vindex::{FeatureMeta, PatchedVindex, VectorIndex, VindexPatch, PatchOp};
 
 use std::collections::HashMap;
@@ -267,10 +267,62 @@ fn main() {
     }
     println!("\nActive patches: {}", patched_mut.num_patches());
 
-    // ── 7. HEALTH (GET /v1/health) ──
+    // ── 7. PROBE LABELS (relation classifier in DESCRIBE) ──
+    section("DESCRIBE with probe labels");
+
+    let mut probe_labels: HashMap<(usize, usize), String> = HashMap::new();
+    probe_labels.insert((1, 0), "capital".into());
+    probe_labels.insert((1, 1), "language".into());
+    probe_labels.insert((2, 0), "capital".into());
+    probe_labels.insert((2, 2), "continent".into());
+
+    println!("Probe labels loaded: {} confirmed", probe_labels.len());
+    println!("{{");
+    println!("  \"entity\": \"France\",");
+    println!("  \"edges\": [");
+
+    let trace = patched.walk(&query, &[1, 2], 3);
+    let mut edge_idx = 0;
+    for (layer, hits) in &trace.layers {
+        for hit in hits.iter().take(2) {
+            let tok = hit.meta.top_token.trim();
+            if tok.len() < 2 { continue; }
+            let comma = if edge_idx > 0 { "" } else { "" };
+            if let Some(label) = probe_labels.get(&(*layer, hit.feature)) {
+                println!(
+                    "    {{\"relation\": \"{}\", \"target\": \"{}\", \"gate_score\": {:.1}, \"layer\": {}, \"source\": \"probe\"}}{}",
+                    label, tok, hit.gate_score, layer, comma
+                );
+            } else {
+                println!(
+                    "    {{\"target\": \"{}\", \"gate_score\": {:.1}, \"layer\": {}}}{}",
+                    tok, hit.gate_score, layer, comma
+                );
+            }
+            edge_idx += 1;
+        }
+    }
+    println!("  ]");
+    println!("}}");
+
+    // ── 8. AUTH (--api-key) ──
+    section("Authentication");
+    println!("With --api-key \"sk-abc123\":");
+    println!("  curl -H \"Authorization: Bearer sk-abc123\" http://localhost:8080/v1/describe?entity=France");
+    println!("  → 200 OK (valid token)");
+    println!();
+    println!("  curl http://localhost:8080/v1/describe?entity=France");
+    println!("  → 401 Unauthorized (no token)");
+    println!();
+    println!("  curl http://localhost:8080/v1/health");
+    println!("  → 200 OK (health exempt from auth)");
+
+    // ── 9. HEALTH (GET /v1/health) ──
     section("GET /v1/health");
-    println!("{{\"status\": \"ok\", \"uptime_seconds\": 0, \"requests_served\": 6}}");
+    println!("{{\"status\": \"ok\", \"uptime_seconds\": 0, \"requests_served\": 9}}");
 
     println!("\n── Demo complete ──");
     println!("To run the real server: larql serve <path-to-vindex> --port 8080");
+    println!("  With auth: larql serve <path> --api-key \"sk-abc123\"");
+    println!("  With TLS:  larql serve <path> --tls-cert cert.pem --tls-key key.pem");
 }

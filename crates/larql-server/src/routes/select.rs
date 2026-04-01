@@ -13,7 +13,9 @@ use crate::state::{AppState, LoadedModel};
 pub struct SelectRequest {
     #[serde(default)]
     pub entity: Option<String>,
+    /// Filter by relation label (future: requires relation classifier).
     #[serde(default)]
+    #[allow(dead_code)]
     pub relation: Option<String>,
     #[serde(default)]
     pub layer: Option<usize>,

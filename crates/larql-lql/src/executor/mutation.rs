@@ -322,7 +322,7 @@ impl Session {
         } else {
             match &self.backend {
                 Backend::Vindex { path, .. } => path.clone(),
-                Backend::None => return Err(LqlError::NoBackend),
+                _ => return Err(LqlError::NoBackend),
             }
         };
 

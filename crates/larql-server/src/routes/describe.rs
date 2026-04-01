@@ -98,6 +98,7 @@ fn describe_entity(
         original: String,
         also: Vec<String>,
         best_layer: usize,
+        best_feature: usize,
     }
 
     let entity_lower = params.entity.to_lowercase();
@@ -137,6 +138,7 @@ fn describe_entity(
             let entry = edges.entry(key).or_insert_with(|| EdgeInfo {
                 gate: 0.0,
                 layers: Vec::new(),
+                best_feature: hit.feature,
                 count: 0,
                 original: tok_trimmed.to_string(),
                 also,
@@ -146,6 +148,7 @@ fn describe_entity(
             if hit.gate_score > entry.gate {
                 entry.gate = hit.gate_score;
                 entry.best_layer = *layer_idx;
+                entry.best_feature = hit.feature;
             }
             if !entry.layers.contains(layer_idx) {
                 entry.layers.push(*layer_idx);
@@ -169,6 +172,12 @@ fn describe_entity(
                 "gate_score": (info.gate * 10.0).round() / 10.0,
                 "layer": info.best_layer,
             });
+
+            // Probe-confirmed relation label.
+            if let Some(label) = model.probe_labels.get(&(info.best_layer, info.best_feature)) {
+                edge["relation"] = serde_json::json!(label);
+                edge["source"] = serde_json::json!("probe");
+            }
 
             if params.verbose {
                 edge["layer_max"] = serde_json::json!(max_l);

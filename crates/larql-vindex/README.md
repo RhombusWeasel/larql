@@ -42,7 +42,8 @@ baked.save_vindex(&output_path, &mut config)?;
 - **Vindexfile** — declarative model builds (FROM + PATCH + INSERT, like Dockerfile)
 - **HuggingFace Hub** — download and publish vindexes (`hf://user/repo` URI scheme)
 - **Split weight files** — gate, up, down, attn, norms, lm_head (no duplication)
-- **Binary down_meta** — 80x smaller than JSONL
+- **Zero-copy mmap** — gate vectors sliced directly from disk, no heap allocation
+- **Binary down_meta** — compact binary format (no JSONL)
 - **f16 storage** — halves file sizes with negligible accuracy loss
 - **MoE support** — Mixtral, DeepSeek (experts as contiguous features)
 - **Layer bands** — per-family boundaries (Gemma, Llama, Qwen, etc.)
@@ -113,7 +114,6 @@ model.vindex/
 ├── gate_vectors.bin        W_gate per layer (KNN index)
 ├── embeddings.bin          W_embed matrix
 ├── down_meta.bin           Per-feature output metadata (binary)
-├── down_meta.jsonl         Per-feature output metadata (JSONL, compat)
 ├── attn_weights.bin        Q, K, V, O per layer
 ├── up_weights.bin          W_up per layer
 ├── down_weights.bin        W_down per layer

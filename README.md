@@ -258,7 +258,7 @@ MoE models store all experts' features in one flat index. Gate KNN naturally sel
 
 ```bash
 cargo build --release       # optimized build
-cargo test                  # 545 tests across all crates
+cargo test                  # 124+ vindex tests, 545+ across all crates
 cargo run -p larql-vindex --example vindex_demo    # vindex feature demo
 cargo run -p larql-vindex --example vindex_bench --release  # benchmarks
 cargo run -p larql-lql --example parser_demo       # parser demo

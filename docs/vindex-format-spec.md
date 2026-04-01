@@ -454,7 +454,9 @@ Legacy `model_weights.bin` is still supported for loading. The engine checks for
 
 ### 11.1 Memory-Mapped Loading — IMPLEMENTED
 
-`gate_vectors.bin` and `embeddings.bin` are loaded via `mmap` (memmap2). The OS pages data in on demand — no heap allocation for the raw file. Multiple vindexes can share physical memory for overlapping pages.
+`gate_vectors.bin` and `embeddings.bin` are loaded via `mmap` (memmap2). For f32 files, gate KNN reinterprets the mmap'd bytes directly as `&[f32]` — zero heap allocation, zero copy. The OS pages data in on demand. Only queried layers consume physical RAM.
+
+Saves use atomic write-to-temp + rename to avoid invalidating active mmaps. Multiple vindexes can share physical memory for overlapping pages.
 
 ### 11.2 Checksums and Verification — IMPLEMENTED
 

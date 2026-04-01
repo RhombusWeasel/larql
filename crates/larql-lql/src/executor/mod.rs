@@ -8,6 +8,7 @@ mod introspection;
 mod lifecycle;
 mod mutation;
 mod query;
+mod remote;
 
 #[cfg(test)]
 mod tests;
@@ -29,6 +30,11 @@ pub(crate) enum Backend {
         /// go through this. The base files on disk are never modified.
         patched: larql_vindex::PatchedVindex,
         relation_classifier: Option<RelationClassifier>,
+    },
+    /// Remote server backend — queries forwarded via HTTP.
+    Remote {
+        url: String,
+        client: reqwest::blocking::Client,
     },
     None,
 }
@@ -73,6 +79,11 @@ impl Session {
     }
 
     pub fn execute(&mut self, stmt: &Statement) -> Result<Vec<String>, LqlError> {
+        // Remote backend: forward supported queries via HTTP.
+        if self.is_remote() {
+            return self.execute_remote(stmt);
+        }
+
         match stmt {
             Statement::Pipe { left, right } => {
                 let mut out = self.execute(left)?;
@@ -143,6 +154,34 @@ impl Session {
         }
     }
 
+    /// Execute a statement against a remote backend.
+    fn execute_remote(&mut self, stmt: &Statement) -> Result<Vec<String>, LqlError> {
+        match stmt {
+            Statement::Use { target } => self.exec_use(target),
+            Statement::Describe { entity, band, verbose, .. } => {
+                self.remote_describe(entity, *band, *verbose)
+            }
+            Statement::Walk { prompt, top, layers, .. } => {
+                self.remote_walk(prompt, *top, layers.as_ref())
+            }
+            Statement::Infer { prompt, top, compare } => {
+                self.remote_infer(prompt, *top, *compare)
+            }
+            Statement::Stats { .. } => self.remote_stats(),
+            Statement::ShowRelations { .. } => self.remote_show_relations(),
+            Statement::Pipe { left, right } => {
+                let mut out = self.execute(left)?;
+                out.extend(self.execute(right)?);
+                Ok(out)
+            }
+            _ => Err(LqlError::Execution(
+                "this statement is not supported on a remote backend. \
+                 Supported: DESCRIBE, WALK, INFER, STATS, SHOW RELATIONS, USE"
+                    .into(),
+            )),
+        }
+    }
+
     // ── Patch execution ──
 
     fn exec_begin_patch(&mut self, path: &str) -> Result<Vec<String>, LqlError> {
@@ -178,7 +217,7 @@ impl Session {
 
         let model_name = match &self.backend {
             Backend::Vindex { config, .. } => config.model.clone(),
-            Backend::None => "unknown".into(),
+            _ => "unknown".into(),
         };
 
         let patch = larql_vindex::VindexPatch {
@@ -222,7 +261,7 @@ impl Session {
             Backend::Vindex { patched, .. } => {
                 patched.apply_patch(patch);
             }
-            Backend::None => return Err(LqlError::NoBackend),
+            _ => return Err(LqlError::NoBackend),
         }
 
         Ok(vec![format!(
@@ -266,7 +305,7 @@ impl Session {
     fn exec_remove_patch(&mut self, path: &str) -> Result<Vec<String>, LqlError> {
         let patched = match &mut self.backend {
             Backend::Vindex { patched, .. } => patched,
-            Backend::None => return Err(LqlError::NoBackend),
+            _ => return Err(LqlError::NoBackend),
         };
 
         let pos = patched.patches.iter().position(|p| {
@@ -289,7 +328,7 @@ impl Session {
     ) -> Result<&larql_vindex::PatchedVindex, LqlError> {
         match &self.backend {
             Backend::Vindex { patched, .. } => Ok(patched),
-            Backend::None => Err(LqlError::NoBackend),
+            _ => Err(LqlError::NoBackend),
         }
     }
 
@@ -299,7 +338,7 @@ impl Session {
     ) -> Result<(&Path, &larql_vindex::VindexConfig, &mut larql_vindex::PatchedVindex), LqlError> {
         match &mut self.backend {
             Backend::Vindex { path, config, patched, .. } => Ok((path, config, patched)),
-            Backend::None => Err(LqlError::NoBackend),
+            _ => Err(LqlError::NoBackend),
         }
     }
 
@@ -310,14 +349,14 @@ impl Session {
     {
         match &self.backend {
             Backend::Vindex { path, config, patched, .. } => Ok((path, config, patched)),
-            Backend::None => Err(LqlError::NoBackend),
+            _ => Err(LqlError::NoBackend),
         }
     }
 
     pub(crate) fn relation_classifier(&self) -> Option<&RelationClassifier> {
         match &self.backend {
             Backend::Vindex { relation_classifier, .. } => relation_classifier.as_ref(),
-            Backend::None => None,
+            _ => None,
         }
     }
 }

@@ -136,6 +136,7 @@ pub enum VindexRef {
 pub enum UseTarget {
     Vindex(String),
     Model { id: String, auto_extract: bool },
+    Remote(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

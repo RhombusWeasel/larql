@@ -2,6 +2,7 @@
 
 pub mod describe;
 pub mod health;
+pub mod infer;
 pub mod models;
 pub mod patches;
 pub mod relations;
@@ -24,6 +25,7 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route("/v1/select", post(select::handle_select))
         .route("/v1/relations", get(relations::handle_relations))
         .route("/v1/stats", get(stats::handle_stats))
+        .route("/v1/infer", post(infer::handle_infer))
         .route("/v1/patches/apply", post(patches::handle_apply_patch))
         .route("/v1/patches", get(patches::handle_list_patches))
         .route("/v1/patches/{name}", delete(patches::handle_remove_patch))
@@ -34,20 +36,17 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
 
 /// Build the router for multi-model serving.
 pub fn multi_model_router(state: Arc<AppState>) -> Router {
-    let mut router = Router::new()
+    Router::new()
         .route("/v1/health", get(health::handle_health))
-        .route("/v1/models", get(models::handle_models));
-
-    // Per-model routes: /v1/{model_id}/describe, etc.
-    router = router
+        .route("/v1/models", get(models::handle_models))
         .route("/v1/{model_id}/describe", get(describe::handle_describe_multi))
         .route("/v1/{model_id}/walk", get(walk::handle_walk_multi))
         .route("/v1/{model_id}/select", post(select::handle_select_multi))
         .route("/v1/{model_id}/relations", get(relations::handle_relations_multi))
         .route("/v1/{model_id}/stats", get(stats::handle_stats_multi))
+        .route("/v1/{model_id}/infer", post(infer::handle_infer_multi))
         .route("/v1/{model_id}/patches/apply", post(patches::handle_apply_patch_multi))
         .route("/v1/{model_id}/patches", get(patches::handle_list_patches_multi))
-        .route("/v1/{model_id}/patches/{name}", delete(patches::handle_remove_patch_multi));
-
-    router.with_state(state)
+        .route("/v1/{model_id}/patches/{name}", delete(patches::handle_remove_patch_multi))
+        .with_state(state)
 }

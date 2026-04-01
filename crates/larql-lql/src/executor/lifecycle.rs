@@ -80,6 +80,7 @@ impl Session {
                 }
                 Ok(out)
             }
+            UseTarget::Remote(url) => self.exec_use_remote(url),
         }
     }
 
@@ -238,6 +239,7 @@ impl Session {
                 out.push(format!("Path:            {}", path.display()));
                 Ok(out)
             }
+            Backend::Remote { .. } => self.remote_stats(),
             Backend::None => Err(LqlError::NoBackend),
         }
     }
@@ -333,7 +335,7 @@ impl Session {
             VindexRef::Current => {
                 match &self.backend {
                     Backend::Vindex { path, .. } => path.clone(),
-                    Backend::None => return Err(LqlError::NoBackend),
+                    _ => return Err(LqlError::NoBackend),
                 }
             }
             VindexRef::Path(p) => PathBuf::from(p),
@@ -610,7 +612,7 @@ impl Session {
 
             let model_name = match &self.backend {
                 Backend::Vindex { config, .. } => config.model.clone(),
-                Backend::None => "unknown".into(),
+                _ => "unknown".into(),
             };
 
             let patch = larql_vindex::VindexPatch {
@@ -641,7 +643,7 @@ impl Session {
         match vref {
             VindexRef::Current => match &self.backend {
                 Backend::Vindex { path, .. } => Ok(path.clone()),
-                Backend::None => Err(LqlError::NoBackend),
+                _ => Err(LqlError::NoBackend),
             },
             VindexRef::Path(p) => {
                 let path = PathBuf::from(p);

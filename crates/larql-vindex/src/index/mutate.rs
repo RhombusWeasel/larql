@@ -31,11 +31,42 @@ impl VectorIndex {
 
     /// Set the gate vector for a specific feature at a layer.
     /// The vector length must match hidden_size.
+    /// If the index is in mmap mode, promotes this layer to heap first.
     pub fn set_gate_vector(&mut self, layer: usize, feature: usize, vector: &Array1<f32>) {
+        // Promote from mmap to heap if needed
+        if self.gate_mmap_bytes.is_some() && self.gate_vectors.get(layer).map(|v| v.is_none()).unwrap_or(true) {
+            self.promote_layer_to_heap(layer);
+        }
+
         if let Some(Some(ref mut matrix)) = self.gate_vectors.get_mut(layer) {
             if feature < matrix.shape()[0] && vector.len() == matrix.shape()[1] {
                 for (j, val) in vector.iter().enumerate() {
                     matrix[[feature, j]] = *val;
+                }
+            }
+        }
+    }
+
+    /// Copy a layer's gate vectors from mmap to heap (for mutation).
+    fn promote_layer_to_heap(&mut self, layer: usize) {
+        if let Some(ref mmap) = self.gate_mmap_bytes {
+            if let Some(slice) = self.gate_mmap_slices.get(layer) {
+                if slice.num_features > 0 {
+                    let bpf = crate::config::dtype::bytes_per_float(self.gate_mmap_dtype);
+                    let byte_offset = slice.float_offset * bpf;
+                    let byte_count = slice.num_features * self.hidden_size * bpf;
+                    let byte_end = byte_offset + byte_count;
+                    if byte_end <= mmap.len() {
+                        let raw = &mmap[byte_offset..byte_end];
+                        let floats = crate::config::dtype::decode_floats(raw, self.gate_mmap_dtype);
+                        let matrix = ndarray::Array2::from_shape_vec(
+                            (slice.num_features, self.hidden_size), floats
+                        ).unwrap();
+                        while self.gate_vectors.len() <= layer {
+                            self.gate_vectors.push(None);
+                        }
+                        self.gate_vectors[layer] = Some(matrix);
+                    }
                 }
             }
         }
@@ -135,21 +166,43 @@ impl VectorIndex {
     }
 
     /// Write gate_vectors.bin back to disk and return updated layer info.
+    /// Handles both heap and mmap modes.
+    /// Writes to a temp file and renames to avoid invalidating active mmaps.
     pub fn save_gate_vectors(
         &self,
         dir: &Path,
     ) -> Result<Vec<crate::config::VindexLayerInfo>, VindexError> {
         let path = dir.join("gate_vectors.bin");
-        let file = std::fs::File::create(&path)?;
+        let tmp_path = dir.join("gate_vectors.bin.tmp");
+        let file = std::fs::File::create(&tmp_path)?;
         let mut writer = BufWriter::new(file);
         let mut layer_infos = Vec::new();
         let mut offset: u64 = 0;
 
-        for (layer, gate_opt) in self.gate_vectors.iter().enumerate() {
-            if let Some(ref matrix) = gate_opt {
-                let data = matrix.as_slice().ok_or_else(|| {
+        for layer in 0..self.num_layers {
+            // Try heap first (may have promoted layers), then mmap
+            let data: Option<Vec<f32>> = if let Some(Some(ref matrix)) = self.gate_vectors.get(layer) {
+                Some(matrix.as_slice().ok_or_else(|| {
                     VindexError::Parse("gate vectors not contiguous".into())
-                })?;
+                })?.to_vec())
+            } else if let Some(ref mmap) = self.gate_mmap_bytes {
+                if let Some(slice) = self.gate_mmap_slices.get(layer) {
+                    if slice.num_features > 0 {
+                        let bpf = crate::config::dtype::bytes_per_float(self.gate_mmap_dtype);
+                        let byte_offset = slice.float_offset * bpf;
+                        let byte_count = slice.num_features * self.hidden_size * bpf;
+                        let byte_end = byte_offset + byte_count;
+                        if byte_end <= mmap.len() {
+                            Some(crate::config::dtype::decode_floats(
+                                &mmap[byte_offset..byte_end], self.gate_mmap_dtype
+                            ))
+                        } else { None }
+                    } else { None }
+                } else { None }
+            } else { None };
+
+            if let Some(ref data) = data {
+                let num_features = data.len() / self.hidden_size;
                 let bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(
                         data.as_ptr() as *const u8,
@@ -161,7 +214,7 @@ impl VectorIndex {
                 let length = bytes.len() as u64;
                 layer_infos.push(crate::config::VindexLayerInfo {
                     layer,
-                    num_features: matrix.shape()[0],
+                    num_features,
                     offset,
                     length,
                     num_experts: None,
@@ -172,6 +225,8 @@ impl VectorIndex {
         }
 
         writer.flush()?;
+        drop(writer); // close file before rename
+        std::fs::rename(&tmp_path, &path)?;
         Ok(layer_infos)
     }
 

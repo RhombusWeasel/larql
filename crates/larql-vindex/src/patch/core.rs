@@ -418,15 +418,36 @@ impl PatchedVindex {
         WalkTrace { layers: trace_layers }
     }
 
-    /// Flatten all patches into the base, producing a new clean VectorIndex.
+    /// Flatten all patches into the base, producing a new clean VectorIndex (heap mode).
     pub fn bake_down(&self) -> VectorIndex {
         let mut new_gate = Vec::new();
         let mut new_meta = Vec::new();
 
         for layer in 0..self.base.num_layers {
-            // Clone base gate vectors
-            let gate = self.base.gate_vectors_at(layer).map(|g| {
-                let mut g = g.clone();
+            // Get base gate vectors (from heap or mmap)
+            let base_gate = if let Some(g) = self.base.gate_vectors_at(layer) {
+                Some(g.clone())
+            } else if let Some(ref mmap) = self.base.gate_mmap_bytes {
+                // Mmap mode — decode this layer's slice to an Array2
+                self.base.gate_mmap_slices.get(layer).and_then(|slice| {
+                    if slice.num_features == 0 { return None; }
+                    let bpf = crate::config::dtype::bytes_per_float(self.base.gate_mmap_dtype);
+                    let byte_offset = slice.float_offset * bpf;
+                    let byte_count = slice.num_features * self.base.hidden_size * bpf;
+                    let byte_end = byte_offset + byte_count;
+                    if byte_end > mmap.len() { return None; }
+                    let floats = crate::config::dtype::decode_floats(
+                        &mmap[byte_offset..byte_end], self.base.gate_mmap_dtype
+                    );
+                    ndarray::Array2::from_shape_vec(
+                        (slice.num_features, self.base.hidden_size), floats
+                    ).ok()
+                })
+            } else {
+                None
+            };
+
+            let gate = base_gate.map(|mut g| {
                 // Apply gate vector overrides
                 for (&(l, f), vec) in &self.overrides_gate {
                     if l != layer { continue; }

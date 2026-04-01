@@ -38,22 +38,20 @@ impl VectorIndex {
         let gate_path = dir.join("gate_vectors.bin");
         let gate_file = std::fs::File::open(&gate_path)?;
         let gate_mmap = unsafe { memmap2::Mmap::map(&gate_file)? };
-        let gate_floats = crate::config::dtype::decode_floats(&gate_mmap, config.dtype);
-
-        let mut gate_vectors: Vec<Option<Array2<f32>>> = vec![None; num_layers];
-        let mut total_gate = 0;
         let bpf = crate::config::dtype::bytes_per_float(config.dtype);
 
+        // Build per-layer slice info — offsets in floats (not bytes)
+        let mut gate_slices: Vec<crate::index::core::GateLayerSlice> = vec![
+            crate::index::core::GateLayerSlice { float_offset: 0, num_features: 0 };
+            num_layers
+        ];
+        let mut total_gate = 0;
+
         for info in &config.layers {
-            let float_offset = info.offset as usize / bpf;
-            let float_count = info.num_features * hidden_size;
-            let layer_data = &gate_floats[float_offset..float_offset + float_count];
-            let matrix = Array2::from_shape_vec(
-                (info.num_features, hidden_size),
-                layer_data.to_vec(),
-            )
-            .map_err(|e| VindexError::Parse(e.to_string()))?;
-            gate_vectors[info.layer] = Some(matrix);
+            gate_slices[info.layer] = crate::index::core::GateLayerSlice {
+                float_offset: info.offset as usize / bpf,
+                num_features: info.num_features,
+            };
             total_gate += info.num_features;
         }
 
@@ -146,7 +144,7 @@ impl VectorIndex {
         };
         let _ = down_count; // used in callbacks above
 
-        Ok(VectorIndex::new(gate_vectors, down_meta, num_layers, hidden_size))
+        Ok(VectorIndex::new_mmap(gate_mmap, gate_slices, config.dtype, down_meta, num_layers, hidden_size))
     }
 }
 

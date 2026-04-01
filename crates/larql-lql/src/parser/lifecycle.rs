@@ -134,6 +134,10 @@ impl Parser {
                 self.advance();
             }
             UseTarget::Model { id, auto_extract }
+        } else if self.check_keyword(Keyword::Remote) {
+            self.advance();
+            let url = self.expect_string()?;
+            UseTarget::Remote(url)
         } else {
             let path = self.expect_string()?;
             UseTarget::Vindex(path)
