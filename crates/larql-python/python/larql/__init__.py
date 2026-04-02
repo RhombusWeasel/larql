@@ -89,6 +89,12 @@ try:
 except ImportError:
     mlx = None
 
+# Sparse FFN: Rust feature selection + MLX matmul on Metal
+try:
+    from larql import sparse_ffn
+except ImportError:
+    sparse_ffn = None
+
 __version__ = "0.1.0"
 
 __all__ = [

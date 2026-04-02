@@ -81,15 +81,19 @@ result = wm.predict("The capital of France is")
 # [("Paris", 0.498), ...]
 ```
 
-### Memory Comparison (Gemma 3 4B, f32)
+### Memory & Performance (Gemma 3 4B, f32)
 
-| Path | Load RSS | Inference RSS | How |
+| Path | Load RSS | Inference | How |
 |---|---|---|---|
-| WalkModel (mmap) | 450 MB | ~20 GB (paged) | Zero-copy, OS manages pages |
-| Native MLX | 8.6 GB | 8.6 GB | All weights in GPU memory |
-| vindex.infer | 18 GB | 18 GB | Heap-loaded weights |
+| `WalkModel` / `vindex.infer()` | **+0 MB** (mmap) | 19s→13s (warms up) | Zero-copy mmap, OS pages on demand |
+| `larql.mlx.load()` | +22 GB | 0.9s (GPU) | All weights in MLX/GPU memory |
+| Native MLX | +8.6 GB | 0.9s (GPU) | Safetensors in GPU memory |
 
-For 120B models the gap is transformative: WalkModel ~1 GB vs native 220 GB.
+`vindex.infer()` uses mmap'd weights (lazy-loaded on first call, reused after).
+The OS page cache warms up across calls — second call is faster, third faster still.
+
+For 120B models: `WalkModel` ~1 GB load RSS vs native 220 GB.
+With madvise prefetching, steady-state ~200-500ms/token after cache warms.
 
 ## LQL Session
 

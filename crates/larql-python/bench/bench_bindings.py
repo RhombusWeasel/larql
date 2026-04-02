@@ -55,46 +55,57 @@ def main():
     last_knowledge = bands["knowledge"][1]
 
     bench("embed('France')", lambda: vindex.embed("France"))
-    bench("tokenize('hello world')", lambda: vindex.tokenize("hello world"))
     bench("gate_vector(L27, F0)", lambda: vindex.gate_vector(last_knowledge, 0))
     bench("gate_vectors(L27)", lambda: vindex.gate_vectors(last_knowledge), n=3)
-
     embed = vindex.embed("France")
     bench("gate_knn(L27, top=10)", lambda: vindex.gate_knn(last_knowledge, embed.tolist(), 10))
     bench("entity_knn('France', L27)", lambda: vindex.entity_knn("France", last_knowledge, 10))
-
     layers = list(range(bands["knowledge"][0], bands["knowledge"][1] + 1))
     bench("entity_walk('France', knowledge)", lambda: vindex.entity_walk("France", layers, 5))
     bench("describe('France')", lambda: vindex.describe("France"), n=5)
     bench("relations()", lambda: vindex.relations(), n=5)
     bench("cluster_centre('capital')", lambda: vindex.cluster_centre("capital"))
-    bench("stats()", lambda: vindex.stats())
     print()
 
-    # ── Inference ──
-    print("=== Inference ===")
-
-    # vindex.infer (loads weights each time — one-shot)
+    # ── Inference: mmap'd (vindex.infer) ──
+    print("=== Inference (vindex.infer — mmap'd, cached) ===")
     r2 = rss_mb()
     t2 = time.perf_counter()
     result = vindex.infer("The capital of France is", top_k_predictions=1)
     t3 = time.perf_counter()
     r3 = rss_mb()
-    print(f"  {'vindex.infer()':<35} {(t3-t2)*1000:>8.0f}ms  RSS: +{r3-r2:.0f} MB  → {result[0][0]}")
+    print(f"  {'1st call (cold mmap)':<35} {(t3-t2)*1000:>8.0f}ms  RSS: +{r3-r2:.0f} MB  → {result[0][0]}")
 
-    # WalkModel (zero-copy mmap)
-    r4 = rss_mb()
     t4 = time.perf_counter()
-    wm = larql.WalkModel(VINDEX_PATH, top_k=4096)
+    result2 = vindex.infer("The largest planet is", top_k_predictions=1)
     t5 = time.perf_counter()
-    r5 = rss_mb()
-    print(f"  {'WalkModel load (mmap)':<35} {(t5-t4)*1000:>8.0f}ms  RSS: {r5:.0f} MB (+{r5-r4:.0f})")
+    print(f"  {'2nd call (warm cache)':<35} {(t5-t4)*1000:>8.0f}ms  → {result2[0][0]}")
 
     t6 = time.perf_counter()
-    result2 = wm.predict("The capital of France is")
+    result3 = vindex.infer("Water boils at", top_k_predictions=1)
     t7 = time.perf_counter()
+    print(f"  {'3rd call (hot cache)':<35} {(t7-t6)*1000:>8.0f}ms  → {result3[0][0]}")
+    print()
+
+    # ── WalkModel (zero-copy mmap) ──
+    print("=== WalkModel (zero-copy mmap) ===")
+    r4 = rss_mb()
+    t8 = time.perf_counter()
+    wm = larql.WalkModel(VINDEX_PATH, top_k=4096)
+    t9 = time.perf_counter()
+    r5 = rss_mb()
+    print(f"  {'load (mmap)':<35} {(t9-t8)*1000:>8.0f}ms  RSS: {r5:.0f} MB (+{r5-r4:.0f})")
+
+    t10 = time.perf_counter()
+    result4 = wm.predict("The capital of France is")
+    t11 = time.perf_counter()
     r6 = rss_mb()
-    print(f"  {'WalkModel.predict(k=4096)':<35} {(t7-t6)*1000:>8.0f}ms  RSS: {r6:.0f} MB (+{r6-r5:.0f})  → {result2[0][0]}")
+    print(f"  {'predict (1st, cold)':<35} {(t11-t10)*1000:>8.0f}ms  RSS: {r6:.0f} MB  → {result4[0][0]}")
+
+    t12 = time.perf_counter()
+    result5 = wm.predict("The largest planet is")
+    t13 = time.perf_counter()
+    print(f"  {'predict (2nd, warm)':<35} {(t13-t12)*1000:>8.0f}ms  → {result5[0][0]}")
     print()
 
     # ── MLX ──
@@ -102,37 +113,41 @@ def main():
     try:
         import mlx_lm
 
-        # larql.mlx.load
         r7 = rss_mb()
-        t8 = time.perf_counter()
+        t14 = time.perf_counter()
         model, tokenizer = larql.mlx.load(VINDEX_PATH)
-        t9 = time.perf_counter()
+        t15 = time.perf_counter()
         r8 = rss_mb()
-        print(f"  {'larql.mlx.load()':<35} {(t9-t8)*1000:>8.0f}ms  RSS: {r8:.0f} MB (+{r8-r7:.0f})")
+        print(f"  {'larql.mlx.load()':<35} {(t15-t14)*1000:>8.0f}ms  RSS: +{r8-r7:.0f} MB")
 
-        t10 = time.perf_counter()
+        t16 = time.perf_counter()
         resp = mlx_lm.generate(model, tokenizer, prompt="The capital of France is", max_tokens=5, verbose=False)
-        t11 = time.perf_counter()
-        print(f"  {'mlx generate (5 tok)':<35} {(t11-t10)*1000:>8.0f}ms  → {resp.strip()}")
+        t17 = time.perf_counter()
+        print(f"  {'generate (5 tok)':<35} {(t17-t16)*1000:>8.0f}ms  → {resp.strip()}")
         del model, tokenizer
 
-        # Native MLX
         import gc; gc.collect()
         r9 = rss_mb()
-        t12 = time.perf_counter()
+        t18 = time.perf_counter()
         model2, tok2 = mlx_lm.load("google/gemma-3-4b-it")
-        t13 = time.perf_counter()
+        t19 = time.perf_counter()
         r10 = rss_mb()
-        print(f"  {'mlx_lm.load() (native)':<35} {(t13-t12)*1000:>8.0f}ms  RSS: {r10:.0f} MB (+{r10-r9:.0f})")
+        print(f"  {'mlx_lm.load() (native)':<35} {(t19-t18)*1000:>8.0f}ms  RSS: +{r10-r9:.0f} MB")
 
-        t14 = time.perf_counter()
+        t20 = time.perf_counter()
         resp2 = mlx_lm.generate(model2, tok2, prompt="The capital of France is", max_tokens=5, verbose=False)
-        t15 = time.perf_counter()
-        print(f"  {'mlx generate native (5 tok)':<35} {(t15-t14)*1000:>8.0f}ms  → {resp2.strip()}")
+        t21 = time.perf_counter()
+        print(f"  {'generate native (5 tok)':<35} {(t21-t20)*1000:>8.0f}ms  → {resp2.strip()}")
 
     except ImportError:
         print("  (mlx not installed — skipping)")
 
+    # ── Summary ──
+    print()
+    print("=== Memory Summary ===")
+    print(f"  Vindex load (gate+embed):     ~{r1:.0f} MB")
+    print(f"  WalkModel load (all mmap'd):  +{r5-r4:.0f} MB  (zero-copy)")
+    print(f"  WalkModel predict (paged):    ~{r6:.0f} MB  (OS pages in on demand)")
     print()
     print("Done.")
 

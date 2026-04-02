@@ -228,6 +228,8 @@ pub struct PyVindex {
     pub(crate) config: VindexConfig,
     pub(crate) path: String,
     pub(crate) classifier: Option<RelationClassifier>,
+    /// Lazy-loaded mmap'd weights for infer(). Created on first call, reused after.
+    pub(crate) walk_model: std::cell::RefCell<Option<crate::walk::InferState>>,
 }
 
 impl PyVindex {
@@ -251,7 +253,11 @@ impl PyVindex {
         // Load relation classifier (clusters + labels) if available
         let classifier = RelationClassifier::from_vindex(dir);
 
-        Ok(Self { index, embeddings, embed_scale, tokenizer, config, path: path.to_string(), classifier })
+        Ok(Self {
+            index, embeddings, embed_scale, tokenizer, config,
+            path: path.to_string(), classifier,
+            walk_model: std::cell::RefCell::new(None),
+        })
     }
 
     /// Compute scaled embedding for entity text. Multi-token entities are averaged.
@@ -871,11 +877,8 @@ impl PyVindex {
 
     /// Run inference: full forward pass with vindex walk FFN.
     ///
-    /// Loads model weights from the vindex (requires --level all),
-    /// runs attention + sparse FFN through all layers, returns predictions.
-    ///
-    /// This is the Rust inference engine — no MLX, no Python overhead.
-    /// The vindex gate KNN selects features, sparse FFN computes output.
+    /// Model weights are mmap'd on first call and reused — zero-copy, fast.
+    /// Subsequent calls reuse the cached weights (OS page cache warms up).
     ///
     /// Args:
     ///     prompt: input text
@@ -888,24 +891,30 @@ impl PyVindex {
     fn infer(
         &self, prompt: &str, top_k_predictions: usize, top_k_features: usize
     ) -> PyResult<Vec<(String, f64)>> {
-        let dir = std::path::Path::new(&self.path);
+        // Lazy-load mmap'd weights on first call
+        {
+            let mut state = self.walk_model.borrow_mut();
+            if state.is_none() {
+                let dir = std::path::Path::new(&self.path);
+                *state = Some(crate::walk::InferState::load(dir)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("Failed to load model weights: {e}")
+                    ))?);
+            }
+        }
 
-        // Load model weights from vindex
-        let mut load_cb = larql_vindex::SilentLoadCallbacks;
-        let weights = larql_vindex::load_model_weights(dir, &mut load_cb)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                format!("Failed to load model weights: {e}")
-            ))?;
+        let state = self.walk_model.borrow();
+        let infer_state = state.as_ref().unwrap();
 
         // Tokenize prompt (with BOS token for correct inference)
         let encoding = self.tokenizer.encode(prompt, true)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         let token_ids: Vec<u32> = encoding.get_ids().to_vec();
 
-        // Run forward pass with walk FFN
-        let walk_ffn = larql_inference::WalkFfn::new(&weights, &self.index, top_k_features);
+        // Run forward pass with walk FFN (mmap'd weights, vindex gate KNN)
+        let walk_ffn = larql_inference::WalkFfn::new(&infer_state.weights, &self.index, top_k_features);
         let result = larql_inference::predict_with_ffn(
-            &weights, &self.tokenizer, &token_ids, top_k_predictions, &walk_ffn
+            &infer_state.weights, &self.tokenizer, &token_ids, top_k_predictions, &walk_ffn
         );
 
         Ok(result.predictions)

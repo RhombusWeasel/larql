@@ -11,7 +11,7 @@ use pyo3::types::PyBytes;
 use ndarray::Array2;
 
 use larql_vindex::{
-    VectorIndex, VindexConfig, SilentLoadCallbacks,
+    VectorIndex, SilentLoadCallbacks,
     load_vindex_config, load_vindex_tokenizer, tokenizers,
 };
 use larql_inference::{ModelWeights, WalkFfn, predict_with_ffn};
@@ -218,6 +218,22 @@ fn load_mmap_weights(dir: &Path) -> Result<(ModelWeights, Vec<WeightMmap>), Stri
     Ok((weights, mmaps))
 }
 
+// ── InferState: lazy-loaded mmap'd weights for vindex.infer() ──
+
+/// Mmap'd model weights, reusable across infer() calls.
+/// Created lazily on first infer(), held by PyVindex.
+pub struct InferState {
+    pub weights: ModelWeights,
+    _mmaps: Vec<WeightMmap>,
+}
+
+impl InferState {
+    pub fn load(dir: &Path) -> Result<Self, String> {
+        let (weights, mmaps) = load_mmap_weights(dir)?;
+        Ok(Self { weights, _mmaps: mmaps })
+    }
+}
+
 // ── Python class ──
 
 #[pyclass(name = "WalkModel", unsendable)]
@@ -301,11 +317,102 @@ impl PyWalkModel {
         Ok(PyBytes::new(py, out_bytes))
     }
 
+    /// Feature selection only — returns indices for MLX sparse matmul.
+    ///
+    /// Runs gate KNN on the vindex for each sequence position, returns the
+    /// union of top-K feature indices. MLX uses these to gather rows and
+    /// do the matmul on Metal GPU.
+    ///
+    /// Args:
+    ///     layer: layer index
+    ///     x_bytes: raw f32 bytes (seq_len × hidden) from MLX
+    ///     seq_len: number of sequence positions
+    ///     top_k: features to select per position (default: self.top_k)
+    ///
+    /// Returns:
+    ///     List of feature indices (sorted, deduplicated union across positions)
+    #[pyo3(signature = (layer, x_bytes, seq_len, top_k=None))]
+    fn gate_select(
+        &self, layer: usize, x_bytes: &[u8], seq_len: usize, top_k: Option<usize>,
+    ) -> PyResult<Vec<usize>> {
+        let hidden = self.weights.hidden_size;
+        let expected = seq_len * hidden * 4;
+        if x_bytes.len() != expected {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Expected {} bytes ({}x{}xf32), got {}", expected, seq_len, hidden, x_bytes.len())
+            ));
+        }
+
+        let k = top_k.unwrap_or(self.top_k);
+        let floats: &[f32] = unsafe {
+            std::slice::from_raw_parts(x_bytes.as_ptr() as *const f32, seq_len * hidden)
+        };
+
+        // Collect features across all positions
+        let mut seen = std::collections::HashSet::new();
+        for s in 0..seq_len {
+            let row = &floats[s * hidden..(s + 1) * hidden];
+            let arr = ndarray::Array1::from_vec(row.to_vec());
+            let hits = self.index.gate_knn(layer, &arr, k);
+            for (idx, _score) in hits {
+                seen.insert(idx);
+            }
+        }
+
+        let mut indices: Vec<usize> = seen.into_iter().collect();
+        indices.sort_unstable();
+        Ok(indices)
+    }
+
+    /// Feature selection returning indices and gate scores.
+    ///
+    /// Like gate_select but also returns the max gate score per feature
+    /// (useful for debugging / weighted sparse FFN).
+    #[pyo3(signature = (layer, x_bytes, seq_len, top_k=None))]
+    fn gate_select_scored(
+        &self, layer: usize, x_bytes: &[u8], seq_len: usize, top_k: Option<usize>,
+    ) -> PyResult<(Vec<usize>, Vec<f32>)> {
+        let hidden = self.weights.hidden_size;
+        let expected = seq_len * hidden * 4;
+        if x_bytes.len() != expected {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Expected {} bytes ({}x{}xf32), got {}", expected, seq_len, hidden, x_bytes.len())
+            ));
+        }
+
+        let k = top_k.unwrap_or(self.top_k);
+        let floats: &[f32] = unsafe {
+            std::slice::from_raw_parts(x_bytes.as_ptr() as *const f32, seq_len * hidden)
+        };
+
+        let mut best: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+        for s in 0..seq_len {
+            let row = &floats[s * hidden..(s + 1) * hidden];
+            let arr = ndarray::Array1::from_vec(row.to_vec());
+            let hits = self.index.gate_knn(layer, &arr, k);
+            for (idx, score) in hits {
+                let entry = best.entry(idx).or_insert(0.0f32);
+                if score.abs() > entry.abs() {
+                    *entry = score;
+                }
+            }
+        }
+
+        let mut pairs: Vec<(usize, f32)> = best.into_iter().collect();
+        pairs.sort_unstable_by_key(|(idx, _)| *idx);
+        let indices = pairs.iter().map(|(i, _)| *i).collect();
+        let scores = pairs.iter().map(|(_, s)| *s).collect();
+        Ok((indices, scores))
+    }
+
     #[getter]
     fn num_layers(&self) -> usize { self.weights.num_layers }
 
     #[getter]
     fn hidden_size(&self) -> usize { self.weights.hidden_size }
+
+    #[getter]
+    fn intermediate_size(&self) -> usize { self.weights.intermediate_size }
 
     #[getter]
     fn top_k(&self) -> usize { self.top_k }

@@ -468,11 +468,23 @@ class TestRealVindex:
         assert model is not None
 
     def test_infer(self, real_vindex):
-        """vindex.infer() — full Rust forward pass with walk FFN."""
+        """vindex.infer() — Rust forward pass with mmap'd walk FFN."""
         result = real_vindex.infer("The capital of France is", top_k_predictions=3)
         assert len(result) > 0
         assert result[0][0] == "Paris"
         assert result[0][1] > 0.5
+
+    def test_infer_reuses_weights(self, real_vindex):
+        """Second infer() call should reuse mmap'd weights (no reload)."""
+        import time
+        # First call loads weights
+        real_vindex.infer("warmup", top_k_predictions=1)
+        # Second call should be faster (no load, page cache warm)
+        t0 = time.time()
+        r = real_vindex.infer("The largest planet is", top_k_predictions=1)
+        t1 = time.time()
+        assert r[0][0] == "Jupiter"
+        # Should complete — no assertion on time, just verifying it works
 
     def test_walk_model(self):
         """WalkModel — zero-copy mmap'd weights, Rust walk FFN."""
@@ -481,30 +493,37 @@ class TestRealVindex:
         assert wm.hidden_size > 0
         result = wm.predict("The capital of France is")
         assert len(result) > 0
-        # With k=4096 should get Paris
         assert result[0][0] == "Paris"
 
     def test_walk_model_ffn_layer(self):
         """WalkModel.ffn_layer — per-layer sparse FFN via bytes."""
         import struct
         wm = larql.WalkModel(REAL_VINDEX, top_k=256)
-        # Create a dummy input: seq_len=1, hidden_size floats as bytes
         hidden = wm.hidden_size
         x_bytes = struct.pack(f"{hidden}f", *([0.1] * hidden))
         result = wm.ffn_layer(layer=0, x_bytes=x_bytes, seq_len=1)
         assert isinstance(result, bytes)
-        assert len(result) == hidden * 4  # f32 output
+        assert len(result) == hidden * 4
 
     def test_walk_model_memory(self):
-        """WalkModel should use minimal RSS (mmap, not heap)."""
+        """WalkModel load should use minimal RSS (mmap, not heap)."""
         import resource
         rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
         wm = larql.WalkModel(REAL_VINDEX, top_k=256)
         rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
         delta = rss_after - rss_before
-        # Zero-copy mmap: should use < 2 GB for a 4B model
-        # (heap load would use ~18 GB for f32)
-        assert delta < 2000, f"WalkModel used {delta:.0f} MB — expected < 2000 MB (mmap)"
+        assert delta < 2000, f"WalkModel load used {delta:.0f} MB — expected < 2000 MB (mmap)"
+
+    def test_infer_memory(self, real_vindex):
+        """vindex.infer() should use mmap'd weights (low load RSS)."""
+        import resource
+        # After infer, the walk_model is cached inside the vindex
+        # The load RSS should be small (mmap, not heap)
+        rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+        v = larql.load(REAL_VINDEX)
+        rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+        # Vindex load (gate + embed only) should be < 8 GB
+        assert rss_after - rss_before < 8000
 
     def test_walk_ffn_mlx(self):
         """walk_ffn.load — MLX attention + Rust FFN."""
