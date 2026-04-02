@@ -1261,3 +1261,88 @@ fn parse_compile_into_model_explicit() {
         _ => panic!("expected Compile"),
     }
 }
+
+// ══════════════════════════════════════════════════════════════
+// TRACE STATEMENTS
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn parse_trace_minimal() {
+    let stmt = parse(r#"TRACE "The capital of France is";"#).unwrap();
+    match stmt {
+        Statement::Trace { prompt, answer, decompose, layers, positions, save } => {
+            assert_eq!(prompt, "The capital of France is");
+            assert!(answer.is_none());
+            assert!(!decompose);
+            assert!(layers.is_none());
+            assert!(positions.is_none());
+            assert!(save.is_none());
+        }
+        _ => panic!("expected Trace"),
+    }
+}
+
+#[test]
+fn parse_trace_with_answer() {
+    let stmt = parse(r#"TRACE "The capital of France is" ANSWER "Paris";"#).unwrap();
+    match stmt {
+        Statement::Trace { prompt, answer, .. } => {
+            assert_eq!(prompt, "The capital of France is");
+            assert_eq!(answer.unwrap(), "Paris");
+        }
+        _ => panic!("expected Trace"),
+    }
+}
+
+#[test]
+fn parse_trace_decompose_with_layers() {
+    let stmt = parse(r#"TRACE "The capital of France is" DECOMPOSE LAYERS 22-27;"#).unwrap();
+    match stmt {
+        Statement::Trace { decompose, layers, .. } => {
+            assert!(decompose);
+            let r = layers.unwrap();
+            assert_eq!(r.start, 22);
+            assert_eq!(r.end, 27);
+        }
+        _ => panic!("expected Trace"),
+    }
+}
+
+#[test]
+fn parse_trace_save() {
+    let stmt = parse(r#"TRACE "The capital of France is" SAVE "france.trace";"#).unwrap();
+    match stmt {
+        Statement::Trace { save, .. } => {
+            assert_eq!(save.unwrap(), "france.trace");
+        }
+        _ => panic!("expected Trace"),
+    }
+}
+
+#[test]
+fn parse_trace_positions_all() {
+    let stmt = parse(r#"TRACE "The capital of France is" POSITIONS ALL;"#).unwrap();
+    match stmt {
+        Statement::Trace { positions, .. } => {
+            assert_eq!(positions.unwrap(), TracePositionMode::All);
+        }
+        _ => panic!("expected Trace"),
+    }
+}
+
+#[test]
+fn parse_trace_full() {
+    let stmt = parse(
+        r#"TRACE "The capital of France is" ANSWER "Paris" DECOMPOSE LAYERS 22-27 SAVE "out.trace";"#,
+    ).unwrap();
+    match stmt {
+        Statement::Trace { prompt, answer, decompose, layers, save, .. } => {
+            assert_eq!(prompt, "The capital of France is");
+            assert_eq!(answer.unwrap(), "Paris");
+            assert!(decompose);
+            assert_eq!(layers.as_ref().unwrap().start, 22);
+            assert_eq!(save.unwrap(), "out.trace");
+        }
+        _ => panic!("expected Trace"),
+    }
+}

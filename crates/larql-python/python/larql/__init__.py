@@ -101,6 +101,8 @@ try:
 except ImportError:
     walk_ffn = None
 
+# Residual stream trace is exposed via WalkModel.trace() (Rust implementation)
+
 __version__ = "0.1.0"
 
 __all__ = [

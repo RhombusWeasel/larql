@@ -144,6 +144,11 @@ WALK "The capital of France is" TOP 10;
 -- Run inference (needs model weights in vindex)
 INFER "The capital of France is" TOP 5 COMPARE;
 
+-- Trace the residual stream (decomposed forward pass)
+TRACE "The capital of France is" ANSWER "Paris";
+TRACE "The capital of France is" DECOMPOSE LAYERS 22-27;
+TRACE "The capital of France is" SAVE "france.trace";
+
 -- Edit knowledge (auto-patch: base files never modified)
 INSERT INTO EDGES (entity, relation, target)
     VALUES ("John Coyle", "lives-in", "Colchester");
@@ -244,6 +249,51 @@ Dense and full-precision MoE models support all operations (DESCRIBE, WALK, INFE
 | INFER prediction (with attention) | ~11s |
 | DESCRIBE (knowledge browse) | 33ms |
 
+## Residual Stream Trace
+
+Capture the complete record of inference — every layer, every contribution, queryable.
+
+```python
+import larql
+
+wm = larql.WalkModel("gemma3-4b.vindex")
+t = wm.trace("The capital of France is")
+
+# When does Paris appear? Track through all 34 layers.
+for w in t.answer_trajectory("Paris"):
+    if w.rank <= 10:
+        print(f"  L{w.layer}: rank={w.rank}, attn={w.attn_logit:.0f}, ffn={w.ffn_logit:.0f}")
+# L23: rank=10, attn=-17, ffn=56
+# L24: rank=1,  attn=106, ffn=24   ← phase transition
+# L25: rank=1,  attn=4,   ffn=94
+
+# Save to mmap'd store — zero-copy reads, append-only
+t.save("trace.bin")
+```
+
+### Tiered Context (infinite context without KV cache)
+
+| Storage | Per window | 370K tokens | vs KV cache |
+|---|---|---|---|
+| Boundary residual | 10 KB | 18.9 MB | 3,100x |
+| Tier 4 int8 (bit-perfect) | 58 KB | 110 MB | 511x |
+| KV cache | ~30 MB | 56,000 MB | 1x |
+
+```python
+from larql._native import BoundaryWriter, BoundaryStore
+
+# Write boundary residuals — one per 200-token window
+writer = BoundaryWriter("context.bndx", hidden_size=2560, window_size=200)
+writer.append(token_offset=0, window_tokens=200, residual=boundary_vec)
+writer.finish()
+
+# Mmap'd read — OS pages on demand, RSS ≈ one boundary
+store = BoundaryStore("context.bndx")
+store.residual(42)  # zero-copy from mmap
+```
+
+See [docs/residual-trace.md](docs/residual-trace.md) for the full writeup.
+
 ## Documentation
 
 | Doc | Description |
@@ -255,6 +305,8 @@ Dense and full-precision MoE models support all operations (DESCRIBE, WALK, INFE
 | [docs/lql-guide.md](docs/lql-guide.md) | LQL quick start guide |
 | [docs/cli.md](docs/cli.md) | CLI reference |
 | [docs/knowledge-pipeline.md](docs/knowledge-pipeline.md) | Knowledge labelling pipeline |
+| [docs/residual-trace.md](docs/residual-trace.md) | Residual stream trace — decomposition, storage, tiered context |
+| [docs/trace-format-spec.md](docs/trace-format-spec.md) | Trace file format specification (.bin, .bndx, .ctxt) |
 
 ## Building & Testing
 

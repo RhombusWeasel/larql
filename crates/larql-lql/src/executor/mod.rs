@@ -9,6 +9,7 @@ mod lifecycle;
 mod mutation;
 mod query;
 mod remote;
+mod trace;
 
 #[cfg(test)]
 mod tests;
@@ -163,6 +164,10 @@ impl Session {
             Statement::ApplyPatch { path } => self.exec_apply_patch(path),
             Statement::ShowPatches => self.exec_show_patches(),
             Statement::RemovePatch { path } => self.exec_remove_patch(path),
+            // ── Trace commands ──
+            Statement::Trace { prompt, answer, decompose, layers, positions, save } => {
+                self.exec_trace(prompt, answer.as_deref(), *decompose, layers.as_ref(), *positions, save.as_deref())
+            }
         }
     }
 

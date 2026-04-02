@@ -7,10 +7,12 @@ use larql_inference as li;
 mod vindex;
 mod session;
 mod walk;
+mod trace_py;
 
 use vindex::{PyVindex, PyFeatureMeta, PyWalkHit, PyDescribeEdge, PyRelation};
 use session::PySession;
 use walk::PyWalkModel;
+use trace_py::{PyResidualTrace, PyAnswerWaypoint, PyLayerSummary, PyTraceStore, PyBoundaryStore, PyBoundaryWriter};
 
 // ── Helpers ──
 
@@ -761,6 +763,12 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRelation>()?;
     m.add_class::<PySession>()?;
     m.add_class::<PyWalkModel>()?;
+    m.add_class::<PyResidualTrace>()?;
+    m.add_class::<PyAnswerWaypoint>()?;
+    m.add_class::<PyLayerSummary>()?;
+    m.add_class::<PyTraceStore>()?;
+    m.add_class::<PyBoundaryStore>()?;
+    m.add_class::<PyBoundaryWriter>()?;
 
     // Graph functions (existing)
     m.add_function(wrap_pyfunction!(load, m)?)?;

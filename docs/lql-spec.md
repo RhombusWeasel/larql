@@ -82,6 +82,17 @@ LQL is a query language for neural network weights treated as a graph database. 
 | `SHOW MODELS` | List available vindexes |
 | `STATS` | Counts, coverage, size |
 
+### 2.7 Residual Stream Trace (requires model weights in vindex)
+
+| Statement | Purpose |
+|---|---|
+| `TRACE` | Capture residual stream decomposition for a prompt |
+| `TRACE ... SHOW` | Query a specific aspect of the trace (trajectory, deltas, predictions) |
+| `TRACE ... SAVE` | Write trace to mmap'd file (.bin, .bndx, .ctxt) |
+| `TRACE ... DIFF` | Compare two traces at a layer |
+| `BOUNDARY APPEND` | Append a boundary residual to a context store |
+| `BOUNDARY OPEN` | Open an existing boundary store for querying |
+
 ---
 
 ## 3. Grammar
@@ -484,7 +495,108 @@ SHOW PATCHES;
 STATS [<vindex_path>];
 ```
 
-### 3.7 Comparison Operators
+### 3.7 Residual Stream Trace Statements
+
+```
+TRACE <prompt>
+    [POSITIONS {LAST | ALL}]
+    [LAYERS <range>]
+
+-- Capture a residual stream trace.
+-- Decomposes the forward pass into attn_delta + ffn_delta at each layer.
+-- Requires model weights in vindex (WITH ALL).
+
+TRACE "The capital of France is";
+-- Captures: 6 tokens × 35 layers = 210 nodes (positions=all)
+-- Default: positions=last (35 nodes, last token only)
+
+TRACE "The capital of France is"
+    POSITIONS ALL;
+-- All token positions, all layers
+```
+
+```
+TRACE <prompt> SHOW {answer_rank | predictions | decompose}
+    [FOR <token>]
+    [AT LAYER <n>]
+
+-- Query a specific aspect of the captured trace.
+
+TRACE "The capital of France is" SHOW answer_rank FOR "Paris";
+-- Layer  Rank  Prob   Attn    FFN
+-- emb       2  0.000    0.0    0.0
+-- L23      10  0.024  -16.9   55.9
+-- L24       1  0.714  105.7   24.4
+-- L25       1  0.997    4.3   94.4
+
+TRACE "The capital of France is" SHOW predictions AT LAYER 24;
+-- Paris (0.714), located (0.133), ____ (0.024), ...
+
+TRACE "The capital of France is" SHOW decompose FOR "Paris";
+-- Layer  Attn→ans  FFN→ans  Who
+-- L23      -16.9    +55.9  FFN ↑
+-- L24     +105.7    +24.4  BOTH ↑
+-- L25       +4.3    +94.4  FFN ↑
+-- L26      +83.1    +18.7  BOTH ↑
+```
+
+```
+TRACE <prompt> SAVE <path>
+    [FORMAT {trace | boundary | context}]
+    [TIER {1 | 2 | 3 | 4}]
+    [WINDOW <n>]
+
+-- Write trace to mmap'd file.
+
+TRACE "The capital of France is"
+    POSITIONS ALL
+    SAVE "france.trace.bin";
+-- Full chain store: 6.5 MB (all positions, all layers)
+
+TRACE "The capital of France is"
+    SAVE "context.bndx"
+    FORMAT boundary
+    WINDOW 200;
+-- Boundary store: 10 KB per window boundary
+
+TRACE "The capital of France is"
+    SAVE "context.ctxt"
+    FORMAT context
+    TIER 4;
+-- Tiered context: 230 KB per window (bit-perfect reconstruction)
+```
+
+```
+TRACE <prompt_a> DIFF <prompt_b>
+    [AT LAYER <n>]
+
+-- Compare two traces.
+
+TRACE "The capital of France is"
+    DIFF "The capital of Germany is"
+    AT LAYER 24;
+-- cosine: 0.987, delta_norm: 4521
+-- France top1: Paris (0.714)
+-- Germany top1: Berlin (0.895)
+```
+
+```
+BOUNDARY OPEN <path>
+
+-- Open a boundary store for querying.
+
+BOUNDARY OPEN "apollo11.bndx";
+-- BoundaryStore(1850 boundaries, 370000 tokens, 18.5 MB)
+
+BOUNDARY <path> AT <n>
+
+-- Read boundary residual at index n.
+
+BOUNDARY "apollo11.bndx" AT 42;
+-- Boundary 42: tokens 8400-8600, residual norm=76385
+```
+
+### 3.8 Comparison Operators
 
 ```
 =    -- equal
@@ -1250,10 +1362,19 @@ The layer-level byte offsets in gate_vectors.bin enable this — each layer can 
 - **INGEST** — document → context graph extraction (Mode 5, the Apollo demo).
 - **Training from graph** — compile an edited knowledge graph back to weights, bypassing gradient descent entirely.
 
-### 11.7 Attention Template Cache (Research, Not Yet Proven at Scale)
+### 11.7 Attention Template Cache (Partially Proven)
 
-Early research suggests that 99% of attention heads produce fixed patterns across entity substitutions for the same query template. If validated, attention templates could be cached in the vindex — a small lookup table (~50 KB) replacing 3GB of attention weights.
+99% of attention heads produce fixed patterns across entity substitutions for the same query template (confirmed). Within a known entity set, 11D projection replaces attention perfectly (15/15, K=11). However, generalization to unseen entities fails (0/21) — the entity signal is a nonlinear function of the residual stream, not the raw embedding. Full attention replacement remains open research.
 
-This would collapse the inference tier into the knowledge tier: full INFER from the 3GB browse-only vindex, no attention weights needed. The knowledge server becomes the inference server.
+**Status:** Template fixedness confirmed. Within-set replacement proven. Generalization blocked by the nonlinear embedding→residual mapping. The residual stream trace (Section 3.7) provides the ground-truth decomposition for continued research.
 
-**Status:** The template fixedness has been demonstrated for single relations. The remaining research question is whether the per-layer mode count is small enough for full attention caching — the final blocker before inference with zero matrix multiplication. This is an active area of research, not a planned feature.
+### 11.8 Tiered Context Store (Proven)
+
+The residual stream trace enables infinite context without KV cache. Boundary residuals (10 KB per 200-token window) carry the complete Markov state. Tiered storage provides accuracy/storage tradeoffs:
+
+- **Tier 1:** 10 KB/window, 3100× compression vs KV cache (boundary residual only)
+- **Tier 4 int8:** 58 KB/window, 511× compression (bit-perfect reconstruction, no replay)
+
+370K tokens (Apollo 11 transcript): 55-110 MB vs 56 GB KV cache.
+
+**Status:** Implemented in `trace/` module. File formats: `.bin` (full chains), `.bndx` (boundaries), `.ctxt` (tiered context). Mmap'd, append-only, zero-copy. See `docs/residual-trace.md` and `docs/trace-format-spec.md`.

@@ -10,6 +10,7 @@ pub mod model;
 pub mod route_ffn;
 pub mod residual;
 pub mod tokenizer;
+pub mod trace;
 pub mod vindex;
 pub mod walker;
 
@@ -41,6 +42,12 @@ pub use ffn::experimental::entity_routed::EntityRoutedFfn;
 pub use ffn::experimental::feature_list::FeatureListFfn;
 pub use ffn::experimental::graph::GraphFfn;
 pub use route_ffn::{RouteFfn, RouteGuidedFfn, RouteTable};
+pub use trace::{
+    trace_residuals, trace as trace_decomposed, AnswerWaypoint, LayerSummary,
+    ResidualTrace, TraceNode, TracePositions, TraceStore, TraceWriter,
+    BoundaryStore, BoundaryWriter,
+    ContextStore, ContextWriter, ContextTier,
+};
 pub use vindex::WalkFfn;
 pub use model::{load_model_dir, resolve_model_path, ModelWeights};
 pub use tokenizer::{decode_token, load_tokenizer};

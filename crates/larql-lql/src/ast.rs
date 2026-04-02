@@ -119,6 +119,17 @@ pub enum Statement {
         path: String,
     },
 
+    // ── Trace ──
+    /// Residual stream trace — decomposed forward pass.
+    Trace {
+        prompt: String,
+        answer: Option<String>,
+        decompose: bool,
+        layers: Option<Range>,
+        positions: Option<TracePositionMode>,
+        save: Option<String>,
+    },
+
     // ── Pipe ──
     Pipe {
         left: Box<Statement>,
@@ -256,6 +267,12 @@ pub struct NearestClause {
 pub struct OrderBy {
     pub field: String,
     pub descending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TracePositionMode {
+    Last,
+    All,
 }
 
 #[derive(Debug, Clone)]

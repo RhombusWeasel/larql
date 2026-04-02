@@ -17,6 +17,8 @@ use larql_vindex::{
 use larql_inference::{ModelWeights, WalkFfn, predict_with_ffn};
 use larql_inference::ffn::FfnBackend;
 
+use crate::trace_py;
+
 /// Mmap'd weight file — kept alive so Array2 views remain valid.
 struct WeightMmap {
     _file: std::fs::File,
@@ -416,6 +418,23 @@ impl PyWalkModel {
 
     #[getter]
     fn top_k(&self) -> usize { self.top_k }
+
+    /// Capture a complete residual stream trace.
+    ///
+    /// Runs a full forward pass, recording the residual, attn_delta, and ffn_delta
+    /// at every layer. Returns a ResidualTrace object.
+    ///
+    /// Args:
+    ///     prompt: Input text
+    ///     positions: "last" (default) or "all"
+    ///
+    /// Example:
+    ///     t = walk_model.trace("The capital of France is")
+    ///     t.answer_trajectory("Paris")
+    #[pyo3(signature = (prompt, positions="last"))]
+    fn trace(&self, prompt: &str, positions: &str) -> PyResult<trace_py::PyResidualTrace> {
+        trace_py::capture_trace(&self.weights, &self.tokenizer, prompt, positions)
+    }
 
     fn __repr__(&self) -> String {
         format!(

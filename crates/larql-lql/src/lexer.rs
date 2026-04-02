@@ -119,6 +119,10 @@ pub enum Keyword {
     Patch,
     Patches,
     Remote,
+    Trace,
+    Answer,
+    Decompose,
+    Positions,
 }
 
 impl Keyword {
@@ -209,6 +213,10 @@ impl Keyword {
             "PATCH" => Some(Self::Patch),
             "PATCHES" => Some(Self::Patches),
             "REMOTE" => Some(Self::Remote),
+            "TRACE" => Some(Self::Trace),
+            "ANSWER" => Some(Self::Answer),
+            "DECOMPOSE" => Some(Self::Decompose),
+            "POSITIONS" => Some(Self::Positions),
             _ => None,
         }
     }

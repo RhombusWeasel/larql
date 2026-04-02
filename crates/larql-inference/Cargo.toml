@@ -20,6 +20,9 @@ thiserror = { workspace = true }
 safetensors = "0.5"
 memmap2 = "0.9"
 
+# System
+libc = "0.2"
+
 # Matrix ops (BLAS-accelerated)
 ndarray = { version = "0.16", features = ["blas"] }
 blas-src = { version = "0.10", features = ["accelerate"] }
@@ -29,3 +32,4 @@ tokenizers = "0.21"
 
 [dev-dependencies]
 assert_approx_eq = "1"
+tempfile = "3"
