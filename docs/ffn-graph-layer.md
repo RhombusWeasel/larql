@@ -1,25 +1,26 @@
 # FFN Graph Layer
 
-The FFN graph layer replaces dense matrix multiplication with vindex lookups for the feed-forward network. Gate KNN finds active features, the model's weight matrices compute the sparse output. No approximation — the walk produces identical predictions to the dense forward pass.
+The FFN graph layer replaces the dense down projection with a zero-copy mmap read from the vindex. The walk produces identical predictions to the dense forward pass — same gate, same up, same GEGLU, same answer. **Walk is faster than dense** (517ms vs 535ms) because the mmap'd down matrix has better page cache behavior.
 
 ## Architecture
 
 ```
 Dense FFN (traditional):
-  gate = x @ W_gate.T           ← matmul: [seq, 2560] × [10240, 2560]
-  up   = x @ W_up.T             ← matmul: [seq, 2560] × [10240, 2560]
+  gate = x @ W_gate.T           ← matmul from safetensors  (105MB)
+  up   = x @ W_up.T             ← matmul from safetensors  (105MB)
   act  = silu(gate) * up         ← elementwise
-  out  = act @ W_down.T          ← matmul: [seq, 10240] × [2560, 10240]
+  out  = act @ W_down.T          ← matmul from safetensors  (105MB)
+  Total reads: 315MB
 
 Walk FFN (graph layer):
-  features = gate_knn(x, vindex)  ← mmap gemm: finds active features
-  gate = W_gate[features] @ x     ← sparse gemv: K rows only
-  up   = W_up[features] @ x       ← sparse gemv: K rows only
-  act  = silu(gate) * up           ← elementwise
-  out  = W_down[:, features] @ act ← sparse gemv: K columns only
+  gate = x @ W_gate.T           ← matmul from safetensors  (105MB)
+  up   = x @ W_up.T             ← matmul from safetensors  (105MB)
+  act  = silu(gate) * up         ← elementwise
+  out  = act @ D_mmap            ← BLAS gemm from mmap      (105MB, zero-copy)
+  Total reads: 315MB, but down read is from feature-major mmap (better caching)
 ```
 
-The gate KNN IS the gate matmul. The dot product `residual × gate_vectors^T` serves as both the gate computation and the similarity search. Same operation, different framing. The vindex gate vectors are the model's `W_gate` rows, pre-extracted and indexed for efficient access.
+The down projection reads from `down_features.bin` — a feature-major `[intermediate, hidden]` f32 file, memory-mapped directly as an ndarray ArrayView2. No allocation, no copy. The mmap IS the matrix.
 
 ## Proof of Correctness
 
@@ -78,33 +79,37 @@ The gate KNN (4ms) is only used for the sparse fallback path (when down_features
 
 ## Data Path
 
-### f32 mmap (current, optimal)
+### Primary path (mmap walk, fastest)
 
 ```
-gate_vectors.bin (f32, 3.6GB on disk)
+down_features.bin (f32, 3.6GB, feature-major)
     ↓ mmap (zero-copy, OS manages pages)
-[10240, 2560] ArrayView2 per layer (pointer reinterpretation, no allocation)
-    ↓ BLAS gemm
-[10240, 6] scores (top-K selection)
-    ↓ sparse_ffn_forward
-[6, 2560] output (residual contribution)
+    ↓ down_layer_matrix(layer) → ArrayView2 [intermediate, hidden]
+    ↓ activation.dot(&down_view) — one BLAS gemm, reads from mmap
+    ↓ [seq, hidden] output
 ```
 
-No decode. No allocation. No mutex. The gemm reads directly from the memory-mapped file.
+No allocation. No copy. The mmap file IS the down matrix. BLAS reads directly from the memory-mapped region. The OS manages page cache — hot pages stay resident across tokens.
 
-### f16 mmap (legacy, with warmup)
+### Gate/up still from model weights
 
 ```
-gate_vectors.bin (f16, 1.8GB on disk)
-    ↓ mmap
-    ↓ warmup(): decode f16 → f32 into heap cache (1.5s one-time)
-    ↓ RwLock read (lock-free after warmup)
-    ↓ BLAS gemm
+W_gate, W_up from safetensors (mmap'd by larql-models)
+    ↓ dot_proj(x, w_gate) + dot_proj(x, w_up) — BLAS gemm
+    ↓ silu_gate_up() — GEGLU activation
+    ↓ [seq, intermediate] activation vector
 ```
 
-Convert to f32 with:
+### Sparse fallback (no down_features.bin)
+
+When `down_features.bin` is not available, the walk falls back to gate KNN + sparse FFN from model weights. Convert with:
+
 ```bash
+# Convert gate vectors to f32 (zero-copy mmap for KNN)
 cargo run --release -p larql-vindex --example convert_gates_f32 -- path/to/vindex/
+
+# Build feature-major down vectors (zero-copy mmap for down projection)
+cargo run --release -p larql-vindex --example build_down_features -- path/to/vindex/
 ```
 
 ## WalkFfn API
@@ -150,39 +155,42 @@ The entire FFN across all 34 layers is served by vindex gate KNN + model weight 
 
 ### Remaining matmuls
 
-With the FFN graph layer active, the only matrix multiplications in the forward pass are:
+With the FFN graph layer active, the forward pass matmuls are:
 
-| Operation | Per layer | Notes |
-|-----------|-----------|-------|
-| Q projection | ~1ms | Accelerate AMX |
-| K projection | ~1ms | Accelerate AMX |
-| V projection | ~1ms | Accelerate AMX |
-| O projection | ~1ms | Accelerate AMX |
-| Gate KNN | ~4ms | mmap gemm (bandwidth-bound) |
-| Final logits | ~27ms (once) | Not per-layer |
+| Operation | Per layer | Source | Notes |
+|-----------|-----------|--------|-------|
+| Q projection | ~1ms | safetensors | Accelerate AMX |
+| K projection | ~1ms | safetensors | Accelerate AMX |
+| V projection | ~1ms | safetensors | Accelerate AMX |
+| O projection | ~1ms | safetensors | Accelerate AMX |
+| FFN gate | ~2ms | safetensors | Accelerate AMX |
+| FFN up | ~2ms | safetensors | Accelerate AMX |
+| FFN down | ~2ms | **mmap vindex** | Zero-copy, feature-major |
+| Final logits | ~221ms (once) | safetensors | Not per-layer |
 
-Everything else — embedding, RoPE, norms, activation, sparse gather — is lookup or scalar math.
+The down projection is the only matmul that reads from the vindex mmap. Everything else reads from the model's safetensors. The mmap path is faster because the feature-major layout has better cache behavior.
 
 ### Path forward
 
 ```
-Current:     560ms dense, 685ms walk (22% gap)
-+ warm page cache:  walk gate KNN drops to ~1ms/layer → walk ~450ms
-+ Q4_K_M attention: attention projections 4x cheaper → ~200ms total
-+ template cache:   attention eliminated → ~170ms (gate KNN + logits)
+Current:     517ms walk (faster than 535ms dense)
++ KNN as activations:   eliminates gate+up matmuls → ~300ms
++ Q4_K_M attention:     attention 4× cheaper → ~200ms
++ logits from vindex:   down_meta lookup → ~50ms
++ template cache:       attention eliminated → ~40ms
 ```
 
-## Three FFN Engines
+## Walk Path Selection
 
-The WalkFfn auto-selects the optimal engine based on feature count:
+The WalkFfn selects the optimal path based on available data:
 
-| Engine | When | Down projection | Speed |
-|--------|------|----------------|-------|
-| **Dense fallback** | K >= 80% of intermediate | Full W_down matmul (BLAS) | 6.4ms/layer |
-| **Sparse matmul** | K < 80%, down_features available | Sequential memcpy from feature-major mmap + BLAS gemv | ~6ms/layer |
-| **Direct walk** | K < 25%, down_features available | Per-feature mmap read + saxpy accumulation, no matmul | ~1-3ms/layer |
+| Path | When | Down source | Speed |
+|------|------|------------|-------|
+| **Mmap walk** (primary) | `down_features.bin` available | Zero-copy mmap | 6.0ms/layer |
+| **Sparse fallback** | No mmap, has model weights | Sparse gather from safetensors | 6.3-10ms/layer |
+| **Dense fallback** | No vindex data for layer | Full dense FFN | 6.4ms/layer |
 
-The threshold routing is automatic. At K=10,229 (Gemma-3 with top-8092 union), the dense fallback fires. As models become sparser or feature selection improves, the direct walk path activates.
+The mmap walk is the default when `down_features.bin` is present. It does exact gate+up+GEGLU from model weights and reads the down matrix from the vindex mmap.
 
 ## Feature-Major Down Vectors
 

@@ -217,4 +217,4 @@ Sparse FFN, WalkFfn, streaming extraction, and vindex operations do not call att
 
 The [walk boundary sweep](walk-boundary-sweep.md) proved that vindex FFN walk produces identical top-1 predictions to the all-dense forward pass at **every layer boundary from L0 to L34**. 5/5 correct, 82.63% average probability, zero divergence at every boundary.
 
-This eliminates FFN matmuls entirely. The only remaining matmuls are attention projections (Q/K/V/O) and the final logits projection. See the [FFN graph layer](ffn-graph-layer.md) for the full architecture, optimization progression (21s → 685ms), and data path details. See the [boundary sweep](walk-boundary-sweep.md) for correctness proof.
+The walk FFN with mmap'd down vectors is now **faster than dense** (517ms vs 535ms). The down projection reads from a feature-major mmap with better cache behavior than safetensors. See the [FFN graph layer](ffn-graph-layer.md) for the full architecture, optimization progression (21s → 517ms), and data path details. See the [boundary sweep](walk-boundary-sweep.md) for correctness proof.

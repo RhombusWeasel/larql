@@ -29,7 +29,7 @@ println!("Top prediction: {} ({:.1}%)", result.predictions[0].0, result.predicti
 | `ffn/` | FFN evaluation: dense, sparse, highway, cached, experimental |
 | `residual.rs` | RMS norm, layer norm |
 | `trace/` | Residual stream decomposition and tiered storage |
-| `vindex/walk_ffn.rs` | WalkFfn: sparse FFN using vindex gate KNN |
+| `vindex/walk_ffn.rs` | WalkFfn: mmap'd FFN — faster than dense (517ms vs 535ms) |
 | `capture.rs` | Residual stream vector capture for probing |
 | `walker/` | Weight-level graph walkers (no forward pass) |
 | `model.rs` | Model loading (re-exports from larql-models) |
@@ -70,12 +70,20 @@ Never allocates the `[seq, seq]` attention matrix. At Gemma-3's head_dim=256, **
 
 ## WalkFfn
 
-The WalkFfn replaces the dense FFN with a sparse version that uses the vindex gate KNN:
+The WalkFfn replaces the dense down projection with a zero-copy mmap read from the vindex:
 
-1. Gate KNN selects top-8092 features (from gate_vectors.bin)
-2. Only selected features go through up/down projections
-3. Result is identical to dense FFN (97.91% on France->Paris)
-4. Enables interpretable inference (see which features fired)
+1. Gate + up projections from model weights (exact, same as dense)
+2. GEGLU activation (exact, same as dense)
+3. Down projection from mmap'd `down_features.bin` (zero-copy, feature-major)
+4. Result is identical to dense FFN — **and faster** (517ms vs 535ms)
+
+The mmap'd feature-major layout has better page cache behavior than the safetensors weight layout.
+
+Build the required vindex files:
+```bash
+cargo run --release -p larql-vindex --example convert_gates_f32 -- path/to/vindex
+cargo run --release -p larql-vindex --example build_down_features -- path/to/vindex
+```
 
 ## Examples
 
