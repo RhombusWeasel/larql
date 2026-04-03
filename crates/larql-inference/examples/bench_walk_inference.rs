@@ -57,10 +57,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Gate warmup: skipped (f32, zero-copy mmap)");
     }
 
-    // Load feature-major down vectors for direct walk (if available)
+    // Load feature-major vectors for mmap walk
     match index.load_down_features(&vindex_path) {
-        Ok(()) => println!("Down features: loaded (direct walk enabled)"),
-        Err(_) => println!("Down features: not found (using sparse matmul fallback)"),
+        Ok(()) => println!("Down features: loaded"),
+        Err(_) => println!("Down features: not found"),
+    }
+    match index.load_up_features(&vindex_path) {
+        Ok(()) => println!("Up features: loaded (full mmap FFN enabled)"),
+        Err(_) => println!("Up features: not found"),
     }
 
     let weights = model.weights();

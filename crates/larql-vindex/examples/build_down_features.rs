@@ -1,4 +1,13 @@
-//! Build feature-major down vectors from the vindex down_weights.bin.
+//! Build feature-major vectors from vindex weight files.
+//! Transposes [hidden, intermediate] → [intermediate, hidden] per layer.
+//!
+//! Creates both:
+//!   down_features.bin — from down_weights.bin
+//!   up_features.bin   — from up_weights.bin (if present)
+//!
+//! Each feature's vector is contiguous for cache-friendly mmap access.
+//!
+//! Previously:
 //!
 //! Transposes [hidden, intermediate] → [intermediate, hidden] per layer,
 //! so each feature's down vector is contiguous in memory. Stores as f32.

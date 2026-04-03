@@ -57,6 +57,90 @@ impl<'a> WalkFfn<'a> {
         WalkTrace { layers }
     }
 
+    /// Full mmap walk: gate + up + down all from mmap. Zero safetensor reads.
+    ///
+    /// gate_scores = gate_vectors @ x^T     (mmap, one BLAS gemm)
+    /// up_scores   = up_vectors @ x^T       (mmap, one BLAS gemm)
+    /// activation  = silu(gate) * up         (exact GEGLU)
+    /// output      = activation @ down       (mmap, one BLAS gemm)
+    ///
+    /// Three mmap gemms. Same computation as dense. Zero model weight reads.
+    fn walk_ffn_full_mmap(
+        &self,
+        layer: usize,
+        x: &Array2<f32>,
+    ) -> Option<(Array2<f32>, Array2<f32>)> {
+        let gate_scores = self.index.gate_scores_batch(layer, x)?;
+        let up_view = self.index.up_layer_matrix(layer)?;
+        let down_view = self.index.down_layer_matrix(layer)?;
+
+        let arch = &*self.weights.arch;
+        let use_gelu = matches!(
+            arch.activation(),
+            larql_models::Activation::GeluTanh | larql_models::Activation::Gelu
+        );
+
+        // up_scores = x @ up_vectors^T = [seq, intermediate]
+        let up_scores = x.dot(&up_view.t());
+
+        // GEGLU: silu(gate) * up  (exact, same as dense)
+        let activation = if use_gelu {
+            crate::ffn::gelu_tanh_gate_up(&gate_scores, &up_scores)
+        } else {
+            crate::ffn::silu_gate_up(&gate_scores, &up_scores)
+        };
+
+        // Down: activation @ down_matrix (mmap, zero-copy)
+        let mut out = activation.dot(&down_view);
+
+        if let Some(bias) = arch.ffn_down_bias_key(layer)
+            .and_then(|k| self.weights.vectors.get(&k))
+        {
+            crate::forward::add_bias(&mut out, bias);
+        }
+
+        Some((out, activation))
+    }
+
+    /// KNN-direct walk: gate scores as activations + down from mmap.
+    ///
+    /// Gate KNN scores = x @ gate_vectors^T = the gate projection.
+    /// Apply SiLU activation. Multiply by down matrix. Done.
+    /// No gate matmul from model weights. No up matmul. No GEGLU.
+    /// Two BLAS gemms: gate_knn + down. Reads 205MB instead of 315MB.
+    fn walk_ffn_knn_direct(
+        &self,
+        layer: usize,
+        x: &Array2<f32>,
+    ) -> Option<(Array2<f32>, Array2<f32>)> {
+        let down_view = self.index.down_layer_matrix(layer)?;
+        let gate_scores = self.index.gate_scores_batch(layer, x)?;
+
+        let arch = &*self.weights.arch;
+        let use_gelu = matches!(
+            arch.activation(),
+            larql_models::Activation::GeluTanh | larql_models::Activation::Gelu
+        );
+
+        // Gate scores → SiLU/GELU activation (no up projection)
+        let activation = if use_gelu {
+            gate_scores.mapv(crate::ffn::gelu_tanh)
+        } else {
+            gate_scores.mapv(|v| v * crate::ffn::sigmoid(v))
+        };
+
+        // activation[seq, intermediate] @ down[intermediate, hidden] → [seq, hidden]
+        let mut out = activation.dot(&down_view);
+
+        if let Some(bias) = arch.ffn_down_bias_key(layer)
+            .and_then(|k| self.weights.vectors.get(&k))
+        {
+            crate::forward::add_bias(&mut out, bias);
+        }
+
+        Some((out, activation))
+    }
+
     /// Walk FFN: gate/up from model weights + down from mmap.
     ///
     /// Uses dense gate/up matmul (exact, sequential reads) and reads the down
@@ -148,8 +232,14 @@ impl<'a> FfnBackend for WalkFfn<'a> {
             self.trace_residuals.borrow_mut().push((layer, last_row));
         }
 
-        // Mmap walk: exact gate/up + zero-copy down from mmap.
-        // Skips gate KNN — exact path does its own gate/up computation.
+        // Full mmap walk: gate + up + down all from mmap. Zero safetensor reads.
+        if self.index.has_full_mmap_ffn() {
+            if let Some(result) = self.walk_ffn_full_mmap(layer, x) {
+                return result;
+            }
+        }
+
+        // Partial mmap: gate/up from model weights + down from mmap.
         if self.index.has_down_features() {
             return self.walk_ffn_exact(layer, x);
         }
