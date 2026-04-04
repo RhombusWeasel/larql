@@ -50,7 +50,7 @@ impl Session {
                 .map_err(|e| LqlError::Execution(format!("failed to load tokenizer: {e}")))?;
 
             hidden = embed.shape()[1];
-            alpha = 2.0f32;
+            alpha = 0.25f32;
 
             // Target embedding for down vector
             let target_encoding = tokenizer.encode(target, false)

@@ -12,10 +12,13 @@ pub mod q4_f32_matvec;
 pub mod geglu;
 pub mod quantize_q8;
 pub mod causal_attention;
+pub mod q4_matvec_v2;
+pub mod q4_matvec_v3;
+pub mod q4_matvec_v4;
 
 /// Concatenate all shaders into one MSL source string for compilation.
 pub fn all_shaders() -> String {
-    let mut src = String::with_capacity(8192);
+    let mut src = String::with_capacity(16384);
     src.push_str(common::HEADER);
     src.push_str(sgemm::SHADER);
     src.push_str(sgemm_transb::SHADER);
@@ -25,5 +28,8 @@ pub fn all_shaders() -> String {
     src.push_str(geglu::SHADER);
     src.push_str(quantize_q8::SHADER);
     src.push_str(causal_attention::SHADER);
+    src.push_str(q4_matvec_v2::SHADER);
+    src.push_str(q4_matvec_v3::SHADER);
+    src.push_str(q4_matvec_v4::SHADER);
     src
 }

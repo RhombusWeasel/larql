@@ -60,7 +60,8 @@ impl MetalBackend {
 
         let sgemm_fn = library.get_function("sgemm", None).ok()?;
         let transb_fn = library.get_function("sgemm_transb", None).ok()?;
-        let q4_matvec_fn = library.get_function("q4_matvec", None).ok()?;
+        // Use v4 (uint32 wide loads) as production Q4 matvec — 2× faster than v1
+        let q4_matvec_fn = library.get_function("q4_matvec_v4", None).ok()?;
         let q4_vecmat_fn = library.get_function("q4_vecmat", None).ok()?;
 
         let f32_ops = F32Ops {
@@ -160,6 +161,22 @@ impl MetalBackend {
             &self.queue, &self.bufs, &self.q4,
             &self.geglu_pipeline, &self.q8_quant_pipeline,
             layers_q4, x, inter, hidden,
+        )
+    }
+
+    /// Full pipeline: attention + FFN for all layers in ONE command buffer.
+    /// No CPU-GPU round-trips between layers.
+    pub fn full_pipeline(
+        &self,
+        layers: &[ops::full_pipeline::LayerWeights],
+        x: &[f32],
+        hidden: usize, inter: usize,
+        q_dim: usize, kv_dim: usize,
+    ) -> Vec<f32> {
+        ops::full_pipeline::dispatch_full_pipeline(
+            &self.queue, &self.bufs, &self.f32_ops, &self.q4,
+            &self.geglu_pipeline, &self.q8_quant_pipeline,
+            layers, x, hidden, inter, q_dim, kv_dim,
         )
     }
 

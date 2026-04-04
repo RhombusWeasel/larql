@@ -25,7 +25,7 @@ pub struct InsertRequest {
     pub confidence: f32,
 }
 
-fn default_alpha() -> f32 { 2.0 }
+fn default_alpha() -> f32 { 0.25 }
 fn default_confidence() -> f32 { 0.9 }
 
 fn run_insert(
