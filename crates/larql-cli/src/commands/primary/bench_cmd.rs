@@ -95,8 +95,9 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let want_metal = requested_backends.contains(&"metal");
     let want_cpu = requested_backends.contains(&"cpu");
-    if !want_metal && !want_cpu && args.ollama.is_none() {
-        return Err("no backends selected: pass --backends metal,cpu and/or --ollama".into());
+    let want_engine = args.engine.is_some();
+    if !want_metal && !want_cpu && args.ollama.is_none() && !want_engine {
+        return Err("no backends selected: pass --backends metal,cpu, --ollama, or --engine".into());
     }
 
     println!("larql bench: {}", vindex_path.display());
@@ -112,20 +113,52 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut rows: Vec<BenchRow> = Vec::new();
 
+    // GPU/CPU bench requires Q4K vindex. Skip silently when running engine-only
+    // (engines need f32 weights from a non-Q4K vindex).
+    let cfg = larql_vindex::load_vindex_config(&vindex_path)?;
+    let is_q4k = cfg.quant == larql_vindex::QuantFormat::Q4K;
+
     if want_metal {
-        rows.push(run_larql(&vindex_path, &args, /* metal */ true)?);
+        if is_q4k {
+            rows.push(run_larql(&vindex_path, &args, /* metal */ true)?);
+        } else if !want_engine {
+            return Err(format!(
+                "GPU bench requires a Q4K vindex (got quant={:?}). \
+                 Use a q4k vindex for GPU bench, or omit --backends and use --engine only.",
+                cfg.quant,
+            ).into());
+        }
     }
     if want_cpu {
-        rows.push(run_larql(&vindex_path, &args, /* metal */ false)?);
+        if is_q4k {
+            rows.push(run_larql(&vindex_path, &args, /* metal */ false)?);
+        } else if !want_engine {
+            return Err(format!(
+                "CPU bench requires a Q4K vindex (got quant={:?}).",
+                cfg.quant,
+            ).into());
+        }
     }
     if let Some(ref ollama_model) = args.ollama {
         rows.push(run_ollama(ollama_model, &args.prompt, args.tokens));
     }
 
     // KV engine rows — load weights once, shared across all selected engines.
+    // Engines need full f32 attention + FFN tensors (not Q4K packed), so we
+    // use load_model_weights for non-Q4K vindexes and load_model_weights_q4k
+    // for Q4K (which populates packed_byte_ranges for attention via manifest).
     if let Some(ref engine_list) = args.engine {
+        let cfg = larql_vindex::load_vindex_config(&vindex_path)?;
+        if cfg.quant == larql_vindex::QuantFormat::Q4K {
+            return Err(
+                "KV engines require a non-quantised vindex (quant=none) — \
+                 attention tensors are not dequantised from Q4K format. \
+                 Use an f16 vindex: e.g. `larql bench gemma3-4b-f16 --engine markov-rs`"
+                .into(),
+            );
+        }
         let mut cb = larql_vindex::SilentLoadCallbacks;
-        let weights = larql_vindex::load_model_weights_q4k(&vindex_path, &mut cb)?;
+        let weights = larql_vindex::load_model_weights(&vindex_path, &mut cb)?;
         let tokenizer = larql_vindex::load_vindex_tokenizer(&vindex_path)?;
         let token_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
             .map_err(|e| format!("tokenize: {e}"))?;

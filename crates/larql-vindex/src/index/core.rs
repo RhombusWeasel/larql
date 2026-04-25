@@ -306,9 +306,6 @@ impl GateIndex for VectorIndex {
         VectorIndex::q4k_ffn_row_dot(self, layer, component, feat, x)
     }
 
-    fn q4k_ffn_row_dot_via_cache(&self, layer: usize, component: usize, feat: usize, x: &[f32]) -> Option<f32> {
-        VectorIndex::q4k_ffn_row_dot_via_cache(self, layer, component, feat, x)
-    }
     fn q4k_ffn_row_scaled_add_via_cache(&self, layer: usize, component: usize, feat: usize, alpha: f32, out: &mut [f32]) -> bool {
         VectorIndex::q4k_ffn_row_scaled_add_via_cache(self, layer, component, feat, alpha, out)
     }

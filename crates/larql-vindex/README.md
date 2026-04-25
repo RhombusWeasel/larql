@@ -424,6 +424,8 @@ reports go to `target/criterion/`.
 | `walk_all_layers / 8L×1024f×256h` | 216 µs |
 | `walk_all_layers / 14L×4096f×512h` | 2.19 ms |
 | `walk_all_layers / 8L×10240f×2560h` (8L Gemma band) | 21.2 ms |
+| `gate_knn_batch / seq1_10240f×2560h` (decode) | 2.63 ms |
+| `gate_knn_batch / seq256_10240f×2560h` (prefill) | **8.44 ms** (-24 % via parallel per-position top-K) |
 | `hnsw_warmup / dense-8L-10240×2560 / serial` | 395 ms |
 | `hnsw_warmup / dense-8L-10240×2560 / parallel` | **109 ms** (3.6× via `warmup_hnsw_all_layers`) |
 | `feature_meta_lookup` (per call) | ~245 ns |

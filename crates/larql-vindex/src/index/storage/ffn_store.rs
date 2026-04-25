@@ -581,32 +581,6 @@ impl VectorIndex {
         true
     }
 
-    /// Cache-based dot — same role as `q4k_ffn_row_scaled_add_via_cache`
-    /// but for the up leg. Currently unused (up is row-major on disk so
-    /// per-row decode is enough); kept for diagnostics and test parity.
-    /// If this works and the per-row version doesn't, the bug is in the
-    /// row-offset calculation or per-row byte slicing.
-    #[inline]
-    pub fn q4k_ffn_row_dot_via_cache(
-        &self,
-        layer: usize,
-        component: usize,
-        feat: usize,
-        x: &[f32],
-    ) -> Option<f32> {
-        let arc = self.q4k_ffn_layer(layer, component)?;
-        let hidden = self.hidden_size;
-        let row_start = feat * hidden;
-        let row_end = row_start + hidden;
-        if row_end > arc.len() { return None; }
-        let mut acc = 0.0f32;
-        for (i, &xv) in x.iter().enumerate() {
-            acc += arc[row_start + i] * xv;
-        }
-        Some(acc)
-    }
-
-
     /// Get gate matrix from Q4 interleaved file, dequantized to f32.
     pub fn interleaved_q4_gate(&self, layer: usize) -> Option<ndarray::Array2<f32>> {
         self.dequant_q4_matrix(layer, 0)

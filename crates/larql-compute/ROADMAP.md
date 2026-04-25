@@ -4,21 +4,23 @@
 
 | Engine | tok/s | ms/tok | Notes |
 |---|---|---|---|
-| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **68** | 14.7 | production extract; q6k_matvec 4-elem rewrite + min-heap top-k |
+| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **72–73** | 13.7 | inter-superblock interleaving + X preload + deferred scale |
 | **LARQL Metal** (gemma3-4b-q4k-downq4k, all-Q4_K) | **70.1** | 14.26 | all-Q4_K extract; q4k_geglu_silu_down fires |
-| **Ollama** gemma3:4b | **100–105** | 9.5–10.0 | reference |
-| **Gap** | LARQL is 1.48–1.53× slower | +5ms/tok | per-stage decomposition below |
+| **Ollama** gemma3:4b | **96–99** | 10.1 | reference |
+| **Gap** | LARQL is **1.33–1.36×** slower | +3.6ms/tok | per-stage decomposition below |
 
 Per-stage breakdown (larql-metal, gemma3-4b-q4k-v2, 100-token run):
 
 | Stage | ms/tok | % |
 |---|---|---|
-| GPU fwd | 12.7 | 84.8% |
-| lm_head | 2.3 | 15.1% |
+| GPU fwd | 11.8 | 83% |
+| lm_head | 2.35 | 17% |
 | embed + norm + detok | ~0.01 | ~0% |
 
-GPU fwd is 84% of decode time; FFN is ~87% of GPU fwd. The Q6_K down
-projection (2560×10240 per layer × 34 layers) is the dominant kernel.
+**Gap diagnosis**: dispatch overhead dominates (~2.4ms of 11.8ms GPU fwd).
+LARQL effective bandwidth: ~322 GB/s. Ollama: ~348 GB/s. Kernel quality gap
+is 8%; total gap is 1.33× due to 476 dispatches/token vs Ollama's ~272.
+See `PERFORMANCE.md` for the full llama.cpp comparison and bandwidth budget.
 
 The "117 tok/s" historical number was synthetic-weight Q4_KF without
 real vindex load. Production extracts use Q6_K down (Ollama
@@ -100,17 +102,37 @@ The revised estimate is ~0.2ms (not 0.4ms — norm_out is L2-cached).
 - Remaining overhead after heap: ~0.35ms.
 The GPU kernel itself (1.55ms) is the irreducible floor.
 
-### #5 — `q6k_matvec` 4-element batching (done 2026-04-25)
+### #5 — `q6k_matvec` full rewrite (done 2026-04-25)
 
-**Gain: ~1.7ms/tok GPU fwd / ~10% / +7 tok/s** (62→69 tok/s).
+**Total gain: ~3ms/tok / ~20% / +10 tok/s** (62→72 tok/s), in two phases:
 
-Root cause of prior slowness: the scalar inner loop computed `(i & 3u) << 1u`
-as a runtime shift for hi2 extraction — the GPU can't hoist a lane-varying
-shift amount. Restructured to process 4 consecutive elements per lane per pass
-(2 passes × 32 lanes × 4 elements = 256 per superblock) so hi2 shifts are
-compile-time constants (0, 2, 4, 6), reducing ops per element and enabling
-4-way ILP within each lane. Also: preloaded 16 scale values into registers +
-raised ROWS_PER_TG to 8 (256 threads/TG). All Q6_K parity tests pass.
+**Phase A — 4-element batching** (+7 tok/s, 62→69):
+Scalar inner loop used `(i & 3u) << 1u` — a runtime shift the GPU can't hoist.
+Restructured to 4-element groups with compile-time hi2 shifts (0,2,4,6), 16
+preloaded scales, and ROWS_PER_TG=8. All tests pass.
+
+**Phase B — inter-superblock interleaving + X preload + deferred scale** (+3 tok/s, 69→72):
+Adapted the llama.cpp `kernel_mul_mv_q6_K_f32_impl` strategy to LARQL's linear
+Q6_K layout (GGUF's transposed layout can't be ported directly — different format):
+- `ix = lane & 1` → adjacent lanes process alternate superblocks, letting DRAM
+  serve two memory banks in parallel.
+- `xl[16]` preloaded before weight reads → X fetches overlap weight byte loads.
+- Deferred scale: `acc += d*sc * (unscaled_sum_4_elems)` — 4× fewer scale mults.
+- ROWS_PER_TG dropped from 8→4 (128 threads/TG) → halved register pressure,
+  2× more concurrent TGs, better latency hiding on LPDDR5X.
+Effective Q6_K bandwidth: ~322 GB/s (up from ~294 GB/s).
+
+### #5b — `q4k_matvec` llama.cpp-style rewrite (open)
+
+**Estimated gain: ~0.5ms/tok.** Gate+up (Q4_K, 29.5 MB/layer) still uses the
+original sub-block stride kernel. llama.cpp's Q4_K uses:
+- 4 parallel block groups (`ix = tiisg/8`, `ib += 4`)
+- `yl[16]/yh[16]` preloaded X before compute + `sumy[4]` sum precompute
+- `float4 acc1/acc2` vectorized accumulation (potential 4× ALU throughput)
+
+The Q4_K inner structure is more complex than Q6_K (8-group scale packing,
+min correction). Estimate ~150 LOC MSL. LARQL's Q4_K format matches GGUF
+(same 144-byte block layout), so llama.cpp's algorithm can be ported directly.
 
 ---
 

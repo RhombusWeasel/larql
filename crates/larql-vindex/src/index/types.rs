@@ -107,10 +107,11 @@ pub trait GateIndex: Send + Sync {
         None
     }
 
-    /// TEMP diagnostic — route row-dot through full-layer cache.
-    fn q4k_ffn_row_dot_via_cache(&self, _layer: usize, _component: usize, _feat: usize, _x: &[f32]) -> Option<f32> {
-        None
-    }
+    /// Cache-based fused scaled-add for the down leg. Required because
+    /// down is stored `[hidden, intermediate]` on disk — there is no
+    /// per-row decode that gives a single feature's down vector
+    /// without first transposing the layer (which is what
+    /// `q4k_ffn_layer` does and caches). See ROADMAP W2.
     fn q4k_ffn_row_scaled_add_via_cache(&self, _layer: usize, _component: usize, _feat: usize, _alpha: f32, _out: &mut [f32]) -> bool {
         false
     }

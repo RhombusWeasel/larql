@@ -107,8 +107,16 @@ impl VectorIndex {
         row_dot(&bytes[start..end], x).ok()
     }
 
-    /// Fused Q4K/Q6K decode + scaled-add into `out` for one feature.
-    /// Counterpart to `q4k_ffn_row_dot` for the down leg.
+    /// Fused Q4K/Q6K decode + scaled-add into `out` for one feature of
+    /// the gate (component 0) or up (component 1) leg.
+    ///
+    /// **Down (component 2) is rejected.** Down is stored
+    /// `[hidden, intermediate]` on disk, so `feat`-th row is hidden-dim
+    /// wide — not a single feature's down vector. Calling with
+    /// `component == 2` here would silently produce wrong values
+    /// (correct stride, wrong meaning). Callers wanting one feature's
+    /// down vector must go through `q4k_ffn_row_scaled_add_via_cache`,
+    /// which transposes the layer first. See ROADMAP W2.
     #[inline]
     pub fn q4k_ffn_row_scaled_add(
         &self,
@@ -118,7 +126,7 @@ impl VectorIndex {
         alpha: f32,
         out: &mut [f32],
     ) -> bool {
-        if component > 2 || out.len() != self.hidden_size { return false; }
+        if component >= 2 || out.len() != self.hidden_size { return false; }
         let Some(slices) = self.interleaved_q4k_layer_data(layer) else { return false; };
         let (bytes, format) = slices[component];
         let hidden = self.hidden_size;

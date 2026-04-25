@@ -101,13 +101,16 @@ replacement kernel exists.
 
 Side findings — even without removing the cache, these are cheap
 cleanups worth doing:
-- `q4k_ffn_row_dot_via_cache` is documented as "currently unused";
-  delete if grep confirms.
-- `q4k_ffn_row_scaled_add` for `component == 2` uses
-  `bytes_per_row(hidden)` which is wrong for the transposed layout.
-  It's never called via `ffn_row_scaled_add` (the dispatch routes
-  down to the cache path) but the dead branch is a footgun. Either
-  delete it for `component == 2` or document the constraint.
+- ✅ Deleted `q4k_ffn_row_dot_via_cache` (2026-04-25). Confirmed
+  unused outside trait dispatch; gone from `FfnStore`, the trait,
+  the impl in `core.rs`, and the overlay forwarder.
+- ✅ Hardened `q4k_ffn_row_scaled_add` to reject `component == 2`
+  (2026-04-25). Down's `[hidden, intermediate]` layout means
+  `bytes_per_row(hidden)` produces the wrong stride; the function
+  now refuses the coordinate up-front instead of silently returning
+  garbage. The dispatch site in `ffn_row_scaled_add` already routes
+  down to the cache path, so the change is a footgun-removal with
+  zero behaviour delta.
 
 #### W3. Parallelize HNSW warmup (across layers) ✅ shipped 2026-04-25
 **Impact**: 8-layer dense HNSW warmup **3.6×** (395 → 109 ms); 4-layer
@@ -128,10 +131,12 @@ KNN queries on different layers don't block.
 | dense-8L (10240×2560) | 395 ms | 109 ms | 3.6× |
 | moe-4L (32768×2560) | 785 ms | 276 ms | 2.8× |
 
-Speedup is sub-linear in cores because BLAS itself spawns threads
-inside each parallel HNSW build (oversubscription). Future: bound
-BLAS to 1 thread inside the warmup pool to recover the missing
-factor.
+Speedup is sub-linear in cores. **Investigated and ruled out
+(2026-04-25):** BLAS thread oversubscription is NOT the bottleneck.
+Running with `VECLIB_MAXIMUM_THREADS=1 OPENBLAS_NUM_THREADS=1` made
+the parallel warmup *slightly slower* (109 → 113 ms, 276 → 300 ms).
+The HNSW search-level inner loop is memory-bound; per-thread cache
+contention is the real ceiling. No further wins from BLAS-tuning.
 
 ### Cached layer decode for template-fixed layers (L0–12) — parked
 **Impact**: 155+ tok/s decode (skip 13 of 21 layers)
@@ -151,16 +156,25 @@ than the phase flag.
 
 ## P2: Forward-looking
 
-### Parallelize gate KNN for batch inference
-**Impact**: 2–4× prefill throughput on multi-token batches
-**Effort**: Medium
-**Status**: Forward-looking
+### Parallelize gate KNN for batch inference ✅ shipped 2026-04-25
+**Impact**: -7 % at seq_len 64, **-24 % at seq_len 256** on Gemma-shape
+gates (10240×2560). Below seq_len 16 the rayon overhead cancels the
+savings, so the parallel branch is gated on
+`PARALLEL_TOPK_THRESHOLD = 16`.
+**Effort**: 30 min actual
+**Bench**: `cargo bench -p larql-vindex --bench vindex_ops -- gate_knn_batch`
+(new bench shipped with this change)
+**Status**: ✅ Shipped — `gate_knn_batch` now `par_iter`s the
+per-position top-K extraction when `seq_len >= 16`. Single-position
+calls (decode) take the same serial path as before; prefill paths get
+the parallel speedup.
 
-`gate_matmul` already runs across all positions in one BLAS call but
-the per-position top-K selection is sequential. Rayon-shard the
-selection across rows (or fold into a single batched argpartial). Not
-urgent — Metal kernel work (Q6_K dequant + 8-rows/TG) is the bigger
-throughput lever.
+| seq_len | Serial (RAYON=1) | Parallel | Δ |
+|---|---|---|---|
+| 1 (decode) | 2.78 ms | 2.73 ms | flat (below threshold) |
+| 16 | 4.11 ms | 4.21 ms | flat (below threshold) |
+| 64 | 5.42 ms | 5.05 ms | -7 % |
+| 256 (typical prefill) | 11.31 ms | 8.56 ms | **-24 %** |
 
 ### `VindexStorage` trait abstraction
 **Impact**: Lets Redis / S3 / GPU-residency backends plug in
