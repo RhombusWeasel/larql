@@ -4,13 +4,13 @@
 
 | Engine | tok/s | ms/tok | Notes |
 |---|---|---|---|
-| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **67.9** | 14.72 | production extract; Q6_K geglu+down NOT fused |
+| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **68–69** | 14.5–14.8 | production extract; 4-elem batching in q6k_matvec |
 | **LARQL Metal** (gemma3-4b-q4k-downq4k, all-Q4_K) | **70.1** | 14.26 | all-Q4_K extract; q4k_geglu_silu_down fires |
-| **Ollama** gemma3:4b | **101.2** | 9.89 | reference |
-| **Gap** | LARQL is 1.44–1.52× slower | +4–5ms/tok | per-stage decomposition below |
+| **Ollama** gemma3:4b | **100–105** | 9.5–10.0 | reference |
+| **Gap** | LARQL is 1.48–1.51× slower | +4.5ms/tok | per-stage decomposition below |
 
-GPU forward dominates (85%); FFN is 87% of GPU forward. Per-stage
-breakdown in the diagnostic write-up below.
+GPU forward: **12.6–12.7ms** (was 14.3ms before q6k_matvec 4-element rewrite).
+LM head: **2.4ms** (85% GPU kernel, 15% CPU sort/overhead).
 
 The "117 tok/s" historical number was synthetic-weight Q4_KF without
 real vindex load. Production extracts use Q6_K down (Ollama
@@ -92,12 +92,17 @@ roughly: CPU `quantize_to_q8(query)` ~50µs, GPU dispatch+commit+wait
 ~300µs. Move quantize to GPU, async readback, smaller heap-based
 top-k.
 
-### #5 — `q6k_matvec` shader optimization (open)
+### #5 — `q6k_matvec` 4-element batching (done 2026-04-25)
 
-**Estimated gain: unclear.** Current Q6_K Metal at prefill_10240:
-**79 GE/s**. Q4_K at same shape: **105 GE/s**. The 25% gap is
-plausible for Q6_K's heavier dequant, but Ollama's Q6_K matvec is
-likely closer to parity with their Q4_K. Profile and tune.
+**Gain: ~1.7ms/tok GPU fwd / ~10% / +7 tok/s** (62→69 tok/s).
+
+Root cause of prior slowness: the scalar inner loop computed `(i & 3u) << 1u`
+as a runtime shift for hi2 extraction — the GPU can't hoist a lane-varying
+shift amount. Restructured to process 4 consecutive elements per lane per pass
+(2 passes × 32 lanes × 4 elements = 256 per superblock) so hi2 shifts are
+compile-time constants (0, 2, 4, 6), reducing ops per element and enabling
+4-way ILP within each lane. Also: preloaded 16 scale values into registers +
+raised ROWS_PER_TG to 8 (256 threads/TG). All Q6_K parity tests pass.
 
 ---
 

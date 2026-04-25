@@ -2,17 +2,20 @@
 
 ## Current state (as of 2026-04-25)
 
-- **321 tests passing** on `larql-vindex` (173 unit + 148 integration);
+- **328 tests passing** on `larql-vindex` (180 unit + 148 integration);
   211 on `larql-models`. Workspace builds clean.
 - **Folder layout decomposed**:
   - `index/{storage,compute,mutate}/` — substores, KNN dispatch, mutation
   - `format/{huggingface,weights,filenames,fp4_codec,…}/`
   - `engine/` (was `storage/`) — StorageEngine + epoch + MEMIT
+  - `config/{index,quantization,model,compliance,dtype}.rs` — was the
+    624-line `types.rs` monolith
   - No `.rs` file > 750 lines (down from 1366 monolith)
 - **Quant dispatch via `quant::registry`** — adding the next K-quant is
   one table entry plus codec functions; ~3-file edit.
 - **Filename literals centralised** in `format::filenames` (252+
-  occurrences → one constant module).
+  occurrences → one constant module). Round-2 added 8 missed
+  constants (LM_HEAD_BIN + FP4 family + attn_q4/q8 manifests).
 - **`VectorIndex` god struct decomposed** into four typed substores
   (`GateStore`, `FfnStore`, `ProjectionStore`, `MetadataStore`). Adding
   a new field is one edit in the relevant store.
@@ -22,6 +25,13 @@
 - HNSW graph index wired into `gate_knn` (opt-in via `--hnsw`).
 - Q4_K dequant cache LRU-bounded via `--max-q4k-cache-layers`.
 - Patch system for editable knowledge (`PatchedVindex` overlay).
+- **Vindexfile `FROM hf://...`** — HF resolution wired through the
+  same resolver `larql run` and `larql extract` use.
+- **Streaming extract checkpoints + auto-resume** — phase-level
+  progress recorded to `.extract_checkpoint.json`; gate + down_meta
+  phases auto-skip on a compatible checkpoint.
+- **Stage labels centralised** in `extract::stage_labels` (15 labels;
+  typo at any site is now a compile error).
 - `make coverage` + `make coverage-summary` (cargo-llvm-cov).
 - Bench rig daemon-aware (`make bench-vindex-scaling` refuses if
   `larql-server` / `larql-router` are running on the host).
@@ -35,25 +45,6 @@ have landed.
 
 ## P1: Active
 
-### Split `config/types.rs` (628 L, 15 unrelated types)
-**Impact**: Future quant / MoE / FP4 additions scoped to one file
-**Effort**: Medium
-**Status**: ⏸ Deferred from 2026-04-25 round-2 cleanup — needs careful
-inter-type reference mapping. `VindexConfig` references `LayerBands`,
-`Fp4Config`, `VindexModelConfig`, `VindexLayerInfo` across what would
-become four files; safe split requires building the type-reference
-graph first.
-
-Proposed split:
-- `config/index.rs` — `VindexConfig`, `VindexSource`, `ExtractLevel`,
-  `VindexLayerInfo`, `DownMetaRecord`, `DownMetaTopK`
-- `config/quantization.rs` — `QuantFormat`, `Precision`,
-  `ProjectionFormat`, `Projections`, `Fp4Config`
-- `config/model.rs` — `VindexModelConfig`, `MoeConfig`
-- `config/compliance.rs` — `ComplianceGate`, `LayerBands`
-
-`mod.rs` re-exports the previous flat surface for back-compat.
-
 ### Cached layer decode for template-fixed layers (L0–12) — parked
 **Impact**: 155+ tok/s decode (skip 13 of 21 layers)
 **Effort**: Medium
@@ -61,27 +52,14 @@ Proposed split:
 Don't start until the prerequisite lands. Keep `CachedLayerGraph` in
 `larql-inference` as the integration point.
 
-### HuggingFace resolution in Vindexfile
+### Layer-level resume within an incomplete phase
+**Impact**: A run interrupted at gate-layer-30-of-34 today re-runs
+all 34 layers; layer-level resume would skip 30
 **Effort**: Medium
-**Status**: TODO in `vindexfile/mod.rs:162`
-
-FROM directive in Vindexfile should resolve `hf://user/repo` paths.
-
-### Streaming extraction checkpoints
-**Effort**: Medium
-**Status**: Not started
-
-Save extraction progress between layers so interrupted builds can
-resume.
-
-### GGUF Q4_K format option (144 bytes vs 148 bytes)
-**Impact**: Direct compatibility with llama.cpp weight files
-**Effort**: Low
-**Status**: Quantizer ready in `larql-compute` (`quantize_q4_k_gguf`)
-
-Add option to store attention weights in GGUF-canonical 144-byte Q4_K
-format (packed scales+mins in 12 bytes) instead of our 148-byte
-format.
+**Status**: Forward-looking — phase-level resume now in place
+(2026-04-25 round-3); the layer-level extension needs mid-phase file
+truncation to the last clean layer boundary, which is more delicate
+than the phase flag.
 
 ## P2: Forward-looking
 
@@ -148,6 +126,17 @@ Add new layers / features to an existing vindex without full rebuild.
 ---
 
 ## Completed
+
+### 2026-04-25 — round-3 polish
+
+| Item | Outcome |
+|------|---------|
+| Split `config/types.rs` (628 L) | → `config/{index,quantization,model,compliance}.rs` + back-compat `types` alias module |
+| HuggingFace resolution in Vindexfile | `FROM hf://...` directives now resolve via `format::huggingface::resolve_hf_vindex` |
+| Streaming extract phase checkpoints | `extract::checkpoint::Checkpoint` written to `.extract_checkpoint.json` after each phase; cleared on full success; 6 unit tests |
+| Auto-resume from checkpoint | `gate_layer_infos` persisted in checkpoint; on resume the gate + down_meta phases are skipped and existing files reused; incompatible checkpoints discarded with warning |
+| `extract::stage_labels` constants module | 15 callback labels (8 stages + 6 components + relation_clusters) extracted from 65+ literal sites — typo'd `on_stage_done("gate_vectro")` is now a compile error |
+| GGUF Q4_K format check | No-op — 144-byte GGUF-canonical layout was already in use everywhere; only fixed a stale 148-byte comment in `larql-compute/src/pipeline.rs` |
 
 ### 2026-04-25 — second audit + round-2 cleanup
 

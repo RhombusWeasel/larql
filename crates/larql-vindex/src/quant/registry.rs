@@ -70,7 +70,7 @@ impl QuantFormatInfo {
     /// if the row isn't a whole number of blocks.
     #[inline]
     pub fn bytes_per_row(&self, n_cols: usize) -> Option<usize> {
-        if n_cols % self.block_elements != 0 { return None; }
+        if !n_cols.is_multiple_of(self.block_elements) { return None; }
         Some((n_cols / self.block_elements) * self.bytes_per_block)
     }
 

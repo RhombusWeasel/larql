@@ -7,5 +7,4 @@ pub mod hnsw;
 pub mod q4k_dispatch;
 pub mod router;
 
-pub use gate_knn::*;
 pub use router::RouterIndex;

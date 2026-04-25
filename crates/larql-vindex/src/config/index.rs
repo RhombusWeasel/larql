@@ -150,7 +150,7 @@ impl std::fmt::Display for ExtractLevel {
     }
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct VindexLayerInfo {
     pub layer: usize,
     pub num_features: usize,

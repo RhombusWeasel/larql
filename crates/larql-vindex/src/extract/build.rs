@@ -16,6 +16,7 @@
 //!
 //! Discrete helpers live in `super::build_helpers`.
 
+use crate::extract::stage_labels::*;
 use std::io::BufWriter;
 use std::path::Path;
 
@@ -104,13 +105,13 @@ impl<'a> BuildContext<'a> {
     /// Stage 1 — write `gate_vectors.bin` (one matrix per layer; MoE
     /// concatenates each expert's matrix). Populates `layer_infos`.
     fn write_gate_vectors(&mut self) -> Result<(), VindexError> {
-        self.callbacks.on_stage("gate_vectors");
+        self.callbacks.on_stage(STAGE_GATE_VECTORS);
         let gate_path = self.output_dir.join(GATE_VECTORS_BIN);
         let mut gate_file = BufWriter::new(std::fs::File::create(&gate_path)?);
         let mut offset: u64 = 0;
 
         for layer in 0..self.num_layers {
-            self.callbacks.on_layer_start("gate", layer, self.num_layers);
+            self.callbacks.on_layer_start(COMP_GATE, layer, self.num_layers);
             let start = std::time::Instant::now();
 
             if self.is_moe && self.n_experts > 0 {
@@ -177,20 +178,20 @@ impl<'a> BuildContext<'a> {
             }
 
             self.callbacks
-                .on_layer_done("gate", layer, start.elapsed().as_secs_f64() * 1000.0);
+                .on_layer_done(COMP_GATE, layer, start.elapsed().as_secs_f64() * 1000.0);
         }
-        self.callbacks.on_stage_done("gate_vectors", 0.0);
+        self.callbacks.on_stage_done(STAGE_GATE_VECTORS, 0.0);
         Ok(())
     }
 
     /// Stage 2 — write `embeddings.bin`.
     fn write_embeddings(&mut self) -> Result<(), VindexError> {
-        self.callbacks.on_stage("embeddings");
+        self.callbacks.on_stage(STAGE_EMBEDDINGS);
         let embed_path = self.output_dir.join(EMBEDDINGS_BIN);
         let embed_data = self.weights.embed.as_slice().unwrap();
         let embed_bytes = crate::config::dtype::encode_floats(embed_data, self.dtype);
         std::fs::write(&embed_path, &embed_bytes)?;
-        self.callbacks.on_stage_done("embeddings", 0.0);
+        self.callbacks.on_stage_done(STAGE_EMBEDDINGS, 0.0);
         Ok(())
     }
 
@@ -201,7 +202,7 @@ impl<'a> BuildContext<'a> {
     /// also collect `(input_token, output_token, offset_direction)` for
     /// the relation clustering stage.
     fn write_down_meta_and_clusters(&mut self) -> Result<(), VindexError> {
-        self.callbacks.on_stage("down_meta");
+        self.callbacks.on_stage(STAGE_DOWN_META);
 
         let mut all_down_meta: Vec<Option<Vec<Option<crate::FeatureMeta>>>> =
             vec![None; self.num_layers];
@@ -218,7 +219,7 @@ impl<'a> BuildContext<'a> {
         );
 
         for (layer, layer_down_meta) in all_down_meta.iter_mut().enumerate().take(self.num_layers) {
-            self.callbacks.on_layer_start("down", layer, self.num_layers);
+            self.callbacks.on_layer_start(COMP_DOWN, layer, self.num_layers);
             let start = std::time::Instant::now();
 
             // Collect all down matrices for this layer (dense: 1, MoE: num_experts)
@@ -242,14 +243,14 @@ impl<'a> BuildContext<'a> {
                 match self.weights.tensors.get(&down_key) {
                     Some(w) => vec![(w, 0)],
                     None => {
-                        self.callbacks.on_layer_done("down", layer, 0.0);
+                        self.callbacks.on_layer_done(COMP_DOWN, layer, 0.0);
                         continue;
                     }
                 }
             };
 
             if down_matrices.is_empty() {
-                self.callbacks.on_layer_done("down", layer, 0.0);
+                self.callbacks.on_layer_done(COMP_DOWN, layer, 0.0);
                 continue;
             }
 
@@ -282,7 +283,7 @@ impl<'a> BuildContext<'a> {
 
                     let w_chunk = w_down.slice(ndarray::s![.., batch_start..batch_end]).to_owned();
                     let cpu = larql_compute::CpuBackend;
-                    use larql_compute::{ComputeBackend, MatMul};
+                    use larql_compute::MatMul;
                     let chunk_logits = cpu.matmul(self.weights.embed.view(), w_chunk.view());
 
                     for feat in batch_start..batch_end {
@@ -368,11 +369,11 @@ impl<'a> BuildContext<'a> {
             }
 
             self.callbacks
-                .on_layer_done("down", layer, start.elapsed().as_secs_f64() * 1000.0);
+                .on_layer_done(COMP_DOWN, layer, start.elapsed().as_secs_f64() * 1000.0);
         }
 
         crate::format::down_meta::write_binary(self.output_dir, &all_down_meta, self.down_top_k)?;
-        self.callbacks.on_stage_done("down_meta", 0.0);
+        self.callbacks.on_stage_done(STAGE_DOWN_META, 0.0);
         Ok(())
     }
 
@@ -397,13 +398,13 @@ impl<'a> BuildContext<'a> {
 
     /// Stage 5 — copy the tokenizer JSON.
     fn write_tokenizer(&mut self) -> Result<(), VindexError> {
-        self.callbacks.on_stage("tokenizer");
+        self.callbacks.on_stage(STAGE_TOKENIZER);
         let tokenizer_json = self
             .tokenizer
             .to_string(true)
             .map_err(|e| VindexError::Parse(format!("tokenizer serialize: {e}")))?;
         std::fs::write(self.output_dir.join(TOKENIZER_JSON), tokenizer_json)?;
-        self.callbacks.on_stage_done("tokenizer", 0.0);
+        self.callbacks.on_stage_done(STAGE_TOKENIZER, 0.0);
         Ok(())
     }
 
@@ -666,11 +667,11 @@ pub fn build_vindex_resume(
         callbacks,
     )?;
 
-    callbacks.on_stage("tokenizer");
+    callbacks.on_stage(STAGE_TOKENIZER);
     let tokenizer_json = tokenizer.to_string(true)
         .map_err(|e| VindexError::Parse(format!("tokenizer serialize: {e}")))?;
     std::fs::write(output_dir.join(TOKENIZER_JSON), tokenizer_json)?;
-    callbacks.on_stage_done("tokenizer", 0.0);
+    callbacks.on_stage_done(STAGE_TOKENIZER, 0.0);
 
     let down_top_k = 10; // default
     let family = weights.arch.family().to_string();

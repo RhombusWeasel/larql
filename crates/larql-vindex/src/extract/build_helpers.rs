@@ -19,6 +19,8 @@
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use crate::extract::stage_labels::STAGE_RELATION_CLUSTERS;
+
 use ndarray::Array2;
 use larql_models::ModelWeights;
 
@@ -104,7 +106,7 @@ pub(super) fn compute_gate_top_tokens(
         let gend = (gstart + gbatch).min(num_features);
         let chunk = w_gate.slice(ndarray::s![gstart..gend, ..]);
         let cpu = larql_compute::CpuBackend;
-        use larql_compute::{ComputeBackend, MatMul};
+        use larql_compute::MatMul;
         let proj = cpu.matmul_transb(ww_embed.view(), chunk.view());
         for f in 0..(gend - gstart) {
             let col = proj.column(f);
@@ -207,7 +209,7 @@ pub(super) fn run_clustering_pipeline(
         return Ok(());
     }
 
-    callbacks.on_stage("relation_clusters");
+    callbacks.on_stage(STAGE_RELATION_CLUSTERS);
 
     let n_features = data.features.len();
     let matrix = ndarray::Array2::from_shape_vec((n_features, hidden_size), data.directions)

@@ -21,7 +21,7 @@
 //! doubles TG count to 640, increasing concurrent memory pressure.
 
 pub const SHADER: &str = r#"
-constant uint Q6K_ROWS_PER_TG = 4;
+constant uint Q6K_ROWS_PER_TG = 8;
 constant uint Q6K_BLOCK_SIZE  = 210;
 
 kernel void q6k_matvec(
@@ -45,27 +45,52 @@ kernel void q6k_matvec(
 
     for (uint sb = 0u; sb < superblocks; sb++) {
         device const uchar* block = row + sb * Q6K_BLOCK_SIZE;
-        device const uchar* ql    = block;
-        device const uchar* qh    = block + 128u;
-        device const char*  sc    = (device const char*)(block + 192u);
+        device const uchar* ql   = block;
+        device const uchar* qh   = block + 128u;
         ushort d_bits = ushort(block[208]) | (ushort(block[209]) << 8u);
         float d = decode_f16_metal(d_bits);
 
+        // Preload 16 scaled int8 scales into registers — eliminates one
+        // device read per element in the inner loops below.
+        device const char* sc_dev = (device const char*)(block + 192u);
+        float sc_f[16];
+        for (uint s = 0u; s < 16u; s++) { sc_f[s] = d * float(sc_dev[s]); }
+
         uint x_base = sb * 256u;
 
-        for (uint pass = 0u; pass < 8u; pass++) {
-            uint i = pass * 32u + lane;
+        // 4-element batching: each lane processes 4 consecutive elements
+        // per pass so that hi2 shifts are compile-time constants (0,2,4,6)
+        // instead of the runtime `(i & 3) << 1` from the scalar loop.
+        // 2 passes × 32 lanes × 4 elements = 256 elements/superblock.
+        // Each group of 4 shares one hi2 byte and one scale entry, so
+        // byte-read count drops from 4 per 4 elements to 3 (2 lo4 + 1 hi2).
+        // All 4 elements also share the same scale (base is aligned to 4,
+        // so floor(base/16) == floor((base+3)/16) always holds).
+        for (uint pass = 0u; pass < 2u; pass++) {
+            uint base = pass * 128u + lane * 4u;
 
-            uchar lo_byte = ql[i >> 1u];
-            uint lo4 = (i & 1u) ? ((lo_byte >> 4u) & 0x0Fu) : (lo_byte & 0x0Fu);
+            float sc = sc_f[base >> 4u];
 
-            uchar hi_byte = qh[i >> 2u];
-            uint hi2 = (hi_byte >> ((i & 3u) << 1u)) & 0x03u;
+            // hi2: one byte → 4 values via compile-time-constant shifts.
+            uchar hi = qh[base >> 2u];
+            uint hi2_0 =  hi        & 0x03u;
+            uint hi2_1 = (hi >> 2u) & 0x03u;
+            uint hi2_2 = (hi >> 4u) & 0x03u;
+            uint hi2_3 = (hi >> 6u) & 0x03u;
 
-            int raw = int(lo4 | (hi2 << 4u)) - 32;
+            // lo4: two bytes → 4 nibbles.
+            uint lo_idx = base >> 1u;
+            uchar lo_a = ql[lo_idx];
+            uchar lo_b = ql[lo_idx + 1u];
+            uint lo4_0 =  lo_a        & 0x0Fu;
+            uint lo4_1 = (lo_a >> 4u) & 0x0Fu;
+            uint lo4_2 =  lo_b        & 0x0Fu;
+            uint lo4_3 = (lo_b >> 4u) & 0x0Fu;
 
-            float val = d * float(sc[i >> 4u]) * float(raw);
-            acc = fma(val, X[x_base + i], acc);
+            acc = fma(sc * float(int(lo4_0 | (hi2_0 << 4u)) - 32), X[x_base + base    ], acc);
+            acc = fma(sc * float(int(lo4_1 | (hi2_1 << 4u)) - 32), X[x_base + base + 1u], acc);
+            acc = fma(sc * float(int(lo4_2 | (hi2_2 << 4u)) - 32), X[x_base + base + 2u], acc);
+            acc = fma(sc * float(int(lo4_3 | (hi2_3 << 4u)) - 32), X[x_base + base + 3u], acc);
         }
     }
 
@@ -74,8 +99,8 @@ kernel void q6k_matvec(
 }
 "#;
 
-pub const ROWS_PER_TG: u64 = 4;
-pub const THREADS_PER_TG: u64 = 128;
+pub const ROWS_PER_TG: u64 = 8;
+pub const THREADS_PER_TG: u64 = 256;
 
 /// Marker for the kernel-handle binding. See `metal::kernel::TiledKernel`.
 pub struct Kernel;

@@ -156,16 +156,18 @@ pub fn build_from_vindexfile(
 }
 
 /// Resolve a path from a Vindexfile directive.
-/// Handles: local paths, hf:// URLs (future), https:// URLs (future).
+/// Handles: local paths, `hf://` URLs (downloads + caches via the
+/// HuggingFace resolver), `https://` URLs (still TODO).
 fn resolve_vindexfile_path(path: &str, working_dir: &Path) -> Result<std::path::PathBuf, VindexError> {
-    if path.starts_with("hf://") {
-        // TODO: HuggingFace resolution
-        Err(VindexError::Parse(format!(
-            "HuggingFace paths not yet implemented: {path}. Download manually and use a local path."
-        )))
+    if crate::format::huggingface::is_hf_path(path) {
+        // Use the same resolver `larql run` and `larql extract` use
+        // — caches under HF's standard cache dir, conditional fetch
+        // by ETag. Returns the local snapshot path.
+        crate::format::huggingface::resolve_hf_vindex(path)
     } else if path.starts_with("https://") || path.starts_with("http://") {
         Err(VindexError::Parse(format!(
-            "Remote URLs not yet implemented: {path}. Download manually and use a local path."
+            "remote URLs not yet implemented in Vindexfile: {path} \
+             — download manually and use a local path"
         )))
     } else {
         let p = working_dir.join(path);

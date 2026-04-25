@@ -1,5 +1,6 @@
 //! Build a .vindex from pre-extracted NDJSON vector files.
 
+use crate::extract::stage_labels::*;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -51,7 +52,7 @@ use crate::config::{
             .unwrap_or(0) as usize;
 
         // ── 2. Stream gate vectors → binary + collect layer info ──
-        callbacks.on_stage("gate_vectors");
+        callbacks.on_stage(STAGE_GATE_VECTORS);
         let start = std::time::Instant::now();
 
         let gate_file = std::fs::File::open(&gate_path)?;
@@ -132,10 +133,10 @@ use crate::config::{
         }
         bin_file.flush()?;
 
-        callbacks.on_stage_done("gate_vectors", start.elapsed().as_secs_f64() * 1000.0);
+        callbacks.on_stage_done(STAGE_GATE_VECTORS, start.elapsed().as_secs_f64() * 1000.0);
 
         // ── 3. Stream embeddings → binary ──
-        callbacks.on_stage("embeddings");
+        callbacks.on_stage(STAGE_EMBEDDINGS);
         let start = std::time::Instant::now();
 
         let embed_bin_path = output_dir.join(EMBEDDINGS_BIN);
@@ -189,10 +190,10 @@ use crate::config::{
         embed_out.write_all(embed_bytes)?;
         embed_out.flush()?;
 
-        callbacks.on_stage_done("embeddings", start.elapsed().as_secs_f64() * 1000.0);
+        callbacks.on_stage_done(STAGE_EMBEDDINGS, start.elapsed().as_secs_f64() * 1000.0);
 
         // ── 4. Stream down metadata (copy top_k, skip vectors) ──
-        callbacks.on_stage("down_meta");
+        callbacks.on_stage(STAGE_DOWN_META);
         let start = std::time::Instant::now();
 
         let down_meta_path = output_dir.join("down_meta.jsonl");
@@ -247,15 +248,15 @@ use crate::config::{
         }
         down_out.flush()?;
 
-        callbacks.on_stage_done("down_meta", start.elapsed().as_secs_f64() * 1000.0);
+        callbacks.on_stage_done(STAGE_DOWN_META, start.elapsed().as_secs_f64() * 1000.0);
 
         // ── 5. Copy tokenizer if available ──
         // Look for tokenizer.json near the vectors dir or in common locations
         let tokenizer_src = find_tokenizer(vectors_dir);
         if let Some(ref src) = tokenizer_src {
-            callbacks.on_stage("tokenizer");
+            callbacks.on_stage(STAGE_TOKENIZER);
             std::fs::copy(src, output_dir.join(TOKENIZER_JSON))?;
-            callbacks.on_stage_done("tokenizer", 0.0);
+            callbacks.on_stage_done(STAGE_TOKENIZER, 0.0);
         }
 
         // ── 6. Determine embed_scale from model family ──

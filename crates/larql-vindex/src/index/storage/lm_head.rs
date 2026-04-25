@@ -199,7 +199,7 @@ impl VectorIndex {
         let hidden = self.hidden_size;
         let x = query.view().into_shape_with_order((1, hidden)).unwrap();
         let cpu = larql_compute::CpuBackend;
-        use larql_compute::{ComputeBackend, MatMul};
+        use larql_compute::MatMul;
         let result = cpu.matmul_transb(x, lm_view); // [1, hidden] @ [vocab, hidden]^T → [1, vocab]
         let scores = ndarray::Array1::from_vec(result.into_raw_vec_and_offset().0);
 

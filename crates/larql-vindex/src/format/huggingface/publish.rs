@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use crate::error::VindexError;
 use crate::format::filenames::*;
 
-use super::{VINDEX_CORE_FILES, VINDEX_WEIGHT_FILES};
 
 /// Options controlling [`publish_vindex_with_opts`]. Kept as a struct so
 /// the signature can grow without breaking callers.

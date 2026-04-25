@@ -6,6 +6,7 @@
 //!
 //! For a 120B MoE model: ~120 GB as ModelWeights vs ~2 GB streaming.
 
+use crate::extract::stage_labels::*;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -89,8 +90,35 @@ pub fn build_vindex_streaming(
         return Err(VindexError::NoSafetensors(model_dir.to_path_buf()));
     }
 
-    callbacks.on_stage("loading");
+    callbacks.on_stage(STAGE_LOADING);
     eprintln!("  Streaming mode: {} safetensors shards (mmap'd, not loaded)", st_files.len());
+
+    // Checkpoint setup with auto-resume. A compatible checkpoint
+    // from a previous interrupted run is reused; phases it marked
+    // complete are skipped (their output files on disk are reused
+    // unchanged). An incompatible checkpoint (different model_dir /
+    // num_layers) is discarded.
+    let mut checkpoint = match super::checkpoint::Checkpoint::load(output_dir)? {
+        Some(prior) if prior.is_compatible_with(model_dir, model_name, num_layers) => {
+            eprintln!(
+                "  Resuming from checkpoint at {}/{} — phases already complete: {:?}",
+                output_dir.display(),
+                super::checkpoint::CHECKPOINT_FILE,
+                prior.completed,
+            );
+            prior
+        }
+        Some(_) => {
+            eprintln!(
+                "  Checkpoint at {}/{} is incompatible with this run \
+                 (different model / layer count) — discarding",
+                output_dir.display(),
+                super::checkpoint::CHECKPOINT_FILE,
+            );
+            super::checkpoint::Checkpoint::fresh(model_dir, model_name, num_layers)
+        }
+        None => super::checkpoint::Checkpoint::fresh(model_dir, model_name, num_layers),
+    };
 
     // (shards vec was for an earlier design — tensor_index + shard_mmaps is the actual approach)
 
@@ -115,7 +143,7 @@ pub fn build_vindex_streaming(
         }
     }
 
-    callbacks.on_stage_done("loading", 0.0);
+    callbacks.on_stage_done(STAGE_LOADING, 0.0);
 
     // ── 1. Gate vectors (streaming, one layer at a time) ──
     //
@@ -123,7 +151,7 @@ pub fn build_vindex_streaming(
     // `layer_infos` (num_features per layer is part of `index.json`)
     // but redirect writes to `/dev/null` (`io::sink`). The gate bytes
     // are recoverable from `interleaved_q4k.bin` at load time.
-    callbacks.on_stage("gate_vectors");
+    callbacks.on_stage(STAGE_GATE_VECTORS);
     let gate_path = output_dir.join(GATE_VECTORS_BIN);
     enum GateSink {
         File(BufWriter<std::fs::File>),
@@ -143,19 +171,40 @@ pub fn build_vindex_streaming(
             }
         }
     }
-    let mut gate_file: GateSink = if drop_gate_vectors {
+
+    // Auto-resume: if a prior run finished the gate phase and saved
+    // `gate_layer_infos`, reuse it and skip the gate loop entirely.
+    let resumed_gate = checkpoint.is_complete(super::checkpoint::ExtractPhase::Gate)
+        && checkpoint.gate_layer_infos.is_some();
+    let mut layer_infos: Vec<VindexLayerInfo> = if resumed_gate {
+        eprintln!(
+            "  Skipping gate phase ({} layer infos restored from checkpoint; \
+             reusing existing {})",
+            checkpoint.gate_layer_infos.as_ref().map(|v| v.len()).unwrap_or(0),
+            GATE_VECTORS_BIN,
+        );
+        callbacks.on_stage_done(STAGE_GATE_VECTORS, 0.0);
+        checkpoint.gate_layer_infos.clone().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Only allocate the writer + run the loop when the phase isn't
+    // already done.
+    let mut gate_file: GateSink = if resumed_gate || drop_gate_vectors {
         GateSink::Discard(std::io::sink())
     } else {
         GateSink::File(BufWriter::new(std::fs::File::create(&gate_path)?))
     };
-    let mut layer_infos: Vec<VindexLayerInfo> = Vec::new();
     let mut offset: u64 = 0;
 
     // Check expert format from the architecture
     let expert_format = arch.expert_format();
 
-    for layer in 0..num_layers {
-        callbacks.on_layer_start("gate", layer, num_layers);
+    // Skip the per-layer gate loop entirely on resume.
+    let layer_count_for_loop = if resumed_gate { 0 } else { num_layers };
+    for layer in 0..layer_count_for_loop {
+        callbacks.on_layer_start(COMP_GATE, layer, num_layers);
         let start = std::time::Instant::now();
 
         if expert_format == larql_models::ExpertFormat::PackedMxfp4 {
@@ -266,20 +315,23 @@ pub fn build_vindex_streaming(
             }
         }
 
-        callbacks.on_layer_done("gate", layer, start.elapsed().as_secs_f64() * 1000.0);
+        callbacks.on_layer_done(COMP_GATE, layer, start.elapsed().as_secs_f64() * 1000.0);
     }
     gate_file.flush()?;
     // If we were only sinking bytes, don't leave a zero-byte
     // gate_vectors.bin behind for the loader to trip over.
     drop(gate_file);
-    if drop_gate_vectors && gate_path.exists() {
+    if drop_gate_vectors && gate_path.exists() && !resumed_gate {
         let _ = std::fs::remove_file(&gate_path);
     }
-    callbacks.on_stage_done("gate_vectors", 0.0);
+    if !resumed_gate {
+        callbacks.on_stage_done(STAGE_GATE_VECTORS, 0.0);
+        checkpoint.mark_gate_complete(layer_infos.clone(), output_dir)?;
+    }
 
     // ── 1b. Router weights (MoE models only) ──
     if is_moe {
-        callbacks.on_stage("router_weights");
+        callbacks.on_stage(STAGE_ROUTER_WEIGHTS);
         let router_path = output_dir.join("router_weights.bin");
         let mut router_file = BufWriter::new(std::fs::File::create(&router_path)?);
 
@@ -304,11 +356,11 @@ pub fn build_vindex_streaming(
             }
         }
         router_file.flush()?;
-        callbacks.on_stage_done("router_weights", 0.0);
+        callbacks.on_stage_done(STAGE_ROUTER_WEIGHTS, 0.0);
     }
 
     // ── 2. Embeddings ──
-    callbacks.on_stage("embeddings");
+    callbacks.on_stage(STAGE_EMBEDDINGS);
     let embed_key = normalize_key(arch.embed_key(), prefixes);
     let embed = get_tensor_f32(&shard_mmaps, &tensor_index, &embed_key)?
         .ok_or_else(|| VindexError::MissingTensor(embed_key.clone()))?;
@@ -316,17 +368,32 @@ pub fn build_vindex_streaming(
     let embed_data = embed.as_slice().unwrap();
     let embed_bytes = crate::config::dtype::encode_floats(embed_data, dtype);
     std::fs::write(output_dir.join(EMBEDDINGS_BIN), &embed_bytes)?;
-    callbacks.on_stage_done("embeddings", 0.0);
+    callbacks.on_stage_done(STAGE_EMBEDDINGS, 0.0);
 
     // ── 3. Down meta (streaming) ──
-    callbacks.on_stage("down_meta");
+    //
+    // Auto-resume: skip the entire down-meta phase if the prior run
+    // already wrote `down_meta.bin`. The file is opaque to us here
+    // (we don't reload it), but the loader at the end uses it
+    // directly off disk via `mmap`, and the config-write doesn't
+    // need any per-layer state from this phase — so a clean skip is
+    // safe.
+    let resumed_down = checkpoint.is_complete(super::checkpoint::ExtractPhase::DownMeta);
+    callbacks.on_stage(STAGE_DOWN_META);
+    if resumed_down {
+        eprintln!(
+            "  Skipping down_meta phase (reusing existing {})",
+            DOWN_META_BIN,
+        );
+    }
     let mut all_down_meta: Vec<Option<Vec<Option<crate::FeatureMeta>>>> = vec![None; num_layers];
 
     // Build whole-word vocab once
     let (_ww_ids, _ww_embed) = super::build_helpers::build_whole_word_vocab(tokenizer, &embed, vocab_size, hidden_size);
 
-    for (layer, layer_down_meta) in all_down_meta.iter_mut().enumerate().take(num_layers) {
-        callbacks.on_layer_start("down", layer, num_layers);
+    let down_layer_count = if resumed_down { 0 } else { num_layers };
+    for (layer, layer_down_meta) in all_down_meta.iter_mut().enumerate().take(down_layer_count) {
+        callbacks.on_layer_start(COMP_DOWN, layer, num_layers);
         let start = std::time::Instant::now();
 
         // Get down matrices for this layer
@@ -353,7 +420,7 @@ pub fn build_vindex_streaming(
                     Array2::from_shape_vec((out_features, in_features), data).unwrap()
                 }).collect()
             } else {
-                callbacks.on_layer_done("down", layer, 0.0); continue;
+                callbacks.on_layer_done(COMP_DOWN, layer, 0.0); continue;
             }
         } else if expert_format == larql_models::ExpertFormat::PackedBF16 && is_moe {
             // Hybrid MoE (Gemma 4 26B A4B): use dense FFN down for down_meta.
@@ -361,7 +428,7 @@ pub fn build_vindex_streaming(
             let down_key = normalize_key(&arch.ffn_down_key(layer), prefixes);
             match get_tensor_f32(&shard_mmaps, &tensor_index, &down_key)? {
                 Some(t) => vec![t],
-                None => { callbacks.on_layer_done("down", layer, 0.0); continue; }
+                None => { callbacks.on_layer_done(COMP_DOWN, layer, 0.0); continue; }
             }
         } else if is_moe && n_experts > 0 {
             let mut mats = Vec::new();
@@ -378,12 +445,12 @@ pub fn build_vindex_streaming(
             let down_key = normalize_key(&arch.ffn_down_key(layer), prefixes);
             match get_tensor_f32(&shard_mmaps, &tensor_index, &down_key)? {
                 Some(t) => vec![t],
-                None => { callbacks.on_layer_done("down", layer, 0.0); continue; }
+                None => { callbacks.on_layer_done(COMP_DOWN, layer, 0.0); continue; }
             }
         };
 
         if down_matrices.is_empty() {
-            callbacks.on_layer_done("down", layer, 0.0);
+            callbacks.on_layer_done(COMP_DOWN, layer, 0.0);
             continue;
         }
 
@@ -399,7 +466,7 @@ pub fn build_vindex_streaming(
 
                 let w_chunk = w_down.slice(ndarray::s![.., batch_start..batch_end]).to_owned();
                 let cpu = larql_compute::CpuBackend;
-                use larql_compute::{ComputeBackend, MatMul};
+                use larql_compute::MatMul;
                 let chunk_logits = cpu.matmul(embed.view(), w_chunk.view());
 
                 for feat in batch_start..batch_end {
@@ -442,18 +509,21 @@ pub fn build_vindex_streaming(
             feature_offset += num_features;
         }
 
-        callbacks.on_layer_done("down", layer, start.elapsed().as_secs_f64() * 1000.0);
+        callbacks.on_layer_done(COMP_DOWN, layer, start.elapsed().as_secs_f64() * 1000.0);
     }
 
-    crate::format::down_meta::write_binary(output_dir, &all_down_meta, down_top_k)?;
-    callbacks.on_stage_done("down_meta", 0.0);
+    if !resumed_down {
+        crate::format::down_meta::write_binary(output_dir, &all_down_meta, down_top_k)?;
+        callbacks.on_stage_done(STAGE_DOWN_META, 0.0);
+        checkpoint.mark(super::checkpoint::ExtractPhase::DownMeta, output_dir)?;
+    }
 
     // ── 4. Tokenizer ──
-    callbacks.on_stage("tokenizer");
+    callbacks.on_stage(STAGE_TOKENIZER);
     let tokenizer_json = tokenizer.to_string(true)
         .map_err(|e| VindexError::Parse(format!("tokenizer serialize: {e}")))?;
     std::fs::write(output_dir.join(TOKENIZER_JSON), tokenizer_json)?;
-    callbacks.on_stage_done("tokenizer", 0.0);
+    callbacks.on_stage_done(STAGE_TOKENIZER, 0.0);
 
     // ── 5. Config ──
     let family = arch.family().to_string();
@@ -565,6 +635,10 @@ pub fn build_vindex_streaming(
     let config_json = serde_json::to_string_pretty(&config)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(output_dir.join(INDEX_JSON), config_json)?;
+
+    // Whole extract succeeded — drop the checkpoint so the next
+    // visitor sees a clean output dir, not a half-finished one.
+    super::checkpoint::Checkpoint::clear(output_dir)?;
 
     Ok(())
 }

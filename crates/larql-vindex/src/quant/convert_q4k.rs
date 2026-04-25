@@ -31,6 +31,7 @@ use crate::format::weights::{
 use crate::IndexLoadCallbacks;
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct Q4kConvertConfig {
     /// Quantise FFN down-proj as Q4_K instead of Q6_K. Default false
     /// preserves the Ollama-compatible Q4_K_M mix (Q4_K gate/up, Q6_K
@@ -41,11 +42,6 @@ pub struct Q4kConvertConfig {
     pub force: bool,
 }
 
-impl Default for Q4kConvertConfig {
-    fn default() -> Self {
-        Self { down_q4k: false, force: false }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct Q4kConvertReport {

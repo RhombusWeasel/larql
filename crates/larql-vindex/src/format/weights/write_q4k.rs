@@ -4,7 +4,7 @@
 //!
 //! Carved out of the monolithic `write.rs` in the 2026-04-25 reorg.
 
-use std::collections::HashMap;
+use crate::extract::stage_labels::*;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
@@ -14,7 +14,6 @@ use crate::error::VindexError;
 use crate::format::filenames::*;
 use crate::extract::callbacks::IndexBuildCallbacks;
 use crate::config::{VindexConfig, VindexModelConfig};
-use crate::format::load::load_vindex_config;
 
 use super::write_f32::{WeightEntry, WeightSource};
 
@@ -84,7 +83,7 @@ fn pad_rows_to_256(data: &[f32], rows: usize, cols: usize) -> (Vec<f32>, usize) 
     for r in 0..rows {
         let row = &data[r * cols..(r + 1) * cols];
         out.extend_from_slice(row);
-        out.extend(std::iter::repeat(0.0f32).take(pad));
+        out.extend(std::iter::repeat_n(0.0f32, pad));
     }
     (out, padded_cols)
 }
@@ -136,7 +135,7 @@ pub fn write_model_weights_q4k_with_opts(
 ) -> Result<(), VindexError> {
     use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
 
-    callbacks.on_stage("model_weights_q4k");
+    callbacks.on_stage(STAGE_MODEL_WEIGHTS_Q4K);
     let start = std::time::Instant::now();
 
     let arch = source.arch();
@@ -149,7 +148,7 @@ pub fn write_model_weights_q4k_with_opts(
     let mut attn_manifest: Vec<Q4kAttnEntry> = Vec::with_capacity(num_layers * 4);
 
     for layer in 0..num_layers {
-        callbacks.on_layer_start("attn_q4k", layer, num_layers);
+        callbacks.on_layer_start(COMP_ATTN_Q4K, layer, num_layers);
 
         // Resolve each tensor. For V, fall back to K when v_shares_k=true or
         // v_proj simply isn't present (global layers on 31B).
@@ -206,7 +205,7 @@ pub fn write_model_weights_q4k_with_opts(
             attn_offset += length;
         }
 
-        callbacks.on_layer_done("attn_q4k", layer, 0.0);
+        callbacks.on_layer_done(COMP_ATTN_Q4K, layer, 0.0);
     }
     attn_file.flush()?;
     drop(attn_file);
@@ -230,7 +229,7 @@ pub fn write_model_weights_q4k_with_opts(
     let mut ff_manifest: Vec<Q4kAttnEntry> = Vec::with_capacity(num_layers * 3);
 
     for layer in 0..num_layers {
-        callbacks.on_layer_start("ffn_q4k", layer, num_layers);
+        callbacks.on_layer_start(COMP_FFN_Q4K, layer, num_layers);
         for (i, key) in [
             arch.ffn_gate_key(layer),
             arch.ffn_up_key(layer),
@@ -261,7 +260,7 @@ pub fn write_model_weights_q4k_with_opts(
                 ff_offset += length;
             }
         }
-        callbacks.on_layer_done("ffn_q4k", layer, 0.0);
+        callbacks.on_layer_done(COMP_FFN_Q4K, layer, 0.0);
     }
     ff_file.flush()?;
     drop(ff_file);
@@ -613,7 +612,7 @@ pub fn write_model_weights_q4k_with_opts(
         .map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(&config_path, config_json)?;
 
-    callbacks.on_stage_done("model_weights_q4k", start.elapsed().as_secs_f64() * 1000.0);
+    callbacks.on_stage_done(STAGE_MODEL_WEIGHTS_Q4K, start.elapsed().as_secs_f64() * 1000.0);
     Ok(())
 }
 

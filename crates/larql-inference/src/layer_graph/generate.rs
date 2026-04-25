@@ -71,6 +71,24 @@ fn backend_lm_head_topk(
         backend.matmul_transb(q_row, lm.view()).row(0).to_vec()
     };
 
+    // Fast path for greedy decode (top_k=1): a single linear scan avoids
+    // allocating the full 262K×8=2MB indexed Vec and the select_nth pass.
+    if top_k == 1 {
+        let best = scores_vec.iter().copied().enumerate()
+            .filter(|(_, s)| s.is_finite())
+            .fold(None::<(usize, f32)>, |acc, (i, s)| {
+                Some(match acc {
+                    None => (i, s),
+                    Some((bi, bs)) => if s > bs { (i, s) } else { (bi, bs) },
+                })
+            });
+        let _ = vocab;
+        return match best {
+            Some((i, s)) => vec![(i as u32, s)],
+            None => vec![],
+        };
+    }
+
     let mut indexed: Vec<(u32, f32)> = scores_vec
         .iter()
         .copied()

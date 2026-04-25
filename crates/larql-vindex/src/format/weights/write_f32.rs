@@ -11,6 +11,7 @@
 //! (mmap'd safetensors) write through the same `write_model_weights` function
 //! via the `WeightSource` trait.
 
+use crate::extract::stage_labels::*;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -247,7 +248,7 @@ pub fn write_model_weights_with_opts(
     callbacks: &mut dyn IndexBuildCallbacks,
     opts: WriteWeightsOptions,
 ) -> Result<(), VindexError> {
-    callbacks.on_stage("model_weights");
+    callbacks.on_stage(STAGE_MODEL_WEIGHTS);
     let start = std::time::Instant::now();
 
     let dtype = load_vindex_config(dir)
@@ -269,7 +270,7 @@ pub fn write_model_weights_with_opts(
     let mut attn_offset: u64 = 0;
 
     for layer in 0..num_layers {
-        callbacks.on_layer_start("attn_weights", layer, num_layers);
+        callbacks.on_layer_start(COMP_ATTN_WEIGHTS, layer, num_layers);
         for key in &[
             arch.attn_q_key(layer),
             arch.attn_k_key(layer),
@@ -303,7 +304,7 @@ pub fn write_model_weights_with_opts(
             }
         }
 
-        callbacks.on_layer_done("attn_weights", layer, 0.0);
+        callbacks.on_layer_done(COMP_ATTN_WEIGHTS, layer, 0.0);
     }
     attn_file.flush()?;
     } // end if write_attn
@@ -335,7 +336,7 @@ pub fn write_model_weights_with_opts(
     let mut down_offset: u64 = 0;
 
     for layer in 0..num_layers {
-        callbacks.on_layer_start("up/down_weights", layer, num_layers);
+        callbacks.on_layer_start(COMP_UP_DOWN_WEIGHTS, layer, num_layers);
 
         if arch.is_moe() {
             for expert in 0..arch.num_experts() {
@@ -402,7 +403,7 @@ pub fn write_model_weights_with_opts(
             }
         }
 
-        callbacks.on_layer_done("up/down_weights", layer, 0.0);
+        callbacks.on_layer_done(COMP_UP_DOWN_WEIGHTS, layer, 0.0);
     }
     up_file.flush()?;
     down_file.flush()?;
@@ -536,7 +537,7 @@ pub fn write_model_weights_with_opts(
         .map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(&config_path, config_json)?;
 
-    callbacks.on_stage_done("model_weights", start.elapsed().as_secs_f64() * 1000.0);
+    callbacks.on_stage_done(STAGE_MODEL_WEIGHTS, start.elapsed().as_secs_f64() * 1000.0);
     Ok(())
 }
 

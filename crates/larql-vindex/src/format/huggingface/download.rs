@@ -4,7 +4,7 @@
 //! Carved out of the monolithic `huggingface.rs` in the 2026-04-25
 //! reorg. See `super::mod.rs` for the module map.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::error::VindexError;
 use crate::format::filenames::*;
