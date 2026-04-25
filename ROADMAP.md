@@ -390,54 +390,100 @@ Worth doing for the Act 2 demo but non-trivial. See
 
 ## P1 — Loose ends in shipped features
 
-### CPU vs Metal disagree on LM-head top-5 for tied-embedding models (open)
+### Metal `q4_matvec_v4` drops 75 % of rows at vocab scale (open)
 
-Surfaced 2026-04-25 by `test_logits_goldens.rs` while baking the
-per-backend goldens. On the prompt `"The capital of France is"`:
+Surfaced and bisected 2026-04-25. Production decode on tied-embedding
+models (Gemma 3 4B, Gemma 4 31B) emits *different first tokens* on
+CPU vs Metal — `larql run` against Gemma 3 4B with the auto-router
+picks one token under Metal and a totally different one under CPU.
 
-- **Llama 2 7B / Mistral 7B v0.1**: CPU and Metal produce
+**Symptom (`test_logits_goldens.rs`).** On the prompt
+`"The capital of France is"`:
+
+- **Llama 2 7B / Mistral 7B v0.1** — CPU and Metal produce
   bit-identical top-5 (`[263, 278, 697, 3681, 884]` for Llama;
   `[5465, 264, 272, 5651, 624]` for Mistral). Same top-1 logit
-  (29.99 / 1.45) on both backends.
-- **Gemma 3 4B / Gemma 4 31B (tied embed)**: CPU and Metal produce
-  *completely different* top-5 sets and top-1 logits. e.g. Gemma 3 4B:
-  Metal top-1 token 50429 (logit 2874); CPU top-1 token 256240 (logit
-  3632) — different magnitudes, different parts of the 262K vocab.
+  (29.99 / 1.45) on both backends. Clean.
+- **Gemma 3 4B / Gemma 4 31B (tied embed)** — CPU and Metal produce
+  *completely different* top-5 sets. e.g. Gemma 3 4B: Metal top-1
+  token 50429 (logit 2874); CPU top-1 token 256240 (logit 3632) —
+  different magnitudes, different parts of the 262K vocab.
 
-Earlier parity tests (`test_cpu_metal_parity` per-layer end-of-layer,
-`test_decode_consistency`, `test_decode_stage_bisect` per-stage L0)
-all pass on Gemma 3 4B / Gemma 4 31B with `cos=1.0`. So the prefill
-through to `h_post_attn` and `down_out` is bit-clean across backends.
-The divergence is downstream — between the final-layer hidden and the
-top-K argsort that `lm_head_topk` returns. Most likely culprit: the
-LM-head `f32_gemv` over the full `[vocab=262144, hidden=2560]` matrix
-on Metal vs CPU, on the **tied-embedding** path (where `weights.lm_head`
-is cloned from `embed`). Llama / Mistral have *separate* lm_head
-matrices and don't show this — supporting the tied-clone hypothesis.
+The per-layer parity tests (`test_cpu_metal_parity`,
+`test_decode_consistency`, `test_decode_stage_bisect`) all pass on
+Gemma 3 4B / Gemma 4 31B with `cos=1.0` through `down_out` — so
+prefill is clean across backends. The divergence is in the LM-head
+step that runs after.
 
-**What this affects.** `larql run` / `larql chat` against Gemma 3 4B
-or Gemma 4 31B may produce different first tokens depending on which
-backend was selected by the auto-router. Behaviour stays
+**Root cause (`test_kernel_lm_head_gemv.rs`, gated on
+`LARQL_RUN_LM_HEAD_BISECT=1` because it allocates a 2.68 GB f32
+matrix).** Two suspects, ruled out then ruled in:
+
+1. **`f32_gemv` at vocab scale (262 144 × 2 560)** — bit-equivalent
+   between CPU and Metal. Top-5 match in identical order, top-1 logit
+   Δ = 2.4 e-7 (rel 7.6 e-8). `f32_gemv_cpu_vs_metal_at_vocab_scale`
+   pins this clean. Cleared.
+2. **`q4_matvec_v4` (Q4_0 + Q8 query) at vocab scale** — **the
+   cause.** Metal silently computes only **~25 % of rows** — exactly
+   2 rows per TG out of the intended 8. The remaining 75 % of the
+   output stays at 0.0. `q4_matvec_cutoff_sweep` confirms this
+   across N from 8 000 to 262 144; the 25 % ratio is constant.
+
+   The pipeline's `maxTotalThreadsPerThreadgroup` is 1024 (queried at
+   runtime — `q4_matvec_pipeline_max_threads_per_tg` reports it), so
+   the dispatch's requested 256 threads-per-TG isn't being clamped at
+   the pipeline level. Yet only 2 of the 8 simdgroups fire per TG.
+   Likely candidates: a `dispatch_thread_groups` vs `dispatch_threads`
+   semantics mismatch in the encode wrapper, or per-thread register
+   pressure in the heavy-integer-arithmetic inner loop silently
+   spilling simdgroups. Both need a closer look at the shader +
+   dispatch site (`crates/larql-compute/src/metal/shaders/q4_matvec_v4.rs`,
+   `crates/larql-compute/src/metal/ops/q4_matvec.rs`).
+
+**Why only Gemma 3 / Gemma 4 hit it.** `lm_head_knn_backend` has
+three paths (Q4 → f16 → f32). Tied-embedding models (Gemma 3/4)
+build `lm_head_q4_synth` from the f16 embedding table and route
+through `backend.q4_matvec` at full vocab — that's the broken path.
+Llama 2 / Mistral ship with a separate `lm_head` matrix and fall
+through to the f32 path which is clean.
+
+**What this affects right now.** `larql run` / `larql chat` against
+Gemma 3 4B or Gemma 4 31B may produce different first tokens
+depending on which backend the auto-router picks. Behaviour stays
 in-distribution (the architecture goldens still pass — the model
-emits sensible tokens either way) but the two backends aren't
+emits sensible tokens either way), but the two backends aren't
 reproducing each other's argmax.
 
-**Pinned by.** `test_logits_goldens` records per-backend goldens, so
-each backend's regression is detected independently. The goldens
-also serve as the bisect baseline: once this is fixed, the goldens
-should converge between CPU and Metal for tied-embedding models, and
-the test file's per-backend split collapses to a single golden per
-arch.
+**Pinned by.**
+- `larql-inference/tests/test_logits_goldens.rs` — per-backend top-5
+  + top-1 logit goldens. Currently records *separate* goldens for CPU
+  and Metal on Gemma 3/4. After the fix, they should converge and the
+  per-backend split collapses to a single golden per arch.
+- `larql-compute/tests/test_kernel_lm_head_gemv.rs` — three gated
+  kernel tests. `f32_gemv_cpu_vs_metal_at_vocab_scale` passes (suspect
+  cleared); `q4_matvec_pipeline_max_threads_per_tg` is a probe;
+  `q4_matvec_cpu_vs_metal_at_vocab_scale` + `q4_matvec_cutoff_sweep`
+  both fail until the kernel/dispatch is fixed.
 
-**Path forward.** The `lm_head_topk` path goes through
-`backend.f32_gemv(lm.view(), query)` for both backends — same kernel
-shape, different implementation. Bisect with a fixed query vector
-(skip the prefill so we know the input is identical), compare top-5
-of CPU vs Metal `f32_gemv` directly. If they diverge at that level,
-it's a Metal `f32_gemv` shader issue at vocab-scale K. If they
-converge, the divergence is upstream (last-layer hidden state
-between the two paths — possibly the embed-table tie cloning the
-wrong tensor).
+**Path forward.** Two angles a Metal-shader-experienced contributor
+should try first:
+
+1. Replace `enc.dispatch_thread_groups((num_tgs, 1, 1), (256, 1, 1))`
+   with `enc.dispatch_threads((num_tgs * 256, 1, 1), (256, 1, 1))` at
+   the dispatch site. If the 25 % ratio disappears, the bug was in
+   the threadgroup-grid form's interaction with the pipeline's
+   register-occupancy schedule.
+2. Reduce ROWS_PER_TG to 2 (matching what's *actually* firing) and
+   re-benchmark — if performance is unchanged, the kernel was
+   silently scheduling at 64 threads-per-TG anyway. If perf drops,
+   the simdgroup-fan-out is genuinely needed and the dispatch path
+   is the real bug.
+
+Either path lands a one-line fix once the right diagnosis is in
+hand. The kernel-level tests above pin both regressions and the
+recovery — running `LARQL_RUN_LM_HEAD_BISECT=1 cargo test
+--release --features metal -p larql-compute --test
+test_kernel_lm_head_gemv` is enough to verify a fix.
 
 ### `--compact` loader reconstruction — WalkFfn-only today
 
