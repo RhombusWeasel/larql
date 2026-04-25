@@ -70,6 +70,11 @@ impl<'a> WalkFfn<'a> {
             larql_models::Activation::GeluTanh | larql_models::Activation::Gelu
         );
 
+        // Hint the kernel to start streaming layer N+1's Q4_K/Q6_K bytes
+        // into the page cache while we work on N. No-op when there's no
+        // Q4_K mmap, no manifest, or `layer+1` is out of range.
+        self.index.prefetch_interleaved_q4k_layer(layer + 1);
+
         let mut out = Array2::<f32>::zeros((seq_len, hidden));
         let mut full_activation = Array2::<f32>::zeros((seq_len, intermediate));
 

@@ -88,6 +88,16 @@ struct Cli {
     #[arg(long, default_value = "0")]
     max_gate_cache_layers: usize,
 
+    /// Cap the number of layers held in the Q4_K/Q6_K FFN dequant cache.
+    /// 0 = unlimited (default). Only fires on the CPU per-position
+    /// fallback in walk_ffn — Metal full-K decode does not populate
+    /// this cache. Each cached layer holds up to gate+up+down
+    /// dequantised to f32 (`intermediate × hidden × 4 bytes` per
+    /// component). On Gemma 3 4B that's ~105 MB/component — set to
+    /// 8 for ~840 MB ceiling on the down leg.
+    #[arg(long, default_value = "0")]
+    max_q4k_cache_layers: usize,
+
     /// Ask the kernel to drop resident mmap pages after each walk-ffn
     /// request (calls `madvise(MADV_DONTNEED)` on every mapping). On
     /// Linux RSS drops immediately; on Darwin the kernel may defer.
@@ -184,6 +194,7 @@ fn load_single_vindex(
     embed_only: bool,
     layer_range: Option<(usize, usize)>,
     max_gate_cache_layers: usize,
+    max_q4k_cache_layers: usize,
     release_mmap_after_request: bool,
     expert_filter: Option<(usize, usize)>,
 ) -> Result<LoadedModel, BoxError> {
@@ -205,6 +216,10 @@ fn load_single_vindex(
     if max_gate_cache_layers > 0 {
         index.set_gate_cache_max_layers(max_gate_cache_layers);
         info!("  Gate cache: LRU, max {} layers", max_gate_cache_layers);
+    }
+    if max_q4k_cache_layers > 0 {
+        index.set_q4k_ffn_cache_max_layers(max_q4k_cache_layers);
+        info!("  Q4K FFN cache: LRU, max {} layers", max_q4k_cache_layers);
     }
     let total_features: usize = config.layers.iter().map(|l| l.num_features).sum();
 
@@ -370,13 +385,13 @@ async fn main() -> Result<(), BoxError> {
         }
         info!("Found {} vindexes in {}", paths.len(), dir.display());
         for p in &paths {
-            match load_single_vindex(&p.to_string_lossy(), cli.no_infer, cli.ffn_only, cli.embed_only, layer_range, cli.max_gate_cache_layers, cli.release_mmap_after_request, expert_filter) {
+            match load_single_vindex(&p.to_string_lossy(), cli.no_infer, cli.ffn_only, cli.embed_only, layer_range, cli.max_gate_cache_layers, cli.max_q4k_cache_layers, cli.release_mmap_after_request, expert_filter) {
                 Ok(m) => models.push(Arc::new(m)),
                 Err(e) => warn!("  Skipping {}: {}", p.display(), e),
             }
         }
     } else if let Some(ref vindex_path) = cli.vindex_path {
-        let m = load_single_vindex(vindex_path, cli.no_infer, cli.ffn_only, cli.embed_only, layer_range, cli.max_gate_cache_layers, cli.release_mmap_after_request, expert_filter)?;
+        let m = load_single_vindex(vindex_path, cli.no_infer, cli.ffn_only, cli.embed_only, layer_range, cli.max_gate_cache_layers, cli.max_q4k_cache_layers, cli.release_mmap_after_request, expert_filter)?;
         models.push(Arc::new(m));
     } else {
         return Err("must provide a vindex path or --dir".into());

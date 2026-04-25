@@ -436,7 +436,10 @@ impl MetalBackend {
                         enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
                     }
                 } else {
-                    use crate::metal::shaders::q4_matvec as q4mv;
+                    // Geometry constants must come from the same shader the
+                    // q4.matvec pipeline is built from in metal/mod.rs (v4);
+                    // see ops/q4_matvec.rs for the row-drop regression history.
+                    use crate::metal::shaders::q4_matvec_v4 as q4mv;
                     let n_tgs_ffn = (inter as u64).div_ceil(q4mv::ROWS_PER_TG);
                     if layer.is_gated() {
                         enc.set_compute_pipeline_state(&self.q4.matvec);

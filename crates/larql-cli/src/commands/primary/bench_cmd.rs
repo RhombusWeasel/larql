@@ -189,6 +189,21 @@ fn run_larql(
     );
     let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
+    // Q4_K dequant cache footprint after the run. The full-K Metal fast
+    // path streams Q4_K bytes through `q4k_matmul_transb` and should NOT
+    // populate this cache; the per-position fallback in walk_ffn/sparse
+    // does. Print it on `-v` so the perf audit can verify which path
+    // was taken without running vmmap.
+    if args.verbose {
+        let (slots, bytes) = q4_index.q4k_ffn_cache_stats();
+        eprintln!(
+            "[bench] q4k_ffn_cache after {}: {} populated slots, {:.1} MB",
+            backend_name_for(metal),
+            slots,
+            bytes as f64 / 1_048_576.0,
+        );
+    }
+
     let n_warm = args.warmup.min(result.decode_ms.len());
     let measured = &result.decode_ms[n_warm..];
     let measured_n = measured.len();
@@ -199,7 +214,7 @@ fn run_larql(
         (result.prefill_ms, avg, 1000.0 / avg)
     };
 
-    let backend_name = if metal { "larql-metal" } else { "larql-cpu" };
+    let backend_name = backend_name_for(metal);
     let note = if measured_n < args.tokens {
         format!("early stop @{}/{} (EOS or GPU fallback)", measured_n, args.tokens)
     } else if measured_n == 0 {
@@ -223,6 +238,10 @@ fn run_larql(
         n_steps: measured_n,
         note,
     })
+}
+
+fn backend_name_for(metal: bool) -> &'static str {
+    if metal { "larql-metal" } else { "larql-cpu" }
 }
 
 /// Query a local Ollama server for a one-shot generate at `n` tokens.

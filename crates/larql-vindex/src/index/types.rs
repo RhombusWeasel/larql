@@ -81,6 +81,10 @@ pub trait GateIndex: Send + Sync {
     fn interleaved_q4_mmap_ref(&self) -> Option<&[u8]> { None }
     fn has_interleaved_q4k(&self) -> bool { false }
     fn interleaved_q4k_mmap_ref(&self) -> Option<&[u8]> { None }
+    /// Issue MADV_WILLNEED for the next layer's Q4_K/Q6_K FFN data so
+    /// pages are streamed in while the current layer computes. No-op
+    /// default for non-mmap implementations.
+    fn prefetch_interleaved_q4k_layer(&self, _layer: usize) {}
     /// Per-layer FFN Q4_K/Q6_K slices — [gate, up, down] with format tags.
     /// `None` when the FFN manifest wasn't emitted (older vindexes).
     fn interleaved_q4k_layer_data(&self, _layer: usize) -> Option<[(&[u8], &str); 3]> { None }

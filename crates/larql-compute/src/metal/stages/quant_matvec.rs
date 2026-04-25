@@ -116,7 +116,9 @@ pub fn encode(
         }
         crate::QuantFormat::Q4_0 | crate::QuantFormat::Q8_0 => {
             // Q4_0 matvec expects Q8 input + Q8 scales (per-32 f16-scaled blocks).
-            use crate::metal::shaders::q4_matvec as q4mv;
+            // Geometry constants must come from the same shader the pipeline
+            // is built from in metal/mod.rs (q4_matvec_v4); see ops/q4_matvec.rs.
+            use crate::metal::shaders::q4_matvec_v4 as q4mv;
             let num_tgs = (num_rows as u64).div_ceil(q4mv::ROWS_PER_TG);
             enc.set_compute_pipeline_state(pipes.q4_matvec);
             enc.set_buffer(0, Some(w_buf), 0);

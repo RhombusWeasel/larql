@@ -164,46 +164,53 @@ fn f32_gemv_cpu_vs_metal_at_vocab_scale() {
 }
 
 /// Probe Metal's `q4_matvec_v4` pipeline state for its actual
-/// `maxTotalThreadsPerThreadgroup` limit. The dispatch requests 256
-/// threads per TG (= 8 simdgroups × 32 lanes), but if the compiled
-/// shader's resource usage caps the pipeline at e.g. 64 threads per
-/// TG (= 2 simdgroups), Metal will silently dispatch fewer threads
-/// than requested. That's the "25% of rows computed" pattern in
-/// `q4_matvec_cutoff_sweep` — exactly 2 of 8 simdgroups firing.
+/// `maxTotalThreadsPerThreadgroup` limit, and assert the dispatch
+/// wrapper's requested threads-per-TG fits inside it. If the compiled
+/// shader's resource usage ever caps the pipeline below the dispatch
+/// request, Metal will silently run fewer threads/TG → fewer
+/// simdgroups → fewer rows covered.
+///
+/// The actual dispatch request lives in `ops::q4_matvec::dispatch`,
+/// which (post-fix) imports its constants from the same shader module
+/// the pipeline is built from (`q4_matvec_v4`). Pre-fix the wrapper
+/// imported from a different shader (`q4_matvec`) and the constants
+/// drifted apart silently — that's what we're guarding against.
 #[test]
 fn q4_matvec_pipeline_max_threads_per_tg() {
-    if !run_enabled() {
-        eprintln!("skip: LARQL_RUN_LM_HEAD_BISECT=1 not set");
-        return;
-    }
     let metal = get_metal();
     // Access the underlying pipeline through the Q4 family.
     let pipeline = &metal.q4.matvec;
-    let limit = pipeline.max_total_threads_per_threadgroup();
+    let limit = pipeline.max_total_threads_per_threadgroup() as u64;
     let requested = larql_compute::metal::shaders::q4_matvec_v4::THREADS_PER_TG;
     eprintln!(
         "  q4_matvec_v4 pipeline maxTotalThreadsPerThreadgroup = {limit} \
          (dispatch requests {requested})"
     );
-    if (limit as u64) < requested {
-        eprintln!(
-            "  ⚠  pipeline limit ({limit}) < requested TG size ({requested}). \
-             Each TG silently runs only {limit} threads ({} simdgroups out \
-             of {}), so each TG covers only {} rows out of ROWS_PER_TG=8 \
-             — accounting for the {:.0}% computed-rows ratio observed in \
-             `q4_matvec_cutoff_sweep`.",
-            (limit / 32),
-            (requested / 32),
-            (limit / 32),
-            (limit as f64 / requested as f64) * 100.0,
-        );
-    }
+    assert!(
+        limit >= requested,
+        "pipeline limit ({limit}) < requested TG size ({requested}). \
+         Each TG would silently run only {limit} threads ({} simdgroups \
+         out of {}), so each TG covers only {} rows out of ROWS_PER_TG={} \
+         — that's the 75 %-row-drop pattern in `q4_matvec_cutoff_sweep`. \
+         Either drop ROWS_PER_TG/THREADS_PER_TG in the v4 shader, or \
+         simplify its register/threadgroup usage so the pipeline cap \
+         comes back up.",
+        limit / 32,
+        requested / 32,
+        limit / 32,
+        larql_compute::metal::shaders::q4_matvec_v4::ROWS_PER_TG,
+    );
 }
 
-/// Sweep across N to find the exact cutoff where Metal Q4_0 matvec
-/// stops computing rows. Cheap (small Q4 buffers) and unambiguous —
-/// we know `n=2048` works (existing test passes) and `n=262144` fails;
-/// this finds the first failing N.
+/// Sweep across N to confirm Metal Q4_0 matvec writes every row at
+/// every scale we ship. Pre-fix this leaked at constant ratio 25 %
+/// (num_rows / 4) because `ops::q4_matvec::dispatch` imported geometry
+/// constants from the wrong shader module — `num_tgs = num_rows / 32`
+/// while the kernel actually consumed 8 row-addresses per TG.
+///
+/// Asserts that for every N in the sweep, `count(metal_scores != 0)`
+/// equals N (every output row written) and that Metal's top index
+/// agrees with CPU's.
 #[test]
 fn q4_matvec_cutoff_sweep() {
     if !run_enabled() {
@@ -215,22 +222,174 @@ fn q4_matvec_cutoff_sweep() {
     use larql_compute::cpu::ops::q4_common::{quantize_q4_0, quantize_to_q8};
 
     let k = 256usize; // small K so the sweep is fast
-    let x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.013).sin()).collect();
+    let x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.013).sin() + 0.5).collect();
     let (q8_x_i8, q8_scales) = quantize_to_q8(&x);
 
-    // Sweep N at 8-row boundaries: 8000 (1000 TGs), 32K (4096 TGs),
-    // 65512 (8189 TGs), 65520 (8190), … 70000 (8750), 100000, 262144.
+    // Sweep N at and around 8/32-row boundaries: 8000 (1000 TGs of 8),
+    // 32K (4000), 65520 (8190), 65536 (8192), 65560 (8195 — first N
+    // beyond the pre-fix wrap-around), 70000, 100000, 262144 (vocab).
     for &n in &[8000usize, 32000, 65520, 65536, 65560, 65600, 70000, 100000, 200000, 262144] {
-        let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.0001).sin()).collect();
+        let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.0001).sin() + 0.5).collect();
         let q4 = quantize_q4_0(&w);
         let cpu_scores = CpuBackend.q4_matvec(&q4, &q8_x_i8, &q8_scales, n, k).unwrap();
         let metal_scores = metal.q4_matvec(&q4, &q8_x_i8, &q8_scales, n, k).unwrap();
-        let nonzero = metal_scores.iter().filter(|&&v| v.abs() > 1e-9).count();
+        let metal_nonzero = metal_scores.iter().filter(|&&v| v.abs() > 1e-9).count();
         let cpu_nonzero = cpu_scores.iter().filter(|&&v| v.abs() > 1e-9).count();
-        let first_zero = metal_scores.iter().position(|&v| v.abs() <= 1e-9).unwrap_or(n);
+        let first_zero = metal_scores.iter().position(|&v| v.abs() <= 1e-9);
         eprintln!(
-            "  N={n:>6}  TGs={:>5}  metal_nonzero={nonzero}/{n}  cpu_nonzero={cpu_nonzero}/{n}  first_zero={first_zero}",
+            "  N={n:>6}  TGs(v4)={:>5}  metal_nonzero={metal_nonzero}/{n}  \
+             cpu_nonzero={cpu_nonzero}/{n}  first_zero={first_zero:?}",
             n.div_ceil(8),
+        );
+        assert_eq!(
+            cpu_nonzero, n,
+            "test invariant: synth inputs are non-zero so CPU output \
+             should be all non-zero (got {cpu_nonzero}/{n} at N={n})"
+        );
+        assert_eq!(
+            metal_nonzero, n,
+            "Metal q4_matvec dropped {} rows at N={n} (first zero at {first_zero:?}). \
+             Pre-fix ratio: ~num_rows/4 covered. Post-fix expectation: every row written.",
+            n - metal_nonzero,
+        );
+    }
+}
+
+/// Regression for the 75 %-row drop bug fixed 2026-04-25.
+///
+/// `ops::q4_matvec::dispatch` previously imported geometry constants
+/// from `shaders::q4_matvec` (ROWS_PER_TG=32, THREADS_PER_TG=1024) but
+/// the pipeline ran the `q4_matvec_v4` kernel — whose row-mapping is
+/// hardcoded as `tg_id * 8 + sg_id`. Mismatch → only `num_rows / 4`
+/// rows were ever written; the rest stayed at zero (the buffer's
+/// initial value).
+///
+/// This test runs at small N (1024 rows × 256 hidden, < 200 KB Q4) and
+/// asserts every output row is non-zero. With the pre-fix bug 75 % of
+/// rows would zero-out; post-fix every row is written. Un-gated so
+/// it runs in casual `cargo test --features metal` and CI.
+#[test]
+fn q4_matvec_metal_writes_every_row_small_n() {
+    let metal = get_metal();
+    metal.set_flop_threshold(1);
+    use larql_compute::cpu::ops::q4_common::{quantize_q4_0, quantize_to_q8};
+
+    let n = 1024usize;
+    let k = 256usize;
+    // Bias non-zero so every dot product is non-zero by construction.
+    let w: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.001).sin() + 0.5).collect();
+    let x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.013).sin() + 0.5).collect();
+    let q4 = quantize_q4_0(&w);
+    let (q8_x, q8_scales) = quantize_to_q8(&x);
+
+    let metal_scores = metal.q4_matvec(&q4, &q8_x, &q8_scales, n, k).unwrap();
+    let cpu_scores = CpuBackend.q4_matvec(&q4, &q8_x, &q8_scales, n, k).unwrap();
+
+    let metal_zeros: Vec<usize> = metal_scores.iter().enumerate()
+        .filter(|(_, &v)| v.abs() <= 1e-9).map(|(i, _)| i).collect();
+    let cpu_zeros: Vec<usize> = cpu_scores.iter().enumerate()
+        .filter(|(_, &v)| v.abs() <= 1e-9).map(|(i, _)| i).collect();
+
+    assert!(
+        cpu_zeros.is_empty(),
+        "test invariant violated: CPU output should be all non-zero, \
+         {} rows are zero (synth bias broken)", cpu_zeros.len(),
+    );
+    let preview = &metal_zeros[..metal_zeros.len().min(10)];
+    assert!(
+        metal_zeros.is_empty(),
+        "Metal q4_matvec dropped {} of {n} rows (expected 0). \
+         First zero rows: {preview:?}. \
+         This is the 75 %-row regression — check that ops/q4_matvec.rs \
+         imports geometry constants from the same shader module \
+         (q4_matvec_v4) the pipeline is built from in metal/mod.rs.",
+        metal_zeros.len(),
+    );
+}
+
+/// N not divisible by ROWS_PER_TG (8) — the last TG has dead
+/// simdgroups whose `row_idx >= N` guard must trip cleanly. Verifies
+/// no spurious writes past `num_rows` and no missed rows at the tail.
+#[test]
+fn q4_matvec_metal_writes_every_row_misaligned_n() {
+    let metal = get_metal();
+    metal.set_flop_threshold(1);
+    use larql_compute::cpu::ops::q4_common::{quantize_q4_0, quantize_to_q8};
+
+    // 1027 = 128 full TGs × 8 + 3 spillover rows.
+    let n = 1027usize;
+    let k = 128usize;
+    let w: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.001).sin() + 0.5).collect();
+    let x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.013).sin() + 0.5).collect();
+    let q4 = quantize_q4_0(&w);
+    let (q8_x, q8_scales) = quantize_to_q8(&x);
+
+    let metal_scores = metal.q4_matvec(&q4, &q8_x, &q8_scales, n, k).unwrap();
+    let cpu_scores = CpuBackend.q4_matvec(&q4, &q8_x, &q8_scales, n, k).unwrap();
+
+    assert_eq!(metal_scores.len(), n, "output length must equal num_rows");
+    for (i, &v) in metal_scores.iter().enumerate() {
+        assert!(v.abs() > 1e-9, "metal_scores[{i}] = {v} (should be non-zero)");
+    }
+    // Q4 quantisation is lossy on both sides; agreement to ~1 % of
+    // peak value is the kernel-equality bar (matches the rel<1e-2 check
+    // in q4_matvec_cpu_vs_metal_at_vocab_scale).
+    let max_abs = cpu_scores.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let max_diff = metal_scores.iter().zip(&cpu_scores)
+        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(
+        max_diff < max_abs * 1e-2,
+        "metal vs cpu max_diff = {max_diff} (peak = {max_abs}, rel = {:.3e})",
+        max_diff / max_abs.max(1e-9),
+    );
+}
+
+/// Pin the contract between `ops::q4_matvec::dispatch` and the
+/// `q4_matvec_v4` kernel that's actually loaded into the pipeline.
+///
+/// `dispatch` computes `num_tgs = num_rows.div_ceil(ROWS_PER_TG)` and
+/// requests `THREADS_PER_TG` threads per TG. The kernel hardcodes
+/// `ROWS_PER_TG_V4 = 8` and assumes 256 threads (8 simdgroups × 32
+/// lanes). If the dispatch's constants drift from the kernel's
+/// expectations, num_tgs over-divides and rows silently drop.
+///
+/// Tested with N=64: post-fix `num_tgs = div_ceil(64, 8) = 8` so all
+/// 64 rows are written. Pre-fix the dispatcher used the *wrong*
+/// shader's ROWS_PER_TG=32, computing `num_tgs = div_ceil(64, 32) = 2`;
+/// the v4 kernel's 32 simdgroups (under 1024 threads) only cover rows
+/// `tg_id * 8 + sg_id ∈ [0, 39]`, leaving rows 40..63 at zero.
+#[test]
+fn q4_matvec_dispatch_geometry_matches_v4_kernel() {
+    use larql_compute::metal::shaders::q4_matvec_v4 as v4;
+    assert_eq!(
+        v4::ROWS_PER_TG, 8,
+        "q4_matvec_v4 kernel hardcodes `row_idx = tg_id * 8 + sg_id`; \
+         the exported ROWS_PER_TG must stay 8"
+    );
+    assert_eq!(
+        v4::THREADS_PER_TG, 256,
+        "q4_matvec_v4 covers 8 rows × 32 lanes = 256 threads per TG"
+    );
+
+    let metal = get_metal();
+    metal.set_flop_threshold(1);
+    use larql_compute::cpu::ops::q4_common::{quantize_q4_0, quantize_to_q8};
+    let n = 64usize;
+    let k = 64usize;
+    let w: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.01).sin() + 0.5).collect();
+    let x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.013).sin() + 0.5).collect();
+    let q4 = quantize_q4_0(&w);
+    let (q8_x, q8_scales) = quantize_to_q8(&x);
+    let metal_scores = metal.q4_matvec(&q4, &q8_x, &q8_scales, n, k).unwrap();
+    for (i, &v) in metal_scores.iter().enumerate() {
+        assert!(
+            v.abs() > 1e-9,
+            "row {i} dropped at N={n}; under the pre-fix bug \
+             (dispatcher imports ROWS_PER_TG=32 from the wrong shader \
+             module while the pipeline runs the v4 kernel with \
+             ROWS_PER_TG_V4=8), num_tgs would be 2 and rows 40..63 \
+             stay at zero. metal_scores[40..]={:?}",
+            &metal_scores[40..],
         );
     }
 }

@@ -310,6 +310,80 @@ impl VectorIndex {
         ndarray::Array2::from_shape_vec((intermediate, self.hidden_size), floats).ok()
     }
 
+    /// Diagnostic: count of populated `q4k_ffn_cache` slots and the
+    /// total f32 bytes they hold. Used by perf probes that need to know
+    /// whether a decode actually exercised the dequant cache (the hot
+    /// path on Metal does NOT — it streams Q4_K bytes through
+    /// `q4k_matmul_transb`). Returns `(populated_slots, bytes)`.
+    pub fn q4k_ffn_cache_stats(&self) -> (usize, usize) {
+        let cache = self.q4k_ffn_cache.lock().unwrap();
+        let mut slots = 0usize;
+        let mut bytes = 0usize;
+        for slot in cache.iter() {
+            for arc in slot.iter().flatten() {
+                slots += 1;
+                bytes += arc.len() * std::mem::size_of::<f32>();
+            }
+        }
+        (slots, bytes)
+    }
+
+    /// Cap the number of layers held in `q4k_ffn_cache`. Mirror of
+    /// `set_gate_cache_max_layers` for the FFN dequant cache. `0`
+    /// (default) means unbounded. Setting a smaller cap shrinks the
+    /// cache eagerly via the LRU.
+    ///
+    /// Recommended: `8` for a CPU-only Gemma 3 4B server (≈ 840 MB
+    /// down-leg ceiling). Metal-backed runs do not need this — the
+    /// full-K fast path bypasses the cache entirely.
+    pub fn set_q4k_ffn_cache_max_layers(&self, max_layers: usize) {
+        self.q4k_ffn_cache_max_layers
+            .store(max_layers, std::sync::atomic::Ordering::Relaxed);
+        if max_layers > 0 {
+            let mut cache = self.q4k_ffn_cache.lock().unwrap();
+            let mut lru = self.q4k_ffn_cache_lru.lock().unwrap();
+            while lru.len() > max_layers {
+                if let Some(evict) = lru.pop_back() {
+                    if evict < cache.len() {
+                        cache[evict] = [None, None, None];
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record an access to a Q4_K-cached layer and evict if the LRU
+    /// has grown beyond `q4k_ffn_cache_max_layers`. Must be called
+    /// with `cache` already locked by the caller; `just_inserted` is
+    /// true when this call just dequantised a fresh layer.
+    fn touch_q4k_ffn_cache_lru(
+        &self,
+        layer: usize,
+        just_inserted: bool,
+        cache: &mut [[Option<std::sync::Arc<Vec<f32>>>; 3]],
+    ) {
+        let max = self
+            .q4k_ffn_cache_max_layers
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if max == 0 {
+            return;
+        }
+        let mut lru = self.q4k_ffn_cache_lru.lock().unwrap();
+        if let Some(pos) = lru.iter().position(|&l| l == layer) {
+            lru.remove(pos);
+        }
+        lru.push_front(layer);
+        if just_inserted {
+            while lru.len() > max {
+                if let Some(evict) = lru.pop_back() {
+                    if evict < cache.len() && evict != layer {
+                        cache[evict] = [None, None, None];
+                    }
+                }
+            }
+        }
+    }
+
     /// Dequantise one Q4K/Q6K FFN matrix on demand, caching the result.
     /// `component`: 0=gate, 1=up, 2=down. Returns `None` when no Q4K
     /// interleaved mmap is loaded. First access per (layer, component)
@@ -325,10 +399,13 @@ impl VectorIndex {
     {
         if component > 2 { return None; }
         {
-            let cache = self.q4k_ffn_cache.lock().unwrap();
+            let mut cache = self.q4k_ffn_cache.lock().unwrap();
             if let Some(slot) = cache.get(layer) {
                 if let Some(ref arc) = slot[component] {
-                    return Some(arc.clone());
+                    let arc = arc.clone();
+                    // Hit — bump LRU but don't evict (just_inserted=false).
+                    self.touch_q4k_ffn_cache_lru(layer, false, &mut cache);
+                    return Some(arc);
                 }
             }
         }
@@ -369,6 +446,8 @@ impl VectorIndex {
             if let Some(slot) = cache.get_mut(layer) {
                 slot[component] = Some(arc.clone());
             }
+            // Fresh insert — bump LRU and evict if over the cap.
+            self.touch_q4k_ffn_cache_lru(layer, true, &mut cache);
         }
         Some(arc)
     }
@@ -659,6 +738,47 @@ impl VectorIndex {
             unsafe {
                 let ptr = mmap[start..].as_ptr() as *mut libc::c_void;
                 libc::madvise(ptr, end - start, libc::MADV_WILLNEED);
+            }
+        }
+    }
+
+    /// Prefetch next layer's Q4_K/Q6_K FFN data into the page cache via
+    /// MADV_WILLNEED. Counterpart of [`Self::prefetch_interleaved_q4_layer`].
+    /// Issues one madvise spanning the layer's gate+up+down matrices.
+    ///
+    /// When the FFN manifest is loaded (the streaming-writer path), the
+    /// span is computed from the layer's three manifest entries — handles
+    /// mixed Q4_K/Q6_K layouts where down may be Q6_K (210 B/256) while
+    /// gate/up are Q4_K (144 B/256). Without a manifest, falls back to
+    /// the legacy uniform Q4_K stride (144 B/256 across all three
+    /// matrices) — matches the build_q4k_weights writer.
+    pub fn prefetch_interleaved_q4k_layer(&self, layer: usize) {
+        #[cfg(unix)]
+        if let Some(ref mmap) = self.interleaved_q4k_mmap {
+            let intermediate = self.num_features(layer);
+            if intermediate == 0 { return; }
+            let (start, len) = if let Some(ref manifest) = self.interleaved_q4k_manifest {
+                let base = layer * 3;
+                if base + 2 >= manifest.len() { return; }
+                let s = manifest[base].0;
+                let (last_off, last_len, _) = &manifest[base + 2];
+                let e = (last_off + last_len).min(mmap.len());
+                if s >= mmap.len() || e <= s { return; }
+                (s, e - s)
+            } else {
+                // Uniform-stride fallback: matches build_q4k_weights's
+                // Q4_K-only writer. Q4_K is 144 bytes per 256 elements.
+                let blocks_per_matrix = intermediate * self.hidden_size / 256;
+                let bytes_per_matrix = blocks_per_matrix * 144;
+                let bytes_per_layer = bytes_per_matrix * 3;
+                let s = layer * bytes_per_layer;
+                let e = (s + bytes_per_layer).min(mmap.len());
+                if s >= mmap.len() || e <= s { return; }
+                (s, e - s)
+            };
+            unsafe {
+                let ptr = mmap[start..].as_ptr() as *mut libc::c_void;
+                libc::madvise(ptr, len, libc::MADV_WILLNEED);
             }
         }
     }

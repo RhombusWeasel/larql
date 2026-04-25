@@ -313,6 +313,14 @@ struct ServeArgs {
     #[arg(long, default_value = "0")]
     max_gate_cache_layers: usize,
 
+    /// Cap Q4_K/Q6_K FFN dequant cache layers via LRU. 0 = unlimited.
+    /// Only fires on the CPU per-position fallback (Metal full-K decode
+    /// streams Q4_K bytes directly, never populating this cache).
+    /// Recommended: 8 for a CPU-only Gemma 3 4B server (≈ 840 MB ceiling
+    /// on the down leg).
+    #[arg(long, default_value = "0")]
+    max_q4k_cache_layers: usize,
+
     /// madvise(MADV_DONTNEED) on all mmaps after each walk-ffn request.
     /// Enforces a hard RSS bound alongside --max-gate-cache-layers at the
     /// cost of re-fault per request. Prefer --layers sharding for real
@@ -529,6 +537,10 @@ fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.max_gate_cache_layers > 0 {
         cmd_args.push("--max-gate-cache-layers".into());
         cmd_args.push(args.max_gate_cache_layers.to_string());
+    }
+    if args.max_q4k_cache_layers > 0 {
+        cmd_args.push("--max-q4k-cache-layers".into());
+        cmd_args.push(args.max_q4k_cache_layers.to_string());
     }
     if args.release_mmap_after_request {
         cmd_args.push("--release-mmap-after-request".into());

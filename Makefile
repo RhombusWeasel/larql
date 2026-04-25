@@ -52,7 +52,22 @@ bench-core:
 bench-inference:
 	cargo run --release -p larql-inference --example bench_inference
 
-bench-all: bench-core bench-inference
+# Vindex micro-benches — synthetic, fast, safe under load.
+bench-vindex:
+	cargo bench -p larql-vindex --bench vindex_ops
+
+# Vindex production-dim scaling bench. Refuses if larql-server / router
+# are alive (they distort 1-2 GB matmuls). Run alone, on a cool host;
+# results feed PERFORMANCE.md.
+bench-vindex-scaling:
+	@if pgrep -fl 'larql-(server|router)' >/dev/null 2>&1; then \
+		echo "Refusing bench-vindex-scaling: larql daemons running. Stop them first."; \
+		pgrep -fl 'larql-(server|router)'; \
+		exit 2; \
+	fi
+	cargo bench -p larql-vindex --bench vindex_scaling
+
+bench-all: bench-core bench-inference bench-vindex
 
 # Python extension (managed via uv)
 python-setup:

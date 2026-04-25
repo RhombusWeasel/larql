@@ -2,14 +2,19 @@
 //!
 //! scores[N] = Q4[N, K] @ Q8_x[K]
 //!
-//! Dispatches the optimised simdgroup shader: 8 rows per threadgroup,
-//! shared memory for Q8 input, simd_sum reduction.
+//! Dispatches the `q4_matvec_v4` simdgroup shader: 8 rows per
+//! threadgroup, 256 threads per TG (8 simdgroups × 32 lanes), shared
+//! memory for Q8 input, simd_sum reduction. Geometry constants come
+//! from the same shader module the pipeline is built from in
+//! `metal/mod.rs` — keep these in sync. (See
+//! `q4_matvec_dispatch_geometry_matches_v4_kernel` and the gated
+//! vocab-scale tests in `test_kernel_lm_head_gemv.rs`.)
 
 use std::ffi::c_void;
 use metal::*;
 
 use crate::metal::buffers::BufferCache;
-use crate::metal::shaders::q4_matvec as shader;
+use crate::metal::shaders::q4_matvec_v4 as shader;
 
 /// Dispatch a single Q4 matvec on GPU.
 ///

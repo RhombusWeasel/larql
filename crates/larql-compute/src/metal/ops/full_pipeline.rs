@@ -16,7 +16,10 @@ use std::ffi::c_void;
 use metal::*;
 
 use crate::metal::buffers::BufferCache;
-use crate::metal::shaders::q4_matvec as q4mv_shader;
+// Geometry constants must come from the same shader the q4 matvec
+// pipeline is built from in metal/mod.rs (q4_matvec_v4). See
+// ops/q4_matvec.rs for the row-drop regression history.
+use crate::metal::shaders::q4_matvec_v4 as q4mv_shader;
 use super::q4_common::Q4Pipelines;
 
 /// Weights for one transformer layer — ALL Q4 + norm weights.

@@ -101,8 +101,24 @@ pub struct VectorIndex {
     /// matrix for component `c` (0=gate, 1=up, 2=down). Populated on first
     /// access via `q4k_ffn_layer`. Backs `walk_ffn_sparse`'s f32 view when
     /// no native f32 mmap exists (Q4K-only vindexes).
+    ///
+    /// On Metal the full-K fast path bypasses this cache entirely (it
+    /// streams Q4_K bytes through `q4k_matmul_transb`). The cache only
+    /// fires on the CPU per-position fallback. See ROADMAP.md "Bound the
+    /// Q4_K dequant cache" for the rationale behind the LRU below.
     #[allow(clippy::type_complexity)]
     pub(crate) q4k_ffn_cache: Mutex<Vec<[Option<Arc<Vec<f32>>>; 3]>>,
+    /// LRU of layers held in `q4k_ffn_cache`, oldest at front. Mirrors
+    /// `gate_cache_lru` for the gate decode cache. Each layer can hold
+    /// up to 3 components (gate/up/down) but the LRU tracks the layer
+    /// as a whole — eviction frees all three slots at once.
+    pub(crate) q4k_ffn_cache_lru: Mutex<std::collections::VecDeque<usize>>,
+    /// Max number of layers held in `q4k_ffn_cache`. `0` (default) means
+    /// unbounded — historical behaviour, no eviction. Set via
+    /// `set_q4k_ffn_cache_max_layers`. Recommended for long-running
+    /// CPU-only servers: ≈ 8 on Gemma 3 4B keeps the down leg under
+    /// ~1 GB; default-leave-unbounded otherwise.
+    pub(crate) q4k_ffn_cache_max_layers: std::sync::atomic::AtomicUsize,
 
     /// Layer range owned by this index instance (start inclusive, end exclusive).
     /// `None` means all layers are owned (default, no sharding).
@@ -162,6 +178,9 @@ impl Clone for VectorIndex {
             up_overrides: self.up_overrides.clone(),
             gate_cache_max_layers: std::sync::atomic::AtomicUsize::new(
                 self.gate_cache_max_layers.load(Ordering::Relaxed),
+            ),
+            q4k_ffn_cache_max_layers: std::sync::atomic::AtomicUsize::new(
+                self.q4k_ffn_cache_max_layers.load(Ordering::Relaxed),
             ),
             down_features_mmap: self.down_features_mmap.clone(),
             up_features_mmap: self.up_features_mmap.clone(),
@@ -239,6 +258,8 @@ impl VectorIndex {
             interleaved_q4k_mmap: None,
             interleaved_q4k_manifest: None,
             q4k_ffn_cache: Mutex::new((0..num_layers).map(|_| [None, None, None]).collect()),
+            q4k_ffn_cache_lru: Mutex::new(std::collections::VecDeque::new()),
+            q4k_ffn_cache_max_layers: std::sync::atomic::AtomicUsize::new(0),
             layer_range: None,
             gate_q4_mmap: None,
             gate_q4_slices: Vec::new(),
@@ -473,15 +494,44 @@ mod refactor_tests {
         v.hnsw_enabled.store(true, Ordering::Relaxed);
         v.hnsw_ef_search.store(42, Ordering::Relaxed);
         v.gate_cache_max_layers.store(7, Ordering::Relaxed);
+        v.q4k_ffn_cache_max_layers.store(3, Ordering::Relaxed);
 
         let cloned = v.clone();
         assert!(cloned.hnsw_enabled.load(Ordering::Relaxed));
         assert_eq!(cloned.hnsw_ef_search.load(Ordering::Relaxed), 42);
         assert_eq!(cloned.gate_cache_max_layers.load(Ordering::Relaxed), 7);
+        assert_eq!(cloned.q4k_ffn_cache_max_layers.load(Ordering::Relaxed), 3);
 
         // Mutating the clone's atomics must not affect the original.
         cloned.hnsw_enabled.store(false, Ordering::Relaxed);
         assert!(v.hnsw_enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn q4k_ffn_cache_lru_evicts_when_capped() {
+        // Synthetic: drop arcs directly into the cache to simulate
+        // dequant inserts, then verify set_q4k_ffn_cache_max_layers
+        // evicts oldest when shrunk below current size.
+        use std::sync::Arc;
+        let v = VectorIndex::empty(5, 8);
+        // Pre-populate layers 0..5 with a dummy gate-component arc and
+        // record them in the LRU as "newest at front".
+        {
+            let mut cache = v.q4k_ffn_cache.lock().unwrap();
+            let mut lru = v.q4k_ffn_cache_lru.lock().unwrap();
+            for layer in 0..5 {
+                cache[layer][0] = Some(Arc::new(vec![0.0f32; 8]));
+                lru.push_front(layer); // 4,3,2,1,0 — newest first
+            }
+        }
+        // Cap to 2 — should evict layers 0 and 1 (oldest).
+        v.set_q4k_ffn_cache_max_layers(2);
+        let (slots, _) = v.q4k_ffn_cache_stats();
+        assert_eq!(slots, 2, "expected 2 surviving slots after eviction");
+        let cache = v.q4k_ffn_cache.lock().unwrap();
+        assert!(cache[0][0].is_none(), "layer 0 should be evicted");
+        assert!(cache[1][0].is_none(), "layer 1 should be evicted");
+        assert!(cache[3][0].is_some() || cache[4][0].is_some());
     }
 
     #[test]

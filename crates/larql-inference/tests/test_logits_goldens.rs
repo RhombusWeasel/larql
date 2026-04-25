@@ -80,17 +80,22 @@ const PROMPT: &str = "The capital of France is";
 /// prompt against future drift *within that backend*. Refresh: set
 /// `LARQL_LOGITS_GOLDENS_PRINT=1` and copy the printed lines back.
 ///
-/// Note: Llama 2 + Mistral produce identical top-5 across CPU and
-/// Metal (cross-backend bit-equivalent); Gemma 3 4B and Gemma 4 31B
-/// produce different top-5 across backends. That's a separate,
-/// pre-existing issue in the LM-head path on tied-embedding models —
-/// per-backend goldens still catch any *future* drift on either side
-/// independently, which is the regression-detection goal here.
+/// Post-2026-04-25 (q4_matvec_v4 dispatch geometry fix), all four
+/// architectures' CPU and Metal goldens are bit-identical or within
+/// Q4 round-trip noise — the per-backend split is kept anyway so that
+/// future drift on either side is caught independently.
 const GOLDENS: &[Golden] = &[
+    // Gemma 3/4 are tied-embedding models — LM head goes through the
+    // synthesised Q4_0 path (`backend.q4_matvec` against `lm_head_q4_synth`).
+    // Pre-2026-04-25 the Metal dispatcher imported the wrong shader's
+    // geometry constants and silently dropped 75 % of vocab rows; CPU
+    // and Metal goldens diverged because of that bug. Post-fix the two
+    // backends agree to within Q4 round-trip noise and the goldens
+    // collapse to one set per arch.
     Golden {
         arch_name: "gemma3-4b-it", vindex_name: "gemma3-4b-q4k-v2", backend: "metal",
-        top5_token_ids: [50429, 478, 9079, 818, 27068],
-        top1_logit: 2874.120605,
+        top5_token_ids: [256240, 256331, 250251, 249309, 212287],
+        top1_logit: 3632.169922,
     },
     Golden {
         arch_name: "gemma3-4b-it", vindex_name: "gemma3-4b-q4k-v2", backend: "cpu",
@@ -99,8 +104,8 @@ const GOLDENS: &[Golden] = &[
     },
     Golden {
         arch_name: "gemma4-31b-it (dense)", vindex_name: "gemma4-31b-q4k", backend: "metal",
-        top5_token_ids: [60834, 63618, 52175, 327, 61262],
-        top1_logit: 1.357929,
+        top5_token_ids: [236780, 236772, 236798, 236799, 236814],
+        top1_logit: 2.261745,
     },
     Golden {
         arch_name: "gemma4-31b-it (dense)", vindex_name: "gemma4-31b-q4k", backend: "cpu",

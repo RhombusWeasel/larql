@@ -17,6 +17,9 @@ impl<'a> WalkFfn<'a> {
         x: &Array2<f32>,
     ) -> Option<(Array2<f32>, Array2<f32>)> {
         let ffn = self.index.interleaved_q4k_layer_data(layer)?;
+        // Stream layer N+1 in while we dequant N — same trick the Q4_0
+        // path uses. No-op when `layer + 1` is out of range.
+        self.index.prefetch_interleaved_q4k_layer(layer + 1);
         let arch = &*self.weights.arch;
         let intermediate = self.index.num_features(layer);
         if intermediate == 0 {

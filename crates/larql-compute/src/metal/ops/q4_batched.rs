@@ -10,7 +10,12 @@ use std::ffi::c_void;
 use metal::*;
 
 use crate::metal::buffers::BufferCache;
-use crate::metal::shaders::q4_matvec as shader;
+// Geometry constants must come from the same shader module the matvec
+// pipeline is built from in `metal/mod.rs` (currently q4_matvec_v4).
+// Importing from a different shader silently desyncs num_tgs from the
+// kernel's row-mapping → 75 %-row drop. See ops/q4_matvec.rs and
+// test_kernel_lm_head_gemv::q4_matvec_dispatch_geometry_matches_v4_kernel.
+use crate::metal::shaders::q4_matvec_v4 as shader;
 use super::q4_common::{Q4Pipelines, quantize_to_q8};
 
 /// Batched gate+up for ALL seq positions in ONE GPU submission.

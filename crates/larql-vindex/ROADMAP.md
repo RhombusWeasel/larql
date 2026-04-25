@@ -8,6 +8,94 @@
 - HNSW graph index for sub-linear KNN
 - Patch system for editable knowledge
 
+## P0: Decode-path performance
+
+Items raised by the 2026-04-25 perf audit (see PERFORMANCE.md and the
+`gpu_forward_gap` memo). Vindex-side only — Metal kernel work lives in
+larql-compute's roadmap.
+
+### Bound the Q4_K dequant cache (LRU like gate cache)
+**Impact**: Caps CPU-fallback RAM at a configurable budget (worst-case
+today: 10.7 GB on 4B / ~110 GB on 31B if all layers cache fully)
+**Effort**: Low
+**Status**: Not started
+
+**Finding from 2026-04-25 audit**: the Metal hot path never populates
+`q4k_ffn_cache` (`larql bench --backends metal -v` reports
+`q4k_ffn_cache after larql-metal: 0 populated slots, 0.0 MB`). The
+full-K Metal branch in `walk_ffn/sparse.rs:84-117` streams Q4_K bytes
+through `q4k_matmul_transb` and bypasses `q4k_ffn_layer` entirely. The
+dequant cache only fires in the CPU per-position fallback at
+`walk_ffn/sparse.rs:145` (`hits.len() >= 512 && down_native.is_none()`)
+— and there it's a 30× win because one 614 ms layer-dequant is
+amortised across thousands of feature reads per token.
+
+So the cache is correct, not pathological. What's missing is an upper
+bound: a long-running CPU-only server can grow it to all 34 layers ×
+105 MB on Gemma 3 4B (10.7 GB) or 60 layers × 1.85 GB on 31B (~110 GB).
+Mirror the existing gate-cache pattern (`gate_cache_max_layers`,
+`gate_cache_lru` in `index/core.rs` / `gate.rs:80`) for the Q4_K FFN
+cache:
+
+1. Add `q4k_ffn_cache_max_layers` (atomic) + `q4k_ffn_cache_lru`
+   (Mutex<VecDeque<usize>>) to `VectorIndex`.
+2. On insert in `q4k_ffn_layer`, push the layer to the LRU and evict
+   from the front when the cap is exceeded; clear the evicted layer's
+   slot triple.
+3. Expose `set_q4k_ffn_cache_max_layers(n)` + a `--max-q4k-cache-layers
+   N` flag on `larql serve` and any other long-running CLI.
+4. Default cap = 0 (unbounded — keeps current behaviour). Recommend 8
+   for a CPU-only Gemma 3 4B server (≈ 840 MB ceiling for the down
+   leg; gate/up dequant aren't on the hot path).
+
+### Q4_K interleaved madvise + per-layer prefetch
+**Impact**: Free win on cold-page first-token latency; small steady-state
+**Effort**: Low
+**Status**: Not started
+
+`load_interleaved_q4k` (`walk.rs:235`) opens with `mmap_demand_paged`
+(MADV_RANDOM) but the decode loop reads every layer once per token in
+order. The Q4_0 path already has `prefetch_interleaved_q4_layer`
+(`walk.rs:649`) issuing MADV_WILLNEED for layer N+1 while N computes —
+mirror it for Q4_K (`prefetch_interleaved_q4k_layer`) and call it from
+the inference walk. Consider switching Q4_K's initial advise to
+SEQUENTIAL since the access pattern is linear over layers within a
+token.
+
+### Audit `save_gate_vectors` 1.4 → 2.0 ms regression
+**Impact**: 40% slip on a build-time hot path
+**Effort**: Low
+**Status**: Not started
+
+`save_load/save_gate_vectors` was 1.4 ms in 2026-04-07's PERFORMANCE.md,
+1.99 ms in 2026-04-25 criterion run on the same dimensions. Bisect via
+`git log -p crates/larql-vindex/src/format/save.rs` since 2026-04-07.
+
+### Lift gate KNN out of brute-force on the decode hot path
+**Impact**: 64-expert MoE 230 → ~30 ms gate KNN/layer (HNSW table)
+**Effort**: Medium
+**Status**: Index built, not wired
+
+`index/hnsw.rs` exists and the `q4k_vs_f32` bench already shows HNSW
+beats brute force at 1024–28K features. Decode currently calls
+`gate_walk` → `gate_knn` (full BLAS gemv). For dense 4B–8B the gemv
+ceiling is fine; for high-expert MoE it dominates. Wire HNSW behind an
+opt-in flag on `VectorIndex` and validate ranking parity vs brute on a
+held-out feature set before defaulting on.
+
+### Bench rig hygiene — fail fast under host contention
+**Impact**: Makes regression detection meaningful again
+**Effort**: Low
+**Status**: Not started
+
+`production_knn_per_layer` swung 4.56 → 8.58 ms run-to-run on
+2026-04-25 because `larql-server` (6 GB RSS) and `larql-router` were
+sharing cores. Add a precondition to `vindex_scaling`: refuse to run
+if `pgrep -f 'larql-(server|router)'` returns non-empty, and surface a
+warning if `pmset -g therm` reports throttling. Move scaling to its
+own `make bench-scaling` target so it doesn't run back-to-back with
+`vindex_ops` (which leaves the M3 Max thermal budget cooked).
+
 ## P0: Support Cached Layer Decode
 
 ### Store pre-computed residuals for template-fixed layers (L0-12)
