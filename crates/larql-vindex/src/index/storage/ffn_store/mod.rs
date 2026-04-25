@@ -27,7 +27,33 @@ use crate::format::filenames::{
     INTERLEAVED_Q4_BIN, INTERLEAVED_Q4K_BIN, INTERLEAVED_Q4K_MANIFEST_JSON,
     UP_FEATURES_BIN,
 };
+use crate::format::weights::Q4kManifestEntry;
 use crate::mmap_util::{mmap_demand_paged, mmap_optimized};
+
+/// Read + typed-deserialise a Q4_K manifest JSON file. Validates each
+/// entry's format tag against `quant::registry`. `display_name` is the
+/// filename used in error messages so a parse failure reports which
+/// manifest broke. Centralised so both `load_interleaved_q4k` and
+/// `load_down_features_q4k` go through the same parse + validation
+/// path.
+fn read_q4k_manifest(
+    path: &std::path::Path,
+    display_name: &str,
+) -> Result<Vec<Q4kManifestEntry>, VindexError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| VindexError::Parse(format!("{display_name}: {e}")))?;
+    let entries: Vec<Q4kManifestEntry> = serde_json::from_str(&text)
+        .map_err(|e| VindexError::Parse(format!("{display_name}: {e}")))?;
+    for e in &entries {
+        if crate::quant::registry::lookup(e.format_tag()).is_none() {
+            return Err(VindexError::Parse(format!(
+                "{display_name}: unknown format tag {:?} — quant::registry has no entry",
+                e.format_tag(),
+            )));
+        }
+    }
+    Ok(entries)
+}
 
 // ── FfnStore composed-substore ─────────────────────────────────────────
 
@@ -374,32 +400,14 @@ impl VectorIndex {
 
         let manifest_path = dir.join(INTERLEAVED_Q4K_MANIFEST_JSON);
         if manifest_path.exists() {
-            let json: Vec<serde_json::Value> = serde_json::from_str(
-                &std::fs::read_to_string(&manifest_path)
-                    .map_err(|e| VindexError::Parse(e.to_string()))?,
-            )
-            .map_err(|e| VindexError::Parse(e.to_string()))?;
-
-            // Format is required. The previous `unwrap_or("Q4_K")`
-            // default silently masked malformed manifests — see
-            // ROADMAP P0 "Replace unwrap_or(Q4_K) silent fallbacks".
-            let entries: Vec<(usize, usize, String)> = json
-                .iter()
-                .map(|e| {
-                    let offset = e["offset"].as_u64().unwrap_or(0) as usize;
-                    let length = e["length"].as_u64().unwrap_or(0) as usize;
-                    let tag = e["format"].as_str().ok_or_else(|| VindexError::Parse(
-                        "interleaved_q4k_manifest entry missing `format` field".into(),
-                    ))?;
-                    if crate::quant::registry::lookup(tag).is_none() {
-                        return Err(VindexError::Parse(format!(
-                            "interleaved_q4k_manifest: unknown format tag {tag:?} \
-                             — quant::registry has no entry"
-                        )));
-                    }
-                    Ok((offset, length, tag.to_string()))
-                })
-                .collect::<Result<Vec<_>, VindexError>>()?;
+            // Typed deserialise — `Q4kManifestEntry` matches the writer's
+            // shape, so a renamed field on either side fails loudly here
+            // instead of silently producing zero-byte slices.
+            let raw = read_q4k_manifest(&manifest_path, INTERLEAVED_Q4K_MANIFEST_JSON)?;
+            let entries: Vec<(usize, usize, String)> = raw
+                .into_iter()
+                .map(|e| (e.offset as usize, e.length as usize, e.format_tag().to_string()))
+                .collect();
             self.ffn.interleaved_q4k_manifest = Some(entries);
         }
         Ok(())
@@ -429,37 +437,19 @@ impl VectorIndex {
         let mmap = unsafe { mmap_demand_paged(&file)? };
         self.ffn.down_features_q4k_mmap = Some(Arc::new(mmap));
 
-        let json: Vec<serde_json::Value> = serde_json::from_str(
-            &std::fs::read_to_string(&manifest_path)
-                .map_err(|e| VindexError::Parse(e.to_string()))?,
-        )
-        .map_err(|e| VindexError::Parse(e.to_string()))?;
-        let entries: Vec<DownFeaturesQ4kEntry> = json
-            .iter()
+        let raw = read_q4k_manifest(&manifest_path, DOWN_FEATURES_Q4K_MANIFEST_JSON)?;
+        let entries: Vec<DownFeaturesQ4kEntry> = raw
+            .into_iter()
             .map(|e| {
-                let offset = e["offset"].as_u64().unwrap_or(0) as usize;
-                let length = e["length"].as_u64().unwrap_or(0) as usize;
-                let tag = e["format"].as_str().ok_or_else(|| {
+                let padded_width = e.padded_width().ok_or_else(|| {
                     VindexError::Parse(format!(
-                        "{DOWN_FEATURES_Q4K_MANIFEST_JSON} entry missing `format`"
+                        "{DOWN_FEATURES_Q4K_MANIFEST_JSON} entry has no shape[1] (padded_width)"
                     ))
                 })?;
-                if crate::quant::registry::lookup(tag).is_none() {
-                    return Err(VindexError::Parse(format!(
-                        "{DOWN_FEATURES_Q4K_MANIFEST_JSON}: unknown format tag {tag:?}"
-                    )));
-                }
-                // Shape is [intermediate, padded_hidden] in the writer —
-                // the second element is the row-stride we need.
-                let padded_width = e["shape"][1].as_u64().ok_or_else(|| {
-                    VindexError::Parse(format!(
-                        "{DOWN_FEATURES_Q4K_MANIFEST_JSON} entry missing `shape[1]` (padded_width)"
-                    ))
-                })? as usize;
                 Ok(DownFeaturesQ4kEntry {
-                    offset,
-                    length,
-                    format: tag.to_string(),
+                    offset: e.offset as usize,
+                    length: e.length as usize,
+                    format: e.format_tag().to_string(),
                     padded_width,
                 })
             })
@@ -532,168 +522,9 @@ impl VectorIndex {
         ndarray::Array2::from_shape_vec((intermediate, self.hidden_size), floats).ok()
     }
 
-    /// Diagnostic: count of populated `q4k_ffn_cache` slots and the
-    /// total f32 bytes they hold. Used by perf probes that need to know
-    /// whether a decode actually exercised the dequant cache (the hot
-    /// path on Metal does NOT — it streams Q4_K bytes through
-    /// `q4k_matmul_transb`). Returns `(populated_slots, bytes)`.
-    pub fn q4k_ffn_cache_stats(&self) -> (usize, usize) {
-        let cache = self.ffn.q4k_ffn_cache.lock().unwrap();
-        let mut slots = 0usize;
-        let mut bytes = 0usize;
-        for slot in cache.iter() {
-            for arc in slot.iter().flatten() {
-                slots += 1;
-                bytes += arc.len() * std::mem::size_of::<f32>();
-            }
-        }
-        (slots, bytes)
-    }
-
-    /// Cap the number of layers held in `q4k_ffn_cache`. Mirror of
-    /// `set_gate_cache_max_layers` for the FFN dequant cache. `0`
-    /// (default) means unbounded. Setting a smaller cap shrinks the
-    /// cache eagerly via the LRU.
-    ///
-    /// Recommended: `8` for a CPU-only Gemma 3 4B server (≈ 840 MB
-    /// down-leg ceiling). Metal-backed runs do not need this — the
-    /// full-K fast path bypasses the cache entirely.
-    pub fn set_q4k_ffn_cache_max_layers(&self, max_layers: usize) {
-        self.ffn.q4k_ffn_cache_max_layers
-            .store(max_layers, std::sync::atomic::Ordering::Relaxed);
-        if max_layers > 0 {
-            let mut cache = self.ffn.q4k_ffn_cache.lock().unwrap();
-            let mut lru = self.ffn.q4k_ffn_cache_lru.lock().unwrap();
-            while lru.len() > max_layers {
-                if let Some(evict) = lru.pop_back() {
-                    if evict < cache.len() {
-                        cache[evict] = [None, None, None];
-                    }
-                }
-            }
-        }
-    }
-
-    /// Record an access to a Q4_K-cached layer and evict if the LRU
-    /// has grown beyond `q4k_ffn_cache_max_layers`. Must be called
-    /// with `cache` already locked by the caller; `just_inserted` is
-    /// true when this call just dequantised a fresh layer.
-    fn touch_q4k_ffn_cache_lru(
-        &self,
-        layer: usize,
-        just_inserted: bool,
-        cache: &mut [[Option<std::sync::Arc<Vec<f32>>>; 3]],
-    ) {
-        let max = self.ffn.q4k_ffn_cache_max_layers
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if max == 0 {
-            return;
-        }
-        let mut lru = self.ffn.q4k_ffn_cache_lru.lock().unwrap();
-        if let Some(pos) = lru.iter().position(|&l| l == layer) {
-            lru.remove(pos);
-        }
-        lru.push_front(layer);
-        if just_inserted {
-            while lru.len() > max {
-                if let Some(evict) = lru.pop_back() {
-                    if evict < cache.len() && evict != layer {
-                        cache[evict] = [None, None, None];
-                    }
-                }
-            }
-        }
-    }
-
-    /// Dequantise one Q4K/Q6K FFN matrix on demand, caching the result.
-    /// `component`: 0=gate, 1=up, 2=down. Returns `None` when no Q4K
-    /// interleaved mmap is loaded. First access per (layer, component)
-    /// pays a ~200ms–1s dequant cost (varies with intermediate size);
-    /// later accesses are a single `Arc` clone.
-    ///
-    /// **Memory cost.** Caching a 31B layer's up+down is ~1.85GB of f32
-    /// heap. For fine-grained inference prefer [`Self::q4k_ffn_row_into`],
-    /// which decodes a single feature into a caller-provided buffer
-    /// without populating the cache.
-    pub fn q4k_ffn_layer(&self, layer: usize, component: usize)
-        -> Option<std::sync::Arc<Vec<f32>>>
-    {
-        if component > 2 { return None; }
-        {
-            let mut cache = self.ffn.q4k_ffn_cache.lock().unwrap();
-            if let Some(slot) = cache.get(layer) {
-                if let Some(ref arc) = slot[component] {
-                    let arc = arc.clone();
-                    // Hit — bump LRU but don't evict (just_inserted=false).
-                    self.touch_q4k_ffn_cache_lru(layer, false, &mut cache);
-                    return Some(arc);
-                }
-            }
-        }
-        let slices = self.interleaved_q4k_layer_data(layer)?;
-        let (bytes, format) = slices[component];
-        let intermediate = self.num_features(layer);
-        if intermediate == 0 { return None; }
-        let hidden = self.hidden_size;
-        let n = intermediate * hidden;
-        let padded = n.div_ceil(256) * 256;
-        let info = crate::quant::registry::lookup(format)?;
-        let decoded = (info.dequantize)(bytes, padded).ok()?;
-        // Gate (0) and up (1) are stored row-major [intermediate, hidden] — row
-        // `feat` already contains that feature's weight vector.
-        //
-        // Down (2) is stored row-major [hidden, intermediate] (the native PyTorch
-        // nn.Linear(intermediate, hidden) orientation). To give callers a
-        // feature-major view matching gate/up, we transpose here: after the flip
-        // arc[feat*hidden..(feat+1)*hidden] is feature `feat`'s down vector.
-        let final_data: Vec<f32> = if component == 2 {
-            let mut t = vec![0.0f32; n];
-            for h in 0..hidden {
-                let src_row = &decoded[h * intermediate..(h + 1) * intermediate];
-                for (i, &v) in src_row.iter().enumerate() {
-                    t[i * hidden + h] = v;
-                }
-            }
-            t
-        } else {
-            decoded.into_iter().take(n).collect()
-        };
-        let arc = std::sync::Arc::new(final_data);
-        {
-            let mut cache = self.ffn.q4k_ffn_cache.lock().unwrap();
-            if let Some(slot) = cache.get_mut(layer) {
-                slot[component] = Some(arc.clone());
-            }
-            // Fresh insert — bump LRU and evict if over the cap.
-            self.touch_q4k_ffn_cache_lru(layer, true, &mut cache);
-        }
-        Some(arc)
-    }
-
-    /// Cache-based scaled-add — decodes the whole layer (`q4k_ffn_layer`)
-    /// on first access, then serves `out += alpha * row` from the cached
-    /// feature-major matrix. Required for down: it is stored transposed
-    /// on disk (`[hidden, intermediate]`), so a per-row decode reads
-    /// hidden-dim rows rather than feature vectors.
-    #[inline]
-    pub fn q4k_ffn_row_scaled_add_via_cache(
-        &self,
-        layer: usize,
-        component: usize,
-        feat: usize,
-        alpha: f32,
-        out: &mut [f32],
-    ) -> bool {
-        let Some(arc) = self.q4k_ffn_layer(layer, component) else { return false; };
-        let hidden = self.hidden_size;
-        let row_start = feat * hidden;
-        let row_end = row_start + hidden;
-        if row_end > arc.len() || out.len() != hidden { return false; }
-        for i in 0..hidden {
-            out[i] += alpha * arc[row_start + i];
-        }
-        true
-    }
+    // Q4_K dequant cache (`q4k_ffn_cache_stats`,
+    // `set_q4k_ffn_cache_max_layers`, `q4k_ffn_layer`,
+    // `q4k_ffn_row_scaled_add_via_cache`) lives in `q4k_cache.rs`.
 
     /// Get gate matrix from Q4 interleaved file, dequantized to f32.
     pub fn interleaved_q4_gate(&self, layer: usize) -> Option<ndarray::Array2<f32>> {
@@ -822,77 +653,9 @@ impl VectorIndex {
         Some(&mmap[slice.byte_offset..end])
     }
 
-    // ── FP4 / FP8 FFN storage (exp 26) ────────────────────────────────────
-
-    /// Load FP4 / FP8 FFN projection mmaps from `dir` using the `fp4`
-    /// manifest in `config`. Non-fatal: if `config.fp4` is None, no
-    /// storage is attached and the method returns Ok. Errors on
-    /// malformed manifests (e.g. file sizes that don't match the
-    /// per-layer feature counts).
-    pub fn load_fp4_storage(
-        &mut self,
-        dir: &std::path::Path,
-        config: &crate::config::types::VindexConfig,
-    ) -> Result<(), VindexError> {
-        let Some(ref manifest) = config.fp4 else { return Ok(()); };
-        let layer_features: Vec<usize> = config.layers.iter().map(|l| l.num_features).collect();
-        let storage = super::fp4_store::Fp4Storage::load(
-            dir,
-            manifest.clone(),
-            layer_features,
-            config.hidden_size,
-        )?;
-        self.ffn.fp4_storage = Some(std::sync::Arc::new(storage));
-        Ok(())
-    }
-
-    /// Whether FP4/FP8 FFN storage is attached.
-    pub fn has_fp4_storage(&self) -> bool {
-        self.ffn.fp4_storage.is_some()
-    }
-
-    /// Fused dequant + dot for one FFN feature when FP4/FP8 storage is
-    /// attached. `component` is 0=gate, 1=up, 2=down. Returns `None`
-    /// if no FP4 storage is attached, if the projection is stored in
-    /// f16/f32 (caller falls back to the legacy path), or if the
-    /// coordinates are out of range.
-    #[inline]
-    pub fn fp4_ffn_row_dot(
-        &self,
-        layer: usize,
-        component: usize,
-        feat: usize,
-        x: &[f32],
-    ) -> Option<f32> {
-        let fp4 = self.ffn.fp4_storage.as_ref()?;
-        fp4.row_dot(layer, component, feat, x)
-    }
-
-    /// Fused dequant + scaled-add for the FP4/FP8 path.
-    #[inline]
-    pub fn fp4_ffn_row_scaled_add(
-        &self,
-        layer: usize,
-        component: usize,
-        feat: usize,
-        alpha: f32,
-        out: &mut [f32],
-    ) -> bool {
-        let Some(fp4) = self.ffn.fp4_storage.as_ref() else { return false; };
-        fp4.row_scaled_add(layer, component, feat, alpha, out)
-    }
-
-    /// Dequantise one FFN feature into the caller's buffer (FP4/FP8 path).
-    /// Counterpart of `q4k_ffn_row_into`.
-    #[inline]
-    pub fn fp4_ffn_row_into(
-        &self,
-        layer: usize,
-        component: usize,
-        feat: usize,
-        out: &mut [f32],
-    ) -> bool {
-        let Some(fp4) = self.ffn.fp4_storage.as_ref() else { return false; };
-        fp4.dequant_row_into(layer, component, feat, out)
-    }
+    // FP4 / FP8 FFN storage (`load_fp4_storage`, `has_fp4_storage`,
+    // `fp4_ffn_row_*`) lives in `fp4.rs`.
 }
+
+mod fp4;
+mod q4k_cache;

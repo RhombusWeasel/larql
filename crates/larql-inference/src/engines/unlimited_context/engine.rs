@@ -22,8 +22,9 @@ use larql_vindex::VectorIndex;
 use crate::attention::SharedKV;
 use crate::model::ModelWeights;
 use super::checkpoint_store::CheckpointStore;
-use super::extend::{empty_prior, rs_extend_from_checkpoint_backend};
+use super::extend::{empty_prior, rs_extend_from_checkpoint_backend, rs_extend_from_checkpoint_q4k};
 use super::token_archive::TokenArchive;
+use crate::engines::markov_residual::ensure_attn_tensors_dequantised;
 use crate::engines::{EngineInfo, KvEngine};
 
 // ─── EngineStats ─────────────────────────────────────────────────────────────
@@ -164,6 +165,60 @@ impl UnlimitedContextEngine {
         }
     }
 
+    /// CPU Q4K equivalent of `process()` — uses `rs_extend_from_checkpoint_q4k`
+    /// (WalkFfn for FFN) instead of the f32-backed `rs_extend_from_checkpoint_backend`.
+    fn process_q4k(
+        &mut self,
+        weights: &ModelWeights,
+        index: &VectorIndex,
+        tokens: &[u32],
+        backend: &dyn ComputeBackend,
+    ) -> Option<()> {
+        let mut remaining = tokens;
+        while !remaining.is_empty() {
+            let free = self.window_size - self.current_window_tokens.len();
+            let take = remaining.len().min(free);
+            let (chunk, rest) = remaining.split_at(take);
+            self.extend_current_q4k(weights, index, chunk, backend)?;
+            remaining = rest;
+            if self.current_window_tokens.len() >= self.window_size {
+                self.close_window();
+            }
+        }
+        Some(())
+    }
+
+    fn extend_current_q4k(
+        &mut self,
+        weights: &ModelWeights,
+        index: &VectorIndex,
+        chunk: &[u32],
+        backend: &dyn ComputeBackend,
+    ) -> Option<()> {
+        if chunk.is_empty() { return Some(()); }
+
+        let prior = if self.current_window_tokens.is_empty() {
+            if self.current_window_id > 0
+                && self.checkpoints.contains(self.current_window_id - 1)
+            {
+                let (ckpt, _) = self.checkpoints.load(self.current_window_id - 1)?;
+                ckpt
+            } else {
+                empty_prior(weights)
+            }
+        } else {
+            self.current_window_kv.take().unwrap_or_else(|| empty_prior(weights))
+        };
+
+        let abs_start = self.abs_offset + self.current_window_tokens.len();
+        let out = rs_extend_from_checkpoint_q4k(weights, index, chunk, &prior, abs_start, backend)?;
+
+        self.last_hidden = Some(out.last_hidden);
+        self.current_window_kv = Some(out.kv_cache);
+        self.current_window_tokens.extend_from_slice(chunk);
+        Some(())
+    }
+
     fn current_kv_bytes(&self) -> usize {
         self.current_window_kv.as_ref().map_or(0, |kv| {
             kv.iter().map(|(k, v)| (k.len() + v.len()) * 4).sum()
@@ -283,19 +338,18 @@ impl KvEngine for UnlimitedContextEngine {
         token_ids: &[u32],
         backend: &dyn ComputeBackend,
     ) -> Option<Array2<f32>> {
+        // Try Metal full pipeline. Returns None for CpuBackend — fall through.
         if let Some(h) = q4k_prefill_metal(weights, index, token_ids, backend) {
-            // Metal path: KV cache populated in GPU buffers by prefill_q4.
-            // Switch to Q4K decode mode — store abs_position for RoPE.
             self.abs_offset = token_ids.len();
             self.last_hidden = Some(h.clone());
             return Some(h);
         }
-        // CPU fallback.
-        self.process(weights, token_ids)?;
+        // CPU Q4K path: dequantise attention tensors, use WalkFfn for FFN.
+        ensure_attn_tensors_dequantised(weights, index);
+        self.process_q4k(weights, index, token_ids, backend)?;
         self.last_hidden.clone()
     }
 
-    /// Q4K decode step — uses Metal `decode_token` when available.
     fn decode_step_q4k(
         &mut self,
         weights: &mut ModelWeights,
@@ -303,16 +357,15 @@ impl KvEngine for UnlimitedContextEngine {
         token_id: u32,
         backend: &dyn ComputeBackend,
     ) -> Option<Array2<f32>> {
-        // If we did a Metal prefill, continue on the Metal decode path.
-        if backend.has_q4() && index.attn_q4k_layer_data(0).is_some() {
-            if let Some(h) = q4k_decode_token(weights, index, token_id, backend) {
-                self.abs_offset += 1;
-                self.last_hidden = Some(h.clone());
-                return Some(h);
-            }
+        // Try Metal decode_token. Returns None for CpuBackend — fall through.
+        if let Some(h) = q4k_decode_token(weights, index, token_id, backend) {
+            self.abs_offset += 1;
+            self.last_hidden = Some(h.clone());
+            return Some(h);
         }
-        // CPU fallback.
-        self.process(weights, &[token_id])?;
+        // CPU Q4K path.
+        ensure_attn_tensors_dequantised(weights, index);
+        self.process_q4k(weights, index, &[token_id], backend)?;
         self.last_hidden.clone()
     }
 }
@@ -321,7 +374,7 @@ impl KvEngine for UnlimitedContextEngine {
 
 /// Run GPU prefill via `backend.prefill_q4` using Q4K pipeline layers built
 /// from `index`. Returns the last-token hidden state on success.
-fn q4k_prefill_metal(
+pub(crate) fn q4k_prefill_metal(
     weights: &ModelWeights,
     index: &VectorIndex,
     token_ids: &[u32],
@@ -387,15 +440,14 @@ fn q4k_prefill_metal(
         rope, qk_norm, softcap,
     )?;
 
-    let norm_offset = arch.norm_weight_offset();
+    // Return pre-final_norm hidden state — the caller (hidden_to_raw_logits) applies it.
     let h_2d = Array2::from_shape_vec((seq_len, hidden), h_vec).ok()?;
-    let h_normed = crate::forward::apply_norm(weights, &h_2d, arch.final_norm_key(), norm_offset);
-    let last = h_normed.shape()[0] - 1;
-    Some(h_normed.slice(ndarray::s![last..=last, ..]).to_owned())
+    let last = h_2d.shape()[0] - 1;
+    Some(h_2d.slice(ndarray::s![last..=last, ..]).to_owned())
 }
 
 /// Run one Metal decode step via `backend.decode_token`.
-fn q4k_decode_token(
+pub(crate) fn q4k_decode_token(
     weights: &ModelWeights,
     index: &VectorIndex,
     token_id: u32,
@@ -445,10 +497,8 @@ fn q4k_decode_token(
         weights.num_q_heads, weights.num_kv_heads, weights.head_dim, rope,
     )?;
 
-    let norm_offset = arch.norm_weight_offset();
-    let h_2d = Array2::from_shape_vec((1, hidden), h_vec).ok()?;
-    let h_normed = crate::forward::apply_norm(weights, &h_2d, arch.final_norm_key(), norm_offset);
-    Some(h_normed)
+    // Return pre-final_norm hidden state — the caller (hidden_to_raw_logits) applies it.
+    Array2::from_shape_vec((1, hidden), h_vec).ok()
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

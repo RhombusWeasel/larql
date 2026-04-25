@@ -80,6 +80,7 @@ pub fn all_shaders() -> String {
     src.push_str(q4k_q6k_qkv_proj::SHADER);
     src.push_str(q4kf_qkv_proj::SHADER);
     src.push_str(q4k_ffn_gate_up::SHADER);
+    src.push_str(q4k_q6k_qkv_proj::NORMED_SHADER);
     src.push_str(q4k_geglu_down::SHADER);
     src.push_str(q4kf_ffn_gate_up::SHADER);
     src.push_str(q6k_geglu_down::SHADER);

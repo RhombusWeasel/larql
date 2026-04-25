@@ -129,24 +129,22 @@ fn q4k_config_defaults_match_q4k_m_mix() {
 //     within tolerance — proves the manifest → bytes correspondence
 //     is what the loader expects.
 
-#[test]
-fn q4k_end_to_end_from_synthetic_safetensors() {
-    use larql_vindex::QuantFormat;
+/// Llama-shaped synthetic-model fixture used by the end-to-end Q4_K
+/// tests. Writes `config.json`, `tokenizer.json`, and a
+/// `model.safetensors` packed with deterministic per-tensor ramps
+/// (`(i as f32) * 0.01`) into `model_dir`. Returns the tokenizer so
+/// callers can drive `build_vindex_streaming` without re-reading the
+/// tokenizer file.
+fn write_synthetic_llama_model(
+    model_dir: &std::path::Path,
+    hidden: usize,
+    intermediate: usize,
+    num_layers: usize,
+    vocab: usize,
+) -> larql_vindex::tokenizers::Tokenizer {
     use std::collections::HashMap;
 
-    let tmp = TempDir::new("e2e_happy");
-    let model_dir = tmp.0.join("model");
-    let src_dir = tmp.0.join("src.vindex");
-    let dst_dir = tmp.0.join("dst.vindex");
-    std::fs::create_dir_all(&model_dir).unwrap();
-
-    // Tiny llama-shaped config — dims chosen so each tensor pads to
-    // exactly one 256-element Q4_K super-block (hidden=8, intermediate=4).
-    let hidden = 8usize;
-    let intermediate = 4usize;
-    let num_layers = 2usize;
-    let vocab = 16usize;
-
+    std::fs::create_dir_all(model_dir).unwrap();
     let config = serde_json::json!({
         "model_type": "llama",
         "hidden_size": hidden,
@@ -161,32 +159,30 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
     std::fs::write(
         model_dir.join("config.json"),
         serde_json::to_string(&config).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let mut tensors: HashMap<String, Vec<f32>> = HashMap::new();
     let mut metadata: Vec<(String, Vec<usize>)> = Vec::new();
-    let push = |tensors: &mut HashMap<String, Vec<f32>>,
-                metadata: &mut Vec<(String, Vec<usize>)>,
-                name: &str,
-                shape: Vec<usize>| {
+    let mut push = |name: &str, shape: Vec<usize>| {
         let n: usize = shape.iter().product();
         let data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01).collect();
         tensors.insert(name.into(), data);
         metadata.push((name.into(), shape));
     };
-    push(&mut tensors, &mut metadata, "model.embed_tokens.weight", vec![vocab, hidden]);
-    push(&mut tensors, &mut metadata, "model.norm.weight", vec![hidden]);
+    push("model.embed_tokens.weight", vec![vocab, hidden]);
+    push("model.norm.weight", vec![hidden]);
     for layer in 0..num_layers {
         let lp = format!("model.layers.{layer}");
-        push(&mut tensors, &mut metadata, &format!("{lp}.self_attn.q_proj.weight"), vec![hidden, hidden]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.self_attn.k_proj.weight"), vec![hidden, hidden]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.self_attn.v_proj.weight"), vec![hidden, hidden]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.self_attn.o_proj.weight"), vec![hidden, hidden]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.mlp.gate_proj.weight"), vec![intermediate, hidden]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.mlp.up_proj.weight"), vec![intermediate, hidden]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.mlp.down_proj.weight"), vec![hidden, intermediate]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.input_layernorm.weight"), vec![hidden]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.post_attention_layernorm.weight"), vec![hidden]);
+        push(&format!("{lp}.self_attn.q_proj.weight"), vec![hidden, hidden]);
+        push(&format!("{lp}.self_attn.k_proj.weight"), vec![hidden, hidden]);
+        push(&format!("{lp}.self_attn.v_proj.weight"), vec![hidden, hidden]);
+        push(&format!("{lp}.self_attn.o_proj.weight"), vec![hidden, hidden]);
+        push(&format!("{lp}.mlp.gate_proj.weight"), vec![intermediate, hidden]);
+        push(&format!("{lp}.mlp.up_proj.weight"), vec![intermediate, hidden]);
+        push(&format!("{lp}.mlp.down_proj.weight"), vec![hidden, intermediate]);
+        push(&format!("{lp}.input_layernorm.weight"), vec![hidden]);
+        push(&format!("{lp}.post_attention_layernorm.weight"), vec![hidden]);
     }
 
     let tensor_bytes: Vec<(String, Vec<u8>, Vec<usize>)> = metadata
@@ -199,18 +195,38 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
         .collect();
     let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = tensor_bytes
         .iter()
-        .map(|(name, bytes, shape)| (
-            name.clone(),
-            safetensors::tensor::TensorView::new(
-                safetensors::Dtype::F32, shape.clone(), bytes,
-            ).unwrap(),
-        ))
+        .map(|(name, bytes, shape)| {
+            (
+                name.clone(),
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), bytes)
+                    .unwrap(),
+            )
+        })
         .collect();
     let serialized = safetensors::tensor::serialize(views, &None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), serialized).unwrap();
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(model_dir.join("tokenizer.json"), tok_json).unwrap();
-    let tokenizer = larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+    larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap()
+}
+
+#[test]
+fn q4k_end_to_end_from_synthetic_safetensors() {
+    use larql_vindex::QuantFormat;
+
+    let tmp = TempDir::new("e2e_happy");
+    let model_dir = tmp.0.join("model");
+    let src_dir = tmp.0.join("src.vindex");
+    let dst_dir = tmp.0.join("dst.vindex");
+
+    // Tiny llama-shaped config — dims chosen so each tensor pads to
+    // exactly one 256-element Q4_K super-block (hidden=8, intermediate=4).
+    let hidden = 8usize;
+    let intermediate = 4usize;
+    let num_layers = 2usize;
+    let vocab = 16usize;
+    let tokenizer = write_synthetic_llama_model(&model_dir, hidden, intermediate, num_layers, vocab);
 
     // Stream-extract to a *float* vindex (QuantFormat::None) at level=Inference
     // so all weight files land. This is the precondition vindex_to_q4k
@@ -317,86 +333,17 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
 #[test]
 fn q4k_feature_major_down_round_trip() {
     use larql_vindex::QuantFormat;
-    use std::collections::HashMap;
 
     let tmp = TempDir::new("fm_down");
     let model_dir = tmp.0.join("model");
     let src_dir = tmp.0.join("src.vindex");
     let dst_dir = tmp.0.join("dst.vindex");
-    std::fs::create_dir_all(&model_dir).unwrap();
 
     let hidden = 8usize;
     let intermediate = 4usize;
     let num_layers = 2usize;
     let vocab = 16usize;
-
-    let config = serde_json::json!({
-        "model_type": "llama",
-        "hidden_size": hidden,
-        "num_hidden_layers": num_layers,
-        "intermediate_size": intermediate,
-        "num_attention_heads": 1,
-        "num_key_value_heads": 1,
-        "head_dim": hidden,
-        "rope_theta": 10000.0,
-        "vocab_size": vocab,
-    });
-    std::fs::write(
-        model_dir.join("config.json"),
-        serde_json::to_string(&config).unwrap(),
-    )
-    .unwrap();
-
-    let mut tensors: HashMap<String, Vec<f32>> = HashMap::new();
-    let mut metadata: Vec<(String, Vec<usize>)> = Vec::new();
-    let push = |tensors: &mut HashMap<String, Vec<f32>>,
-                metadata: &mut Vec<(String, Vec<usize>)>,
-                name: &str,
-                shape: Vec<usize>| {
-        let n: usize = shape.iter().product();
-        let data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01).collect();
-        tensors.insert(name.into(), data);
-        metadata.push((name.into(), shape));
-    };
-    push(&mut tensors, &mut metadata, "model.embed_tokens.weight", vec![vocab, hidden]);
-    push(&mut tensors, &mut metadata, "model.norm.weight", vec![hidden]);
-    for layer in 0..num_layers {
-        let lp = format!("model.layers.{layer}");
-        push(&mut tensors, &mut metadata, &format!("{lp}.self_attn.q_proj.weight"), vec![hidden, hidden]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.self_attn.k_proj.weight"), vec![hidden, hidden]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.self_attn.v_proj.weight"), vec![hidden, hidden]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.self_attn.o_proj.weight"), vec![hidden, hidden]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.mlp.gate_proj.weight"), vec![intermediate, hidden]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.mlp.up_proj.weight"), vec![intermediate, hidden]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.mlp.down_proj.weight"), vec![hidden, intermediate]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.input_layernorm.weight"), vec![hidden]);
-        push(&mut tensors, &mut metadata, &format!("{lp}.post_attention_layernorm.weight"), vec![hidden]);
-    }
-
-    let tensor_bytes: Vec<(String, Vec<u8>, Vec<usize>)> = metadata
-        .iter()
-        .map(|(name, shape)| {
-            let data = &tensors[name];
-            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-            (name.clone(), bytes, shape.clone())
-        })
-        .collect();
-    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = tensor_bytes
-        .iter()
-        .map(|(name, bytes, shape)| {
-            (
-                name.clone(),
-                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), bytes)
-                    .unwrap(),
-            )
-        })
-        .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
-    std::fs::write(model_dir.join("model.safetensors"), serialized).unwrap();
-    let tok_json =
-        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
-    std::fs::write(model_dir.join("tokenizer.json"), tok_json).unwrap();
-    let tokenizer = larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+    let tokenizer = write_synthetic_llama_model(&model_dir, hidden, intermediate, num_layers, vocab);
 
     let mut cb = larql_vindex::SilentBuildCallbacks;
     larql_vindex::build_vindex_streaming(
@@ -474,5 +421,4 @@ fn q4k_feature_major_down_round_trip() {
             "down[{layer}][feat={feat}][{h}] diverged: got {got}, expected {want}"
         );
     }
-    let _ = vocab; // silence unused-arg warning if compiler complains
 }

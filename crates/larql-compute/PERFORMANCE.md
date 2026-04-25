@@ -8,9 +8,9 @@ Vindex: `gemma3-4b-q4k-v2` (Q4_K attn/gate/up, Q6_K V/down — Ollama convention
 ## Current state (2026-04-25)
 
 ```
-larql-metal  gemma3-4b-q4k-v2   72–73 tok/s   13.7ms/tok
-Ollama       gemma3:4b          96–99 tok/s   10.1ms/tok
-Gap          1.33–1.36×         +3.6ms/tok
+larql-metal  gemma3-4b-q4k-v2   75–77 tok/s   13.0ms/tok
+Ollama       gemma3:4b          97–103 tok/s  10.0ms/tok
+Gap          1.26–1.34×         +3ms/tok
 ```
 
 Per-stage breakdown (100-token run, 8 warmup):

@@ -98,6 +98,10 @@ pub struct MarkovResidualEngine {
     backend: Box<dyn ComputeBackend>,
     profiling: bool,
     profile: EngineProfiler,
+    /// Set to `true` after a successful Metal `prefill_q4k`. When true,
+    /// `decode_step_q4k` routes through the Metal `decode_token` path
+    /// rather than the CPU residual-recompute path.
+    metal_prefill_done: bool,
 }
 
 impl MarkovResidualEngine {
@@ -106,7 +110,7 @@ impl MarkovResidualEngine {
     }
 
     pub fn with_backend(window_size: Option<usize>, backend: Box<dyn ComputeBackend>) -> Self {
-        Self { window_size, store: None, backend, profiling: false, profile: EngineProfiler::default() }
+        Self { window_size, store: None, backend, profiling: false, profile: EngineProfiler::default(), metal_prefill_done: false }
     }
 
     /// Enable per-stage decode timing. Adds ~1µs overhead per decode step.
@@ -180,10 +184,12 @@ impl KvEngine for MarkovResidualEngine {
         Some(self.profile.summary("markov-rs", self.backend.name()))
     }
 
-    /// Q4K prefill — dequantises attention weights into `weights.tensors` once
-    /// (per-layer lazy; subsequent decode steps reuse the cached f32 tensors),
-    /// then runs the normal residual-store prefill. Uses `WalkFfn` for FFN so
-    /// the heavy gate/up/down matmuls stay on Q4K rather than dequantised f32.
+    /// Q4K prefill — uses the Metal full pipeline (`prefill_q4`/`decode_token`)
+    /// for full GPU speed. This is the same path as `UnlimitedContextEngine`
+    /// since at the Metal level both engines reduce to KV-cache-backed decoding.
+    ///
+    /// For the CPU path (no Metal or no Q4K index), falls back to the f32 prefill
+    /// which stores residuals for later K/V recomputation.
     fn prefill_q4k(
         &mut self,
         weights: &mut ModelWeights,
@@ -191,6 +197,17 @@ impl KvEngine for MarkovResidualEngine {
         token_ids: &[u32],
         backend: &dyn ComputeBackend,
     ) -> Option<Array2<f32>> {
+        use super::unlimited_context::engine::q4k_prefill_metal;
+        // Try Metal full pipeline first. Returns None for CpuBackend or when
+        // Q4K data is absent — fall through to CPU path in that case.
+        if let Some(h) = q4k_prefill_metal(weights, index, token_ids, backend) {
+            self.metal_prefill_done = true;
+            self.store = None;
+            return Some(h);
+        }
+        // CPU Q4K path: dequantise attention tensors once (idempotent); use
+        // WalkFfn so FFN reads Q4K bytes directly without a 9 GB f32 copy.
+        self.metal_prefill_done = false;
         ensure_attn_tensors_dequantised(weights, index);
         let result = rs_prefill_walk(weights, index, token_ids, self.window_size, backend);
         let hidden = result.hidden.clone();
@@ -198,8 +215,6 @@ impl KvEngine for MarkovResidualEngine {
         Some(hidden)
     }
 
-    /// Q4K decode step — attention projection uses cached f32 tensors;
-    /// FFN uses `WalkFfn` (Q4K/Q6K, no dequant to f32).
     fn decode_step_q4k(
         &mut self,
         weights: &mut ModelWeights,
@@ -207,6 +222,17 @@ impl KvEngine for MarkovResidualEngine {
         token_id: u32,
         backend: &dyn ComputeBackend,
     ) -> Option<Array2<f32>> {
+        use super::unlimited_context::engine::q4k_decode_token;
+        if self.metal_prefill_done {
+            // Metal path: decode_token manages KV state in GPU buffers.
+            // Returns None only on a GPU-side error; if that happens fall
+            // through to CPU (engine state was lost — can't recover residuals,
+            // so we'll get an error from store.take() below).
+            if let Some(h) = q4k_decode_token(weights, index, token_id, backend) {
+                return Some(h);
+            }
+        }
+        // CPU path: residual-recompute with WalkFfn FFN + dequantised attention.
         ensure_attn_tensors_dequantised(weights, index);
         let rs = self.store.take()?;
         let (hidden, new_rs) = rs_decode_step_walk(weights, index, token_id, rs, backend)?;
@@ -551,9 +577,9 @@ fn last_row(h: &Array2<f32>) -> Array2<f32> {
 ///
 /// Skips layers whose attention tensors are already present (idempotent).
 pub fn ensure_attn_tensors_dequantised(weights: &mut ModelWeights, index: &VectorIndex) {
-    let arch = weights.arch.clone();
     let num_layers = weights.num_layers;
     for layer in 0..num_layers {
+        let arch = &*weights.arch;
         let q_key = arch.attn_q_key(layer);
         if weights.tensors.contains_key(&q_key) { continue; }
 
@@ -564,16 +590,19 @@ pub fn ensure_attn_tensors_dequantised(weights: &mut ModelWeights, index: &Vecto
         let hidden = weights.hidden_size;
         let q_dim  = num_q * hd;
         let kv_dim = num_kv * hd;
+        let k_key  = arch.attn_k_key(layer);
+        let v_key  = arch.attn_v_key(layer);
+        let o_key  = arch.attn_o_key(layer);
 
         let w_q = dequantize_matrix_engine(attn[0].0, attn[0].1, q_dim,  hidden);
         let w_k = dequantize_matrix_engine(attn[1].0, attn[1].1, kv_dim, hidden);
         let w_v = dequantize_matrix_engine(attn[2].0, attn[2].1, kv_dim, hidden);
         let w_o = dequantize_matrix_engine(attn[3].0, attn[3].1, hidden, q_dim);
 
-        weights.tensors.insert(q_key,                     w_q.into_shared());
-        weights.tensors.insert(arch.attn_k_key(layer),    w_k.into_shared());
-        weights.tensors.insert(arch.attn_v_key(layer),    w_v.into_shared());
-        weights.tensors.insert(arch.attn_o_key(layer),    w_o.into_shared());
+        weights.tensors.insert(q_key, w_q.into_shared());
+        weights.tensors.insert(k_key, w_k.into_shared());
+        weights.tensors.insert(v_key, w_v.into_shared());
+        weights.tensors.insert(o_key, w_o.into_shared());
     }
 }
 
@@ -607,7 +636,7 @@ fn rs_prefill_walk(
         stored.push(h.clone());
         let (h_post_attn, _k, _v) = run_attention_with_kv_backend(weights, &h, layer, be)
             .expect("attention failed during MarkovRS Q4K prefill");
-        let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::full_dense())
+        let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(weights.num_layers))
             .with_backend(backend);
         let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
         h = h_out;
@@ -651,13 +680,7 @@ fn rs_decode_step_walk(
     rs: RsStore,
     backend: &dyn ComputeBackend,
 ) -> Option<(Array2<f32>, RsStore)> {
-    // Override FFN with WalkFfn; everything else is the normal decode path.
-    // We achieve this by substituting the ffn backend inside rs_decode_step_inner
-    // via the profiler=None path, then re-running with WalkFfn replacing BackendFfn.
-    //
-    // Because rs_decode_step_inner hard-codes BackendFfn, we inline the loop here
-    // with WalkFfn substituted. This is the only delta vs rs_decode_step_inner.
-    use std::time::Instant;
+    // WalkFfn (Q4K FFN) replaces BackendFfn (f32 FFN) — only delta vs rs_decode_step_inner.
 
     let num_layers  = weights.num_layers;
     let abs_position = rs.next_position;
@@ -704,7 +727,7 @@ fn rs_decode_step_walk(
             weights, &h_new, layer, Some(&(k_full, v_full)), abs_position, Some(backend),
         )?;
 
-        let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::full_dense())
+        let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(weights.num_layers))
             .with_backend(backend);
         let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
         h_new = h_out;

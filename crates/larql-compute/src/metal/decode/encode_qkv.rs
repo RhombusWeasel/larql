@@ -65,8 +65,21 @@ impl MetalBackend {
         uses_q4k: bool,
     ) {
         if uses_q4k {
-            self.encode_q4k_input_norm(enc, layer, &bufs, dims);
-            self.encode_q4k_qkv(enc, layer, &bufs, dims);
+            // Fast path: fused RMS norm + mixed Q4K/Q6K QKV in one dispatch.
+            // Fires when format is Q4_K Q/K + Q6_K V (Gemma 3/4 production),
+            // no bias, standard RMS norm. Saves 1 dispatch per layer × 34.
+            let mixed_q4k_q6k_v = layer.wq.format == crate::QuantFormat::Q4_K
+                && layer.wk.format == crate::QuantFormat::Q4_K
+                && layer.wv.format == crate::QuantFormat::Q6_K;
+            if mixed_q4k_q6k_v
+                && layer.norm_type == crate::NormType::RmsNorm
+                && layer.input_norm_bias.is_none()
+            {
+                self.encode_normed_q4k_q6k_qkv(enc, layer, &bufs, dims);
+            } else {
+                self.encode_q4k_input_norm(enc, layer, &bufs, dims);
+                self.encode_q4k_qkv(enc, layer, &bufs, dims);
+            }
         } else {
             self.encode_q4_0_norm_and_qkv(enc, layer, &bufs, dims);
         }
@@ -252,6 +265,48 @@ impl MetalBackend {
         enc.dispatch_thread_groups(
             MTLSize::new((total_rows as u64).div_ceil(8), 1, 1),
             MTLSize::new(256, 1, 1),
+        );
+    }
+
+    // ── Fused RMS norm + Q4K/Q6K QKV (Gemma 3/4 production path) ─────────────
+
+    /// Fused dispatch: cooperatively reduces ||h||² within each TG, then runs
+    /// the Q4_K+Q6_K mixed QKV matvec with inline normalization.
+    /// Replaces `encode_q4k_input_norm` + `encode_q4k_qkv` (saves 1 dispatch).
+    fn encode_normed_q4k_q6k_qkv(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        layer: &FullPipelineLayer,
+        bufs: &QkvBufs<'_>,
+        dims: QkvDims,
+    ) {
+        use crate::metal::shaders::q4k_q6k_qkv_proj as sh;
+        let QkvDims { hidden, layer_q_dim, layer_kv_dim, eps, norm_offset } = dims;
+        let total_rows = (layer_q_dim + layer_kv_dim + layer_kv_dim) as u64;
+        let num_tgs = total_rows.div_ceil(sh::ROWS_PER_TG);
+        let q_u = layer_q_dim as u32;
+        let k_u = layer_kv_dim as u32;
+        let v_u = layer_kv_dim as u32;
+        let hidden_u = hidden as u32;
+
+        enc.set_compute_pipeline_state(&self.q4k_q6k_qkv_proj_normed_pipeline.state);
+        enc.set_buffer(0, Some(bufs.wq), 0);
+        enc.set_buffer(1, Some(bufs.wk), 0);
+        enc.set_buffer(2, Some(bufs.wv), 0);
+        enc.set_buffer(3, Some(bufs.h_in), 0);
+        enc.set_buffer(4, Some(bufs.input_norm), 0);
+        enc.set_buffer(5, Some(bufs.q_out), 0);
+        enc.set_buffer(6, Some(bufs.k_out), 0);
+        enc.set_buffer(7, Some(bufs.v_out), 0);
+        enc.set_bytes(8,  4, &q_u      as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(9,  4, &k_u      as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(10, 4, &v_u      as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(11, 4, &hidden_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(12, 4, &eps      as *const f32 as *const std::ffi::c_void);
+        enc.set_bytes(13, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new(num_tgs, 1, 1),
+            MTLSize::new(sh::THREADS_PER_TG, 1, 1),
         );
     }
 }

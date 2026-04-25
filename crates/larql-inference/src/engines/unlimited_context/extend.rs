@@ -5,9 +5,11 @@
 
 use ndarray::Array2;
 use larql_compute::ComputeBackend;
+use larql_vindex::VectorIndex;
 
 use crate::attention::{run_attention_block_decode_step_backend, SharedKV};
 use crate::ffn::BackendFfn;
+use crate::vindex::{WalkFfn, WalkFfnConfig};
 use crate::forward::{embed_tokens_pub, run_ffn};
 use crate::model::ModelWeights;
 
@@ -91,6 +93,62 @@ pub fn rs_extend_from_checkpoint_backend(
         kv_cache,
         new_checkpoint,
     })
+}
+
+/// CPU Q4K variant of [`rs_extend_from_checkpoint_backend`].
+///
+/// Uses `WalkFfn` (reads Q4K bytes directly from `index`) for FFN instead of
+/// `BackendFfn` (needs f32 tensors in `weights.tensors`). Attention projection
+/// uses the dequantised f32 tensors already inserted by
+/// `ensure_attn_tensors_dequantised`. Call that before this function.
+pub fn rs_extend_from_checkpoint_q4k(
+    weights: &ModelWeights,
+    index: &VectorIndex,
+    token_ids: &[u32],
+    prior_kv: &[SharedKV],
+    abs_start: usize,
+    backend: &dyn ComputeBackend,
+) -> Option<ExtendOutput> {
+    let num_layers = weights.num_layers;
+
+    if token_ids.is_empty() { return None; }
+    if prior_kv.len() != num_layers { return None; }
+
+    let mut kv_cache: Vec<SharedKV> = prior_kv.to_vec();
+    let mut last_hidden: Option<Array2<f32>> = None;
+
+    for (i, &token_id) in token_ids.iter().enumerate() {
+        let abs_position = abs_start + i;
+        let mut h = embed_tokens_pub(weights, &[token_id]);
+
+        for (layer, kv_slot) in kv_cache.iter_mut().enumerate() {
+            let kv_entry: Option<&SharedKV> = if kv_slot.0.shape()[0] > 0 { Some(kv_slot) } else { None };
+
+            let (h_post_attn, new_kv) = run_attention_block_decode_step_backend(
+                weights, &h, layer, kv_entry, abs_position, Some(backend),
+            )?;
+
+            let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
+                .with_backend(backend);
+            let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
+            h = h_out;
+            *kv_slot = new_kv;
+        }
+
+        last_hidden = Some(h);
+    }
+
+    let new_checkpoint: Vec<SharedKV> = kv_cache
+        .iter()
+        .map(|(k, v)| {
+            let n = k.shape()[0];
+            let last_k = k.slice(ndarray::s![n - 1..n, ..]).to_owned();
+            let last_v = v.slice(ndarray::s![n - 1..n, ..]).to_owned();
+            (last_k, last_v)
+        })
+        .collect();
+
+    Some(ExtendOutput { last_hidden: last_hidden?, kv_cache, new_checkpoint })
 }
 
 /// Build an empty (zero-row) K,V seed for use when no prior checkpoint exists.

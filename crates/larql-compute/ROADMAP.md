@@ -4,23 +4,24 @@
 
 | Engine | tok/s | ms/tok | Notes |
 |---|---|---|---|
-| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **72–73** | 13.7 | inter-superblock interleaving + X preload + deferred scale |
+| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **75–77** | 13.0 | 5 dispatch fusions + Q6K/Q4K interleaving |
 | **LARQL Metal** (gemma3-4b-q4k-downq4k, all-Q4_K) | **70.1** | 14.26 | all-Q4_K extract; q4k_geglu_silu_down fires |
-| **Ollama** gemma3:4b | **96–99** | 10.1 | reference |
-| **Gap** | LARQL is **1.33–1.36×** slower | +3.6ms/tok | per-stage decomposition below |
+| **Ollama** gemma3:4b | **97–99** | 10.1 | reference |
+| **Gap** | LARQL is **1.28–1.30×** slower | +3.1ms/tok | per-stage decomposition below |
 
-Per-stage breakdown (larql-metal, gemma3-4b-q4k-v2, 100-token run):
+Per-stage breakdown (larql-metal, gemma3-4b-q4k-v2, 120-token run):
 
 | Stage | ms/tok | % |
 |---|---|---|
-| GPU fwd | 11.8 | 83% |
-| lm_head | 2.35 | 17% |
-| embed + norm + detok | ~0.01 | ~0% |
+| GPU fwd | 11.2 | 83% |
+| lm_head | 2.27 | 17% |
 
-**Gap diagnosis**: dispatch overhead dominates (~2.4ms of 11.8ms GPU fwd).
-LARQL effective bandwidth: ~322 GB/s. Ollama: ~348 GB/s. Kernel quality gap
-is 8%; total gap is 1.33× due to 476 dispatches/token vs Ollama's ~272.
-See `PERFORMANCE.md` for the full llama.cpp comparison and bandwidth budget.
+**Gap analysis (2026-04-25):**
+- LARQL dispatch: ~408 dispatches × 5µs ≈ 2.0ms (reduced from 2.4ms after QK-norm+RoPE fusion)
+- LARQL kernel time: 11.2 - 2.0 = **9.2ms** → **329 GB/s**
+- Ollama kernel time: ~10.1 - 1.4 = **8.7ms** → **348 GB/s**
+- Kernel gap: ~0.5ms. Dispatch gap: ~0.6ms. lm_head gap: ~0.8ms.
+See `PERFORMANCE.md` for the full bandwidth budget and llama.cpp comparison.
 
 The "117 tok/s" historical number was synthetic-weight Q4_KF without
 real vindex load. Production extracts use Q6_K down (Ollama
@@ -39,7 +40,16 @@ Remaining gap: **1.33×** (72 vs 98 tok/s, 3.7ms/tok). Three sources ranked by s
 | **4** | LM head async readback + GPU top-k | **~0.5ms** | partial |
 | — | Other (attention, residuals, activation) | ~0.7ms | unclear |
 
-Closing #6 + #7 brings LARQL to ~90–95 tok/s (Ollama parity).
+**Updated analysis (2026-04-25 post Q4_K rewrite):**
+- LARQL kernel time: 9.2ms → **328 GB/s** effective bandwidth
+- Ollama kernel time: 8.4ms → **359 GB/s** effective bandwidth
+- Kernel efficiency gap: 0.78ms → closing it reaches **102 tok/s** (Ollama parity)
+- Dispatch gap: 1.02ms → closing it alone reaches **~94 tok/s**
+
+**#7 (dispatch fusion) is now the highest-leverage remaining item.**
+#6 (Q4_K kernel) had limited gain because K=2560 fits in L1 cache — the
+inter-superblock optimization only helps when K is large enough to be DRAM-bound
+(Q6_K down with K=10240 was 4× larger and got the big gain).
 
 ### #1 — Q6_K fused activation+down (closed — wrong fix, correct diagnosis)
 
@@ -136,7 +146,23 @@ Folded into #6 below with updated size estimate.
 
 ---
 
-### #6 — `q4k_matvec` inter-superblock rewrite (open — highest priority)
+### #6 — `q4k_matvec` inter-superblock rewrite (partial — shipped, limited gain)
+
+**Actual gain: ~0.1ms/tok** (benchmarked 2026-04-25). Applied to `q4k_matvec`,
+`q4k_ffn_gate_up`, and Q/K branch of `q4k_q6k_qkv_proj`.
+
+**Root cause of limited gain:** All Q4_K matvecs in Gemma 3 4B use K=2560 as
+input dimension (hidden size). K=2560 → 10 superblocks × 144 bytes = 1440 bytes
+per row — fits entirely in GPU L1 cache. The old lane-stride approach had 22/32
+idle lanes for K=2560, but L1-cached superblock data hid that inefficiency. The
+inter-superblock optimization helps primarily when K is large enough that
+superblock data spills to DRAM — which is why Q6_K down (K=10240, 8400 bytes/row,
+21.5 MB total) got a much larger gain.
+
+**Potential remaining Q4_K gains:** The llama.cpp approach uses `yl[]/yh[]`
+preloading + `float4 acc1/acc2` vectorized accumulation. For the output dimension
+(N=10240 for gate/up), more TGs may help via better GPU saturation. But the
+fundamental bottleneck for Q4_K with K=2560 is now something else.
 
 **Estimated gain: ~1.0–1.5ms/tok.** The Q4_K kernel handles:
 - Wq (8192×2560) + Wk (4096×2560) + Wv fused QKV: 26.3 MB/layer × 34 = 895 MB
@@ -206,22 +232,24 @@ Current per-layer dispatch count (~14 for Gemma 3 4B):
 
 Three fusions with clear wins (each saves 34 dispatches = ~0.17ms):
 
-**7a — Fused QK-norm Q+K** (~0.17ms):
-Currently dispatches `qk_norm` twice (dispatches 3+4) with same pipeline.
-A single dispatch with `total_heads = q_heads + kv_heads` and a flag or
-offset to select the weight vector would halve it. ~30 LOC MSL change.
+**7a — Fused QK-norm Q+K** ✅ done 2026-04-25 (+0.17ms recovered):
+New `qk_norm_qk` shader dispatches total_heads = q_heads + kv_heads in one
+call; TG index selects Q buffer + q_weight vs K buffer + k_weight.
 
-**7b — Fused RoPE Q+K** (~0.17ms):
-Dispatches 5+6 reuse the same `rope_at_pos_batched` pipeline with a buffer
-swap. A single dispatch with total threads covering Q+K heads, distinguishing
-them by offset, halves it. ~30 LOC MSL change.
+**7b — Fused RoPE Q+K** ✅ done 2026-04-25 (+0.17ms recovered):
+New `rope_at_pos_batched_qk` shader: grid `(rope_pairs, q_heads+kv_heads, 1)`;
+thread `h < num_q` selects Q buffer, else K buffer.
 
-**7c — Fused input norm + QKV projection** (~0.17ms):
-Dispatch 1+2 can be merged: each QKV TG independently computes the RMS norm
-(all 128 threads reduce `||h||²` cooperatively via simd_sum + threadgroup
-barrier), then proceeds with its row's matvec using inline `h[i]/rms*w[i]`.
-The `norm_out` 10KB buffer write is eliminated. ~200 LOC MSL (cooperative
-reduction + two-format Q4_K/Q6_K inline norm). See encode_qkv.rs.
+**7c — Fused input norm + QKV projection** ✅ done 2026-04-25:
+New `q4k_q6k_qkv_proj_normed` kernel: all 128 threads cooperatively reduce
+`||h||²` in Phase 1 (barrier), then each simdgroup runs its matvec with inline
+`h[i] * rms * (offset + norm_w[i])`. Fires when format is Q4_K Q/K + Q6_K V,
+standard RMS norm, no bias (Gemma 3 4B production).
+
+**7e — Fused residual_norm + residual_add** ✅ done 2026-04-25:
+New `residual_norm_store` kernel writes both `ffn_norm_out` (normed FFN input)
+and `h_post_attn` (raw sum for post-FFN add) in one pass. Replaces the
+`residual_norm + residual_add` two-dispatch pair in the Q4_K hot path.
 
 **7d — Fused GEGLU + down** (~0.17ms):
 Dispatches 12+13 can be merged for Q4_K down (already done). For Q6_K down,

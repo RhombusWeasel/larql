@@ -104,6 +104,7 @@ pub struct MetalBackend {
     /// Gemma 3 4B / Gemma 4 ship `V` as Q6_K; without this shader decode
     /// falls through to three per-projection dispatches per layer.
     pub q4k_q6k_qkv_proj_pipeline: KernelHandle,
+    pub q4k_q6k_qkv_proj_normed_pipeline: KernelHandle,
     pub q4k_proj_pipeline: KernelHandle,
     pub q4kf_qkv_proj_pipeline: KernelHandle,
     pub q4kf_proj_pipeline: KernelHandle,
@@ -117,6 +118,8 @@ pub struct MetalBackend {
     pub v_norm_pipeline: ComputePipelineState,
     pub v_norm_batched_pipeline: ComputePipelineState,
     pub qk_norm_pipeline: ComputePipelineState,
+    pub qk_norm_qk_pipeline: ComputePipelineState,
+    pub rope_at_pos_batched_qk_pipeline: ComputePipelineState,
     // Scale vector (per-layer scalar, Gemma 4)
     pub scale_vector_pipeline: ComputePipelineState,
     /// KV cache for decode mode — initialized on first decode_token call.
@@ -124,6 +127,7 @@ pub struct MetalBackend {
     pub rms_norm_q8_pipeline: ComputePipelineState,
     pub residual_norm_pipeline: ComputePipelineState,
     pub residual_norm_q8_pipeline: ComputePipelineState,
+    pub residual_norm_store_pipeline: ComputePipelineState,
     /// Dedicated row-per-simdgroup f32 gemv for the LM head. Used in
     /// autoregressive decode where `matmul_transb(query, lm_head)` shows
     /// up as the dominant per-token cost.
@@ -220,6 +224,8 @@ impl MetalBackend {
         let rms_norm_q8_pipeline = device.new_compute_pipeline_state_with_function(&rms_norm_q8_fn).ok()?;
         let residual_norm_pipeline = device.new_compute_pipeline_state_with_function(&residual_norm_fn).ok()?;
         let residual_norm_q8_pipeline = device.new_compute_pipeline_state_with_function(&residual_norm_q8_fn).ok()?;
+        let residual_norm_store_fn = library.get_function("residual_norm_store", None).ok()?;
+        let residual_norm_store_pipeline = device.new_compute_pipeline_state_with_function(&residual_norm_store_fn).ok()?;
 
         // Dedicated f32 / f16 gemv for the LM head (KernelHandle).
         let f32_gemv_pipeline = KernelHandle::from_kernel::<shaders::f32_gemv::Kernel>(&device, &library)?;
@@ -238,6 +244,7 @@ impl MetalBackend {
         // Fused Q4_K QKV projection (KernelHandle).
         let q4k_qkv_proj_pipeline = KernelHandle::from_kernel::<shaders::q4k_qkv_proj::QkvKernel>(&device, &library)?;
         let q4k_q6k_qkv_proj_pipeline = KernelHandle::from_kernel::<shaders::q4k_q6k_qkv_proj::Kernel>(&device, &library)?;
+        let q4k_q6k_qkv_proj_normed_pipeline = KernelHandle::from_kernel::<shaders::q4k_q6k_qkv_proj::NormedKernel>(&device, &library)?;
         let q4k_proj_pipeline = KernelHandle::from_kernel::<shaders::q4k_qkv_proj::ProjKernel>(&device, &library)?;
 
         // Q4_KF: pre-baked scales (faster inference) — KernelHandle.
@@ -269,6 +276,12 @@ impl MetalBackend {
         // QK-norm (learned-weight per-head RMSNorm, Gemma 3/4)
         let qk_norm_fn = library.get_function("qk_norm", None).ok()?;
         let qk_norm_pipeline = device.new_compute_pipeline_state_with_function(&qk_norm_fn).ok()?;
+        // Fused Q+K norm — applies both in one dispatch (saves 34 dispatches/token)
+        let qk_norm_qk_fn = library.get_function("qk_norm_qk", None).ok()?;
+        let qk_norm_qk_pipeline = device.new_compute_pipeline_state_with_function(&qk_norm_qk_fn).ok()?;
+        // Fused Q+K RoPE — applies both in one dispatch (saves 34 dispatches/token)
+        let rope_batched_qk_fn = library.get_function("rope_at_pos_batched_qk", None).ok()?;
+        let rope_at_pos_batched_qk_pipeline = device.new_compute_pipeline_state_with_function(&rope_batched_qk_fn).ok()?;
 
         // Scale vector (per-layer scalar multiplier, Gemma 4)
         let scale_vector_fn = library.get_function("scale_vector", None).ok()?;
@@ -293,15 +306,17 @@ impl MetalBackend {
             q6k_geglu_silu_down_pipeline, q6k_geglu_gelu_tanh_down_pipeline,
             q6k_matvec_pipeline,
             rope_pipeline, rope_at_pos_pipeline, rope_at_pos_batched_pipeline,
-            q4k_qkv_proj_pipeline, q4k_q6k_qkv_proj_pipeline, q4k_proj_pipeline,
+            q4k_qkv_proj_pipeline, q4k_q6k_qkv_proj_pipeline, q4k_q6k_qkv_proj_normed_pipeline, q4k_proj_pipeline,
             q4kf_qkv_proj_pipeline, q4kf_proj_pipeline,
             silu_pipeline, gelu_tanh_pipeline,
             layer_norm_pipeline, layer_norm_no_bias_pipeline,
             v_norm_pipeline, v_norm_batched_pipeline,
-            qk_norm_pipeline,
+            qk_norm_pipeline, qk_norm_qk_pipeline,
+            rope_at_pos_batched_qk_pipeline,
             scale_vector_pipeline,
             kv_cache: std::sync::Mutex::new(None),
             rms_norm_q8_pipeline, residual_norm_pipeline, residual_norm_q8_pipeline,
+            residual_norm_store_pipeline,
             f32_gemv_pipeline,
             f16_gemv_pipeline,
             flop_threshold: AtomicUsize::new(calibrate::DEFAULT_FLOP_THRESHOLD),

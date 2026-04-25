@@ -239,38 +239,28 @@ impl MetalBackend {
             // the right thing for both families.
             if let (Some(q_w), Some(k_w)) = (layer.q_norm_weight, layer.k_norm_weight) {
                 let hd_val = layer_head_dim as u32;
+                let nq_val = layer_num_q_heads as u32;
                 let qk_off = layer.qk_norm_offset;
                 let eps = layer.eps;
-                // One threadgroup per head; threads per tg = min(head_dim, 512)
-                // rounded up to a power of two for the tree reduction.
                 let mut tg_w: usize = 1;
                 while tg_w < layer_head_dim && tg_w < 512 { tg_w <<= 1; }
 
-                // Q heads
+                // Fused Q+K norm: one dispatch covers all q_heads+kv_heads.
+                // Saves 1 dispatch per layer × 34 = 34 dispatches/token.
                 let q_w_buf = self.bufs.get_f32(q_w);
-                let nq_val = layer_num_q_heads as u32;
-                enc.set_compute_pipeline_state(&self.qk_norm_pipeline);
-                enc.set_buffer(0, Some(&q_out), 0);
-                enc.set_buffer(1, Some(&q_out), 0);
-                enc.set_buffer(2, Some(&q_w_buf), 0);
-                enc.set_bytes(3, 4, &hd_val as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(4, 4, &nq_val as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
-                enc.set_bytes(6, 4, &qk_off as *const f32 as *const std::ffi::c_void);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(layer_num_q_heads as u64, 1, 1),
-                    MTLSize::new(tg_w as u64, 1, 1),
-                );
-
-                // K heads
                 let k_w_buf = self.bufs.get_f32(k_w);
-                let nkv_val = layer_num_kv_heads as u32;
-                enc.set_buffer(0, Some(&k_out), 0);
+                let total_heads = (layer_num_q_heads + layer_num_kv_heads) as u64;
+                enc.set_compute_pipeline_state(&self.qk_norm_qk_pipeline);
+                enc.set_buffer(0, Some(&q_out), 0);
                 enc.set_buffer(1, Some(&k_out), 0);
-                enc.set_buffer(2, Some(&k_w_buf), 0);
-                enc.set_bytes(4, 4, &nkv_val as *const u32 as *const std::ffi::c_void);
+                enc.set_buffer(2, Some(&q_w_buf), 0);
+                enc.set_buffer(3, Some(&k_w_buf), 0);
+                enc.set_bytes(4, 4, &hd_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(5, 4, &nq_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
+                enc.set_bytes(7, 4, &qk_off as *const f32 as *const std::ffi::c_void);
                 enc.dispatch_thread_groups(
-                    MTLSize::new(layer_num_kv_heads as u64, 1, 1),
+                    MTLSize::new(total_heads, 1, 1),
                     MTLSize::new(tg_w as u64, 1, 1),
                 );
             }
@@ -284,24 +274,19 @@ impl MetalBackend {
                 let num_q = layer_num_q_heads as u32;
                 let num_kv = layer_num_kv_heads as u32;
 
-                // Q heads — all in one dispatch
-                enc.set_compute_pipeline_state(&self.rope_at_pos_batched_pipeline);
+                // Fused Q+K RoPE: one dispatch covers rope_pairs × (q+kv heads).
+                // Saves 1 dispatch per layer × 34 = 34 dispatches/token.
+                let total_qk_heads = (layer_num_q_heads + layer_num_kv_heads) as u64;
+                enc.set_compute_pipeline_state(&self.rope_at_pos_batched_qk_pipeline);
                 enc.set_buffer(0, Some(&q_out), 0);
-                enc.set_bytes(1, 4, &hd as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(2, 4, &layer_rope_base as *const f32 as *const std::ffi::c_void);
-                enc.set_bytes(3, 4, &pos as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(4, 4, &rdim as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(5, 4, &num_q as *const u32 as *const std::ffi::c_void);
+                enc.set_buffer(1, Some(&k_out), 0);
+                enc.set_bytes(2, 4, &hd as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(3, 4, &layer_rope_base as *const f32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &pos as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(5, 4, &rdim as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &num_q as *const u32 as *const std::ffi::c_void);
                 enc.dispatch_threads(
-                    MTLSize::new(rope_pairs, layer_num_q_heads as u64, 1),
-                    MTLSize::new(rope_pairs.min(256), 1, 1),
-                );
-
-                // K heads — all in one dispatch
-                enc.set_buffer(0, Some(&k_out), 0);
-                enc.set_bytes(5, 4, &num_kv as *const u32 as *const std::ffi::c_void);
-                enc.dispatch_threads(
-                    MTLSize::new(rope_pairs, layer_num_kv_heads as u64, 1),
+                    MTLSize::new(rope_pairs, total_qk_heads, 1),
                     MTLSize::new(rope_pairs.min(256), 1, 1),
                 );
             }
@@ -446,20 +431,19 @@ impl MetalBackend {
                     enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
                 }
             } else if ffn_uses_q4k {
-                // Q4_K path: residual+norm → f32 output (no Q8)
-                enc.set_compute_pipeline_state(&self.residual_norm_pipeline);
+                // Fused: residual_norm_store writes BOTH ffn_norm_out (normed,
+                // for FFN input) AND h_post_attn (raw sum, for post-FFN add).
+                // Replaces residual_norm + residual_add (saves 34 dispatches/token).
+                enc.set_compute_pipeline_state(&self.residual_norm_store_pipeline);
                 enc.set_buffer(0, Some(h_buf), 0);
                 enc.set_buffer(1, Some(&o_out_buf), 0);
                 enc.set_buffer(2, Some(&post_attn_norm_bufs[l]), 0);
                 enc.set_buffer(3, Some(&ffn_norm_out), 0);
-                enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
-                enc.set_bytes(6, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+                enc.set_buffer(4, Some(&h_post_attn), 0);
+                enc.set_bytes(5, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
+                enc.set_bytes(7, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
                 enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256.min(hidden as u64), 1, 1));
-                // h_post_attn = h + o (pre-norm residual for post-FFN add)
-                use crate::metal::ops::full_pipeline::encode_residual_add;
-                encode_residual_add(&enc, &self.residual_add_pipeline,
-                    h_buf, &o_out_buf, &h_post_attn, hidden);
             } else {
                 enc.set_compute_pipeline_state(&self.residual_norm_q8_pipeline);
                 enc.set_buffer(0, Some(h_buf), 0);

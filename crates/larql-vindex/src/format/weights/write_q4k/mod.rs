@@ -5,6 +5,7 @@
 //! Carved out of the monolithic `write.rs` in the 2026-04-25 reorg.
 
 use crate::extract::stage_labels::*;
+use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
@@ -30,16 +31,13 @@ pub enum QuantBlockFormat {
     Q6K,
 }
 
-/// Manifest entry for `attn_weights_q4k.bin` — one per tensor (Q, K, V, O),
-/// 4 per layer in layer-major order.
-#[derive(Debug, Serialize, Deserialize)]
-struct Q4kAttnEntry {
-    key: String,
-    shape: Vec<usize>,
-    format: QuantBlockFormat,
-    offset: u64,
-    length: u64,
-}
+// Manifest entry shape moved to `super::manifest::Q4kManifestEntry`
+// so the loaders in `index/storage/ffn_store.rs` can deserialise into
+// it directly instead of poking `serde_json::Value` with string keys.
+use super::manifest::Q4kManifestEntry as Q4kAttnEntry;
+
+mod feature_major_down;
+use feature_major_down::FeatureMajorDownState;
 
 /// Pad a row-major f32 buffer to the next multiple of 256 with zeros
 /// (Q4_K/Q6_K super-blocks require length % 256 == 0).
@@ -72,7 +70,7 @@ fn pad_to_256(data: &[f32]) -> Vec<f32> {
 /// small storage overhead (the padding columns are zero and contribute
 /// nothing to the dot product at dispatch time, provided the caller also
 /// zero-pads the input vector to `padded_cols`).
-fn pad_rows_to_256(data: &[f32], rows: usize, cols: usize) -> (Vec<f32>, usize) {
+pub(super) fn pad_rows_to_256(data: &[f32], rows: usize, cols: usize) -> (Vec<f32>, usize) {
     debug_assert_eq!(data.len(), rows * cols);
     let padded_cols = cols.div_ceil(256) * 256;
     if padded_cols == cols {
@@ -145,8 +143,6 @@ pub fn write_model_weights_q4k_with_opts(
     callbacks: &mut dyn IndexBuildCallbacks,
     opts: Q4kWriteOptions,
 ) -> Result<(), VindexError> {
-    use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
-
     callbacks.on_stage(STAGE_MODEL_WEIGHTS_Q4K);
     let start = std::time::Instant::now();
 
@@ -247,17 +243,14 @@ pub fn write_model_weights_q4k_with_opts(
     // re-quantised at the same precision. Lets per-feature decode at
     // load time skip the cache. Allocated lazily so non-opt-in
     // extracts pay nothing.
-    let mut fm_state: Option<(BufWriter<std::fs::File>, u64, Vec<Q4kAttnEntry>)> =
-        if opts.feature_major_down {
-            let path = dir.join(DOWN_FEATURES_Q4K_BIN);
-            Some((
-                BufWriter::new(std::fs::File::create(&path)?),
-                0u64,
-                Vec::with_capacity(num_layers),
-            ))
-        } else {
-            None
-        };
+    let mut fm_state: Option<FeatureMajorDownState> = if opts.feature_major_down {
+        Some(FeatureMajorDownState::new(
+            &dir.join(DOWN_FEATURES_Q4K_BIN),
+            num_layers,
+        )?)
+    } else {
+        None
+    };
 
     for layer in 0..num_layers {
         callbacks.on_layer_start(COMP_FFN_Q4K, layer, num_layers);
@@ -290,38 +283,9 @@ pub fn write_model_weights_q4k_with_opts(
                 });
                 ff_offset += length;
 
-                // Feature-major down emission: transpose `padded`
-                // from [hidden=rows, padded_intermediate] to
-                // [padded_intermediate, hidden], pad each output
-                // row to 256, and quantise at the same precision.
                 if is_down {
-                    if let Some((fm_file, fm_offset, fm_manifest)) = fm_state.as_mut() {
-                        let intermediate = padded_cols;
-                        let hidden = rows;
-                        let mut transposed = vec![0.0f32; intermediate * hidden];
-                        for h in 0..hidden {
-                            let src = &padded[h * intermediate..(h + 1) * intermediate];
-                            for (feat, &v) in src.iter().enumerate() {
-                                transposed[feat * hidden + h] = v;
-                            }
-                        }
-                        let (fm_padded, fm_padded_cols) =
-                            pad_rows_to_256(&transposed, intermediate, hidden);
-                        let fm_bytes = if use_q6 {
-                            quantize_q6_k(&fm_padded)
-                        } else {
-                            quantize_q4_k(&fm_padded)
-                        };
-                        fm_file.write_all(&fm_bytes)?;
-                        let fm_len = fm_bytes.len() as u64;
-                        fm_manifest.push(Q4kAttnEntry {
-                            key: key.clone(),
-                            shape: vec![intermediate, fm_padded_cols],
-                            format,
-                            offset: *fm_offset,
-                            length: fm_len,
-                        });
-                        *fm_offset += fm_len;
+                    if let Some(state) = fm_state.as_mut() {
+                        state.append_layer(key.clone(), &padded, rows, padded_cols, format)?;
                     }
                 }
             }
@@ -335,12 +299,8 @@ pub fn write_model_weights_q4k_with_opts(
         .map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(dir.join(INTERLEAVED_Q4K_MANIFEST_JSON), ff_manifest_json)?;
 
-    if let Some((mut fm_file, _, fm_manifest)) = fm_state.take() {
-        fm_file.flush()?;
-        drop(fm_file);
-        let json = serde_json::to_string_pretty(&fm_manifest)
-            .map_err(|e| VindexError::Parse(e.to_string()))?;
-        std::fs::write(dir.join(DOWN_FEATURES_Q4K_MANIFEST_JSON), json)?;
+    if let Some(state) = fm_state.take() {
+        state.finalize(&dir.join(DOWN_FEATURES_Q4K_MANIFEST_JSON))?;
     }
 
     // ── experts_packed.bin (hybrid MoE PackedBF16, e.g. Gemma 4 26B A4B) ──
