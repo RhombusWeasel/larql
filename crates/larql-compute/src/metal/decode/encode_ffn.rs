@@ -177,20 +177,21 @@ impl MetalBackend {
 
             // Fast path: down is Q4_K → fused activation+down kernel
             // skips the GEGLU dispatch and the inter-sized activation
-            // buffer write/read. Verified parity against the
-            // separated path in `test_kernel_q4k_geglu_down.rs`.
+            // buffer write/read. Verified parity against the separated
+            // path in `test_kernel_q4k_geglu_down.rs`.
             //
             // **Q6_K fusion is NOT engaged here.** The Q6_K fused
-            // kernel `q6k_geglu_silu_down` is built and parity-
-            // tested but routing it on production gemma3-4b-q4k-v2
-            // showed a ~8 % regression (67.9 → 62.2 tok/s). Q6_K
-            // decode is memory-bound at hidden=2560; the fused
-            // kernel reads gate[i] *and* up[i] per inner iteration
-            // (vs `q6k_matvec`'s single read of pre-computed
-            // `act[i]`), and the extra bandwidth costs more than
-            // the saved dispatch + buffer round-trip. To re-enable,
-            // first add threadgroup-memory caching of gate/up per
-            // superblock — see ROADMAP P0 #1.
+            // kernels (`q6k_geglu_silu_down` / `q6k_geglu_gelu_tanh_down`)
+            // are built, TG-memory-cached, and parity-tested, but routing
+            // them on production gemma3-4b-q4k-v2 regresses decode
+            // 67.9 → 62.2 tok/s even with TG caching. Root cause: with
+            // GELU-tanh the fused inner loop recomputes tanh(gate[i]) once
+            // per output row, so 2560 rows = 2560× more tanh() calls than
+            // the separated `geglu_gelu_tanh` dispatch. Gate/up bandwidth
+            // was never the bottleneck — the 4× intra-TG redundancy the
+            // TG-cache fix targeted was L2-cached in practice (gate/up =
+            // 80 KB, well within M3 Max GPU L2). Re-enable once a cheaper
+            // activation variant avoids the per-row tanh explosion.
             //
             // Slow path: Q6_K / Q4_KF / Q4_0 / Q8_0 → separated
             // GEGLU then format-aware down dispatch.
@@ -348,11 +349,8 @@ impl MetalBackend {
     }
 
     /// Twin of `encode_q4k_fused_geglu_down` for Q6_K down weights.
-    /// **Currently not routed** — empirical regression on the
-    /// production gemma3-4b-q4k-v2 path (see encode_q4k_ffn for the
-    /// analysis). Kept here so the routing can be re-enabled once
-    /// the Q6_K shader gains threadgroup-memory caching for gate/up
-    /// (ROADMAP P0 #1).
+    /// Not currently routed — see the encode_q4k_ffn comment for why
+    /// GELU-tanh fusion regresses on production Q6_K shapes.
     #[allow(clippy::too_many_arguments, dead_code)]
     fn encode_q6k_fused_geglu_down(
         &self,

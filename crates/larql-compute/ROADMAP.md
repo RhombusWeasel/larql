@@ -23,35 +23,44 @@ convention); the q4_KF fast-path doesn't apply to those.
 These are the optimizations from the 2026-04-25 diagnostic — ranked
 by leverage. Lands sequentially; #1 alone closes ~half the gap.
 
-### #1 — Q6_K fused activation+down with TG-memory caching (open)
+### #1 — Q6_K fused activation+down (closed — wrong fix, correct diagnosis)
 
-**Status:** shaders shipped, parity-tested, **not routed**.
-Empirical 8 % regression at production shape — root cause
-identified, fix scoped.
+**Status:** Benchmarked (2026-04-25). Not viable. Routing reverted.
+Root cause of original regression identified and documented.
 
-`q6k_geglu_silu_down` / `q6k_geglu_gelu_tanh_down` shaders +
-KernelHandle wiring + parity tests all landed (2026-04-25). Routing
-them on `gemma3-4b-q4k-v2` (Q6_K down, GELU-tanh) regressed decode
-67.9 → 62.2 tok/s. **Diagnosis:** Q6_K decode at hidden=2560 is
-memory-bound; the fused inner loop reads `gate[i]` *and* `up[i]`
-from device memory per element where `q6k_matvec`'s separated path
-reads only the pre-computed `act[i]`. The extra bandwidth costs
-more than the saved dispatch + buffer round-trip.
+**What was tried:** Added threadgroup-memory caching of `gate`/`up`
+per super-block so all 4 simdgroups in a TG share one device load
+(128 threads × 2 values each). All 5 parity tests pass. But
+`larql bench gemma3-4b-q4k-v2` showed 61–62 tok/s — identical to
+the unfused-TG-cache attempt and identical to the regression without
+TG caching. TG caching had zero effect.
 
-(Q4_K fusion wins because its inner-loop dequant is heavier,
-amortising the extra reads. Q6_K dequant is differently shaped —
-heavier per cell but more memory-traffic-sensitive.)
+**Root cause (corrected):** bandwidth was never the bottleneck.
+gate/up = 80 KB total per dispatch — well within M3 Max GPU L2 cache.
+All 640 TGs share the same gate/up data → L2 cache-hits from TG 2
+onward. The real regression is GELU-tanh recomputation:
 
-**Fix:** add threadgroup-memory caching of `gate` and `up` per
-super-block in the Q6_K shaders. All 4 simdgroups in a TG read the
-same 256-element gate/up window for each super-block (different
-output rows, same input). One TG-coordinated load + 32× shared
-read per super-block replaces 32× per-lane device reads. ~30 LOC
-per kernel. Once parity holds, re-enable the routing in
-`encode_q4k_ffn` and `stages/ffn.rs::encode_gated`.
+- Separated path: `geglu_gelu_tanh` kernel runs 10,240 threads,
+  each computing one `tanh(gate[i])`. Total: 10,240 `tanh` calls.
+- Fused path: inner loop computes `tanh(gate[i])` for every output
+  row independently. At N=2560 output rows: 2,560 × 10,240 =
+  **26.2 M `tanh` calls** — 2560× more than separated.
 
-**Estimated gain after fix: ~1.5–2 ms/tok / ~10–14 % / +8–10 tok/s
-on production extracts.**
+`tanh` is a transcendental function; GPU ALU cost dominates. The
+saved dispatch + buffer round-trip (~0.2 ms) doesn't offset the
+extra 2560× `tanh` work at production shape.
+
+**Q4_K fusion wins for a different reason:** the all-Q4_K model
+uses SiLU (`x/(1+exp(-x))`), not GELU-tanh. SiLU is cheaper than
+`tanh`, so the recomputation overhead is smaller relative to the
+heavier Q4_K dequant per cell.
+
+**Remaining Q6_K opportunity:** optimise `q6k_matvec` throughput
+directly (P0 #5 below) — currently 79 GE/s vs Q4_K 105 GE/s.
+Alternatively: precompute `act[]` via a fast batch activation and
+pass a float input to a future `q6k_matvec_f32in` kernel (avoids
+the per-row `tanh` recomputation entirely while still fusing
+dispatch). ~50 LOC new shader.
 
 ### #2 — Coalesce per-layer command encoders (open)
 

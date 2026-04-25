@@ -97,11 +97,14 @@ pub fn encode_gated(
     // dispatch entirely, fuse activation into down.
     //
     // Q6_K fields on `FusedGegluDown` are present (kernels built and
-    // parity-tested) but **deliberately not routed here**: empirical
-    // regression on production gemma3-4b-q4k-v2 (~8 %) — see decode/
-    // encode_ffn.rs for the full analysis. Re-enable once the Q6_K
-    // shader gains threadgroup-memory caching of gate/up per
-    // superblock (ROADMAP P0 #1).
+    // parity-tested) but **deliberately not routed here**. With
+    // GELU-tanh activation the fused kernel recomputes tanh() N=hidden
+    // times per input element (once per output row) vs once in the
+    // separated `geglu_gelu_tanh` dispatch. At N=2560 (Gemma 3 4B) the
+    // extra 2560× tanh cost regresses decode 67.9→62.2 tok/s regardless
+    // of TG-memory caching (gate/up bandwidth was never the bottleneck).
+    // Re-enable when a cheaper activation variant or act[] precompute
+    // avoids the per-row tanh explosion.
     let fused_kernel = match (down_format, activation) {
         (crate::QuantFormat::Q4_K, Activation::SiLU)      => fused_down.q4k_silu,
         (crate::QuantFormat::Q4_K, Activation::GeluTanh)  => fused_down.q4k_gelu_tanh,
