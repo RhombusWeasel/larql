@@ -2,12 +2,21 @@
 
 ## Current State
 
-- 167 unit tests + 137 integration tests passing, 0 build warnings
+- 173 unit tests + 148 integration tests passing on `larql-vindex`
+  (321 total, all green); 211 on `larql-models`
+- Folder layout: `index/{storage,compute,mutate}/`,
+  `format/{huggingface,weights}/` decomposed; no .rs file > 750 lines
+- Quant dispatch via `quant::registry` — adding the next format is one
+  table entry, not eight match-arm edits
+- Filename literals centralised in `format::filenames`
+  (244 occurrences → one constant module)
 - 3 storage formats: f32, Q8, Q4_K/Q6_K (Ollama-compatible)
 - Mmap zero-copy with adaptive residency
 - HNSW graph index wired into `gate_knn` (opt-in via `--hnsw`)
 - Q4_K dequant cache LRU-bounded via `--max-q4k-cache-layers`
 - Patch system for editable knowledge
+- `make coverage` + `make coverage-summary` ready (`cargo-llvm-cov`
+  install required)
 
 ## P0: Code-quality cleanup (2026-04-25 audit)
 
@@ -60,28 +69,24 @@ and migrate callers.
 
 ## P1: Modularity + test depth
 
-### Split `index/` along storage / compute / mutate seams — PARTIAL
+### Split `index/` along storage / compute / mutate seams — DONE
 **Impact**: Unblocks the god-struct extraction; no behaviour change
-**Effort**: Medium (move-only) for the directory creation; impl-block
-surgery for gate.rs/walk.rs is a separate pass.
-**Status**: ✅ Pass 1+2 complete (2026-04-25); gate.rs / walk.rs split
-deferred as P1-1b.
+**Effort**: Medium total (file moves + impl-block surgery)
+**Status**: ✅ Complete (2026-04-25)
 
-Done:
-- `storage/` (mmap loaders, decode caches, residency)
-- `compute/` (HNSW, MoE router)
+What landed:
+- `storage/` (mmap loaders, decode caches, residency, FFN store, gate
+  store, attn, lm_head, FP4 storage)
+- `compute/` (gate KNN dispatch, HNSW, MoE router, Q4_K codec dispatch)
 - `mutate/` (INSERT/DELETE, NDJSON loaders, persistence)
-- 9 files moved (`residency`, `hnsw`, `router`, `accessors`, `attn`,
-  `lm_head`, `fp4_storage`, `mutate`, `loaders`)
-- 321 tests pass; backwards-compatible re-exports keep
-  `crate::index::{hnsw,attn,lm_head,…}` resolving
-
-Remaining (P1-1b):
-- `gate.rs` (992 L) → split into `compute/gate_knn.rs` +
-  `storage/gate_store.rs` (resolve_gate / mmap fast path / LRU)
-- `walk.rs` (862 L) → split into `storage/ffn_store.rs` (mmap +
-  prefetch) + `compute/q4k_dispatch.rs` (matmul/row helpers via
-  the new registry)
+- 11 files moved + 4 net new (`gate_store`, `ffn_store`,
+  `q4k_dispatch`, plus the existing `gate_knn`)
+- gate.rs (992) → `compute/gate_knn.rs` (615) + `storage/gate_store.rs`
+  (446)
+- walk.rs (862) → `storage/ffn_store.rs` (720) +
+  `compute/q4k_dispatch.rs` (168)
+- All 321 tests pass; backwards-compatible aliases on `index/mod.rs`
+  keep external paths resolving
 
 `index/` is partitioned by *operation* (`gate.rs`, `walk.rs`, `attn.rs`,
 `lm_head.rs`) but those files mix mmap slicing, KNN compute, and
@@ -109,7 +114,16 @@ index/
 ### `VectorIndex` god struct → composed substores
 **Impact**: 35+ Option<Arc<Mmap>> fields collapse to four typed stores
 **Effort**: Large
-**Status**: Blocked by index/ split
+**Status**: Unblocked by P1-1 — still pending. Touching every method
+that reads `self.*_mmap` directly is the hard part; the substore
+shapes themselves are easy. Sequence:
+1. Define `GateStore` / `FfnStore` / `ProjectionStore` /
+   `MetadataStore` in `index/storage/` next to their existing
+   modules.
+2. Embed them on `VectorIndex` and migrate read sites one at a time
+   (gate first, then ffn, then projections — each is an isolated PR).
+3. Slim `VectorIndex::empty` and the Clone impl to delegate.
+4. Update `gate_trait.rs` to delegate through the stores.
 
 ```rust
 pub struct VectorIndex {
@@ -161,25 +175,21 @@ queries, cap=4, 60 layers, observe never > 4).
 
 ## P2: Ergonomics + cosmetics
 
-### Split oversized files
-- `format/huggingface.rs` (1366 L) → `huggingface/{download,publish,cache,discovery}.rs`
-- `format/weights/write.rs` (1249 L) → `weights/{write_f32,write_q4_0,write_q4k}.rs`
-- `larql-models/src/quant/ggml.rs` (1352 L) → `quant/ggml/{q4_0,q4_k,q6_k,q8}.rs`
+### Split oversized files — DONE
+- ✅ `format/huggingface.rs` (1366) → `huggingface/{mod,download,publish,discovery}.rs`
+- ✅ `format/weights/write.rs` (1249) → `weights/{write_f32,write_q4k}.rs`
+- ✅ `larql-models/src/quant/ggml.rs` (1352) → `quant/ggml/{mod,legacy,q4_k,q6_k,quantize}.rs`
 
-Move-only; mirrors the registry shape.
+### Naming pass — one referent per format concept — DONE
+- ✅ Rust types: `Q4K` (was 8 × `Q4k` before, all renamed)
+- ✅ Snake-case identifiers: `q4k`
+- ✅ Serialized strings: `"Q4_K"` (only in registry)
 
-### Naming pass — one referent per format concept
-- Rust types: `Q4K` (no `Q4k`)
-- Snake-case identifiers: `q4k`
-- Serialized strings: `"Q4_K"` (only in registry)
-
-Today `Q4k`, `Q4K`, and `q4k` all appear in the same crate for the
-same format. Workspace-wide find-and-replace.
-
-### Coverage tooling
-Add `cargo-llvm-cov` (or tarpaulin) + `make coverage` target. Output
-to `coverage/`. No CI integration yet — local-only is fine. Makes the
-next coverage audit data-driven instead of grep-based.
+### Coverage tooling — DONE
+- ✅ `make coverage` — HTML report under `coverage/`
+- ✅ `make coverage-summary` — terminal-only digest
+- ✅ Both fail-fast with install hint when `cargo-llvm-cov` is missing
+- Override scope with `make coverage CRATE=larql-models`
 
 ## P0: Decode-path performance
 

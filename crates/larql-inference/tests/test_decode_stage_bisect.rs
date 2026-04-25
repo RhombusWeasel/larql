@@ -123,7 +123,7 @@ fn check_stage_bisect(case: &StageCase) -> Result<(), String> {
     let mut cb = SilentLoadCallbacks;
     let cfg = load_vindex_config(&vindex_path)
         .map_err(|e| format!("load_vindex_config: {e}"))?;
-    if cfg.quant != QuantFormat::Q4k {
+    if cfg.quant != QuantFormat::Q4K {
         return Err(format!("expected Q4K vindex, got {:?}", cfg.quant));
     }
     let tokenizer = load_vindex_tokenizer(&vindex_path)

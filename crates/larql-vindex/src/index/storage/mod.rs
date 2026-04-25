@@ -7,7 +7,9 @@
 
 pub mod accessors;
 pub mod attn;
+pub mod ffn_store;
 pub mod fp4_storage;
+pub mod gate_store;
 pub mod lm_head;
 pub mod residency;
 

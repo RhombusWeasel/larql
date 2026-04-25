@@ -169,3 +169,113 @@ pub fn read_buffer_f32(buf: &metal::Buffer, len: usize) -> Vec<f32> {
     // has completed (caller invariant). Data is immediately copied to Vec.
     unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev() -> Option<Device> { Device::system_default() }
+
+    /// `get_f32` caches by (pointer, len). The same slice handed in
+    /// twice must return the same Buffer (one allocation, two clones).
+    #[test]
+    fn get_f32_caches_by_slice_identity() {
+        let Some(d) = dev() else { return; };
+        let cache = BufferCache::new(&d);
+        let data = vec![1.0f32, 2.0, 3.0, 4.0];
+        assert_eq!(cache.len(), 0);
+        let b1 = cache.get_f32(&data);
+        let b2 = cache.get_f32(&data);
+        assert_eq!(cache.len(), 1, "second call must hit cache, not allocate");
+        // Same underlying GPU buffer.
+        assert_eq!(b1.gpu_address(), b2.gpu_address());
+    }
+
+    /// Distinct slices → distinct cache entries even if contents
+    /// happen to be byte-identical (cache key is pointer+len, not value).
+    #[test]
+    fn get_f32_distinct_slices_get_distinct_buffers() {
+        let Some(d) = dev() else { return; };
+        let cache = BufferCache::new(&d);
+        let a = vec![1.0f32; 16];
+        let b = vec![1.0f32; 16];
+        let _ = cache.get_f32(&a);
+        let _ = cache.get_f32(&b);
+        assert_eq!(cache.len(), 2);
+    }
+
+    /// Empty f32 slice → reused 4-byte stub. Metal rejects 0-length
+    /// allocations, so the cache returns a single shared stub buffer.
+    #[test]
+    fn get_f32_empty_slice_returns_shared_stub() {
+        let Some(d) = dev() else { return; };
+        let cache = BufferCache::new(&d);
+        let empty: Vec<f32> = vec![];
+        let b1 = cache.get_f32(&empty);
+        let b2 = cache.get_f32(&empty);
+        assert_eq!(cache.len(), 1, "empty slices share one stub");
+        assert_eq!(b1.length(), 4);
+        assert_eq!(b1.gpu_address(), b2.gpu_address());
+    }
+
+    /// `get_bytes` empty stub keyed separately from `get_f32` empty
+    /// stub (cache keys are different — `(0,0)` vs `(1,0)`).
+    #[test]
+    fn empty_f32_and_empty_bytes_have_separate_stubs() {
+        let Some(d) = dev() else { return; };
+        let cache = BufferCache::new(&d);
+        let _ = cache.get_f32(&[][..]);
+        let _ = cache.get_bytes(&[][..]);
+        assert_eq!(cache.len(), 2, "f32 and bytes empty stubs are independent cache entries");
+    }
+
+    /// `transient_from_*` does NOT cache. Ten calls = ten allocations.
+    #[test]
+    fn transient_buffers_are_not_cached() {
+        let Some(d) = dev() else { return; };
+        let cache = BufferCache::new(&d);
+        let data = vec![0.0f32; 64];
+        let _b1 = cache.transient_from_f32(&data);
+        let _b2 = cache.transient_from_f32(&data);
+        assert_eq!(cache.len(), 0, "transient calls must not touch the cache");
+    }
+
+    /// `output(bytes)` returns a buffer of at least the requested
+    /// size (Metal may round up but never under).
+    #[test]
+    fn output_buffer_is_at_least_requested_size() {
+        let Some(d) = dev() else { return; };
+        let cache = BufferCache::new(&d);
+        let buf = cache.output(1024);
+        assert!(buf.length() >= 1024);
+        let buf2 = cache.output(1024);
+        assert_eq!(cache.len(), 0, "output() does not cache");
+        // Distinct allocations (different gpu_address).
+        assert_ne!(buf.gpu_address(), buf2.gpu_address());
+    }
+
+    /// `read_buffer_f32` round-trips bytes written via the contents
+    /// pointer of a `transient_from_f32` buffer. Pin the
+    /// "buffer-finished → CPU read" contract.
+    #[test]
+    fn read_buffer_f32_round_trip() {
+        let Some(d) = dev() else { return; };
+        let cache = BufferCache::new(&d);
+        let src: Vec<f32> = (0..16).map(|i| i as f32 * 0.5).collect();
+        let buf = cache.transient_from_f32(&src);
+        let got = read_buffer_f32(&buf, src.len());
+        assert_eq!(got, src);
+    }
+
+    /// `read_buffer_f32` panics on an undersized buffer.
+    #[test]
+    #[should_panic(expected = "Metal buffer too small")]
+    fn read_buffer_f32_panics_when_buffer_undersized() {
+        let Some(d) = dev() else {
+            panic!("Metal buffer too small"); // simulate the failure on non-Metal hosts
+        };
+        let cache = BufferCache::new(&d);
+        let buf = cache.output(4); // 1 f32
+        let _ = read_buffer_f32(&buf, 100); // ask for 100 → must panic
+    }
+}

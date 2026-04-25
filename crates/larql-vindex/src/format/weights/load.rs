@@ -17,7 +17,7 @@ use crate::format::filenames::*;
 use crate::format::load::load_vindex_config;
 use crate::index::core::IndexLoadCallbacks;
 
-use super::write::WeightEntry;
+use super::write_f32::WeightEntry;
 
 /// Options for [`load_model_weights_with_opts`]. Filter which
 /// component tensors are actually mmap'd + decoded at load time —
@@ -355,7 +355,7 @@ pub fn load_model_weights_q4k(
             "vindex does not contain model weights. Rebuild with --level all --quant q4k".into(),
         ));
     }
-    if config.quant != crate::QuantFormat::Q4k {
+    if config.quant != crate::QuantFormat::Q4K {
         return Err(VindexError::Parse(format!(
             "load_model_weights_q4k expects a Q4_K vindex, got quant={}",
             config.quant,

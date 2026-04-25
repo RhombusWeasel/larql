@@ -62,26 +62,6 @@ fn cpu_rope_at_pos(
     }
 }
 
-/// CPU reference: per-position RoPE on a `[seq_len, num_heads * head_dim]`
-/// matrix, in place. Each (pos, head) gets its own rotation by
-/// `pos * freq(i)`.
-fn cpu_rope_apply_seq(
-    x: &mut [f32],
-    seq_len: usize,
-    num_heads: usize,
-    head_dim: usize,
-    rotary_dim: usize,
-    base: f32,
-) {
-    for pos in 0..seq_len {
-        for h in 0..num_heads {
-            let off = pos * num_heads * head_dim + h * head_dim;
-            let head = &mut x[off..off + head_dim];
-            cpu_rope_at_pos(head_dim, rotary_dim, base, pos, head);
-        }
-    }
-}
-
 /// CPU reference for the batched form used by decode: rotate every
 /// head of a `[num_heads, head_dim]` flat buffer at the same position.
 fn cpu_rope_at_pos_batched(

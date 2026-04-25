@@ -92,9 +92,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Verify vindex is Q4_K ──
     let config = load_vindex_config(&vindex_path)?;
-    if config.quant != QuantFormat::Q4k {
+    if config.quant != QuantFormat::Q4K {
         return Err(format!(
-            "vindex quant is {:?}, expected Q4k — use remote_walk_parity.rs for float vindexes",
+            "vindex quant is {:?}, expected Q4K — use remote_walk_parity.rs for float vindexes",
             config.quant
         ).into());
     }

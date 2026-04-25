@@ -79,7 +79,7 @@ impl LoadedModel {
         // Q4_K vindexes take a dedicated loader that produces a ModelWeights
         // with empty attn/FFN tensors (those live in the Q4K mmap files).
         // The walk-ffn endpoint dequantises FFN per layer on demand.
-        let weights = if self.config.quant == larql_vindex::QuantFormat::Q4k {
+        let weights = if self.config.quant == larql_vindex::QuantFormat::Q4K {
             if self.ffn_only {
                 tracing::info!(
                     "ffn-only (q4k): loading norms + lm_head + embed only; \
@@ -213,7 +213,7 @@ mod loaded_model_tests {
     //! Unit tests for `LoadedModel` field/flag plumbing.
     //!
     //! The q4k / f32 branch in `get_or_load_weights` keys off
-    //! `config.quant == QuantFormat::Q4k`, and `run_full_output` in
+    //! `config.quant == QuantFormat::Q4K`, and `run_full_output` in
     //! `routes/walk_ffn.rs` keys off the same check to decide between
     //! `WalkFfn::new_unlimited` and `q4k_ffn_forward_layer`. Running
     //! either branch end-to-end needs a real on-disk vindex (GBs of
@@ -305,15 +305,15 @@ mod loaded_model_tests {
     fn quant_format_selects_q4k_branch() {
         // Exact selector used in both `get_or_load_weights` and
         // `run_full_output` to pick the q4k path.
-        let q4k_model = tiny_loaded_model(QuantFormat::Q4k, false);
+        let q4k_model = tiny_loaded_model(QuantFormat::Q4K, false);
         let f32_model = tiny_loaded_model(QuantFormat::None, false);
 
         assert!(
-            q4k_model.config.quant == QuantFormat::Q4k,
-            "Q4k config → q4k branch (load_model_weights_q4k + q4k_ffn_forward_layer)"
+            q4k_model.config.quant == QuantFormat::Q4K,
+            "Q4K config → q4k branch (load_model_weights_q4k + q4k_ffn_forward_layer)"
         );
         assert!(
-            f32_model.config.quant != QuantFormat::Q4k,
+            f32_model.config.quant != QuantFormat::Q4K,
             "None config → f32 branch (load_model_weights_with_opts + WalkFfn::new_unlimited)"
         );
     }

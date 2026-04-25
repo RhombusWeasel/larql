@@ -1,0 +1,59 @@
+# Bench regression detector — runs `make bench-check` on every PR
+# against a baseline saved on `main`. Fails the workflow if any cell
+# in `benches/quant_matvec` regresses past Criterion's noise threshold.
+#
+# This is a starter template; uncomment + adjust when you adopt CI.
+# The quant_matvec suite covers Q4_0 / Q4_K / Q4_KF / Q6_K × 3 shapes ×
+# CPU/Metal — that's the surface where the next throughput cliff would
+# show up first.
+
+name: bench-regress
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  bench:
+    # Metal benches need an Apple Silicon host. Without one, drop
+    # `--features metal` from the Makefile target so the CPU-only
+    # cells run on any GitHub-hosted runner.
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # need both PR head and main for baseline diff
+
+      - name: Cache cargo + criterion baselines
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-bench-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Save baseline (main only)
+        if: github.ref == 'refs/heads/main'
+        run: make bench-save
+
+      - name: Check vs baseline (PRs only)
+        if: github.event_name == 'pull_request'
+        run: |
+          # Restore baseline from main's last cache, then re-run.
+          # If the cache is cold, the bench-check step prints a clear
+          # "no baseline found" message and exits 2 — treat that as
+          # neutral (don't fail the PR on a missing baseline).
+          set +e
+          make bench-check
+          rc=$?
+          set -e
+          if [ "$rc" -eq 2 ]; then
+            echo "::warning::no baseline cached; skipping regression check"
+            exit 0
+          fi
+          exit "$rc"

@@ -7,10 +7,10 @@
 //!
 //! Two independent HF-matching operations happen here:
 //!   1. **Outer post-FFN norm** on `(h1 + h2)`, then residual add. Matches:
-//!        `hidden = residual + post_feedforward_layernorm(h1 + h2)`
+//!      `hidden = residual + post_feedforward_layernorm(h1 + h2)`
 //!   2. **Whole-layer `layer_scalar` multiplication** on the entire output.
 //!      Matches HF's final step in `Gemma4TextDecoderLayer.forward`:
-//!        `hidden_states *= self.layer_scalar`
+//!      `hidden_states *= self.layer_scalar`
 //!      NB: this multiplies `h_post_attn + ffn_delta` — not just the FFN
 //!      delta — which is why folding `layer_scalar` into the outer-norm
 //!      scale was wrong (prior bug: 14× mis-scaling on 26B A4B collapsed

@@ -373,7 +373,7 @@ fn run_with_vindex_weights(
     // reconstruct the float ModelWeights), so we branch on `config.quant`
     // BEFORE calling it to avoid a confusing error for Q4 users.
     let cfg = larql_vindex::load_vindex_config(vindex_path)?;
-    if cfg.quant == larql_vindex::QuantFormat::Q4k {
+    if cfg.quant == larql_vindex::QuantFormat::Q4K {
         let mut weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut *cb)?;
         let tokenizer = load_vindex_tokenizer(vindex_path)?;
         vlog!(

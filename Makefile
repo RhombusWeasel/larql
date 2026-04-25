@@ -1,4 +1,4 @@
-.PHONY: build release test check clean fmt lint demos
+.PHONY: build release test check clean fmt lint demos bench bench-save bench-check coverage coverage-summary
 
 # Build
 build:
@@ -31,6 +31,23 @@ ci: fmt-check lint test
 # Clean
 clean:
 	cargo clean
+
+# Benchmarks
+#
+# `bench` runs the full quant_matvec suite and writes HTML reports under
+# `target/criterion/`. `bench-save` records a baseline named `main`;
+# `bench-check` re-runs and fails if any cell regresses past Criterion's
+# default noise threshold. Plug `bench-check` into CI to catch the next
+# 4× throughput cliff (the kind the q4_matvec_v4 row-drop bug caused) at
+# PR time, not at goldens-fail time weeks later.
+bench:
+	cargo bench -p larql-compute --bench quant_matvec --features metal
+
+bench-save:
+	bash scripts/bench-regress.sh save
+
+bench-check:
+	bash scripts/bench-regress.sh check
 
 # Demos
 demos:
@@ -68,6 +85,27 @@ bench-vindex-scaling:
 	cargo bench -p larql-vindex --bench vindex_scaling
 
 bench-all: bench-core bench-inference bench-vindex
+
+# Coverage — uses cargo-llvm-cov (install with `cargo install cargo-llvm-cov`).
+# Writes an HTML report to coverage/ that can be opened in a browser.
+# Scoped to larql-vindex by default since the audit owner cares about
+# that crate; pass CRATE=… to scope elsewhere.
+COVERAGE_CRATE ?= larql-vindex
+coverage:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package $(COVERAGE_CRATE) --html --output-dir coverage
+	@echo "Report: coverage/html/index.html"
+
+coverage-summary:
+	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		echo "cargo-llvm-cov not installed."; \
+		exit 1; \
+	fi
+	cargo llvm-cov --package $(COVERAGE_CRATE) --summary-only
 
 # Python extension (managed via uv)
 python-setup:

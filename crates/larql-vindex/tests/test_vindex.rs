@@ -2396,13 +2396,13 @@ fn streaming_extract_from_safetensors() {
     let _ = std::fs::remove_dir_all(&output_dir);
 }
 
-// ─── streaming_extract with QuantFormat::Q4k ────────────────────
+// ─── streaming_extract with QuantFormat::Q4K ────────────────────
 //
 // End-to-end coverage for `write_model_weights_q4k`:
 //   - Manifest shape: attn has 4 entries per layer, FFN has 3;
 //     V and down carry Q6_K, everything else Q4_K.
 //   - Offsets tile start-to-end with no gaps.
-//   - `config.quant = Q4k` and `has_model_weights = true` land in
+//   - `config.quant = Q4K` and `has_model_weights = true` land in
 //     `index.json` so loaders can dispatch without sniffing files.
 //   - The non-Q4 `attn_weights.bin` / `interleaved.bin` are absent.
 #[test]
@@ -2503,7 +2503,7 @@ fn streaming_extract_q4k_from_safetensors() {
     std::fs::write(model_dir.join("tokenizer.json"), tok_json).unwrap();
     let tokenizer = larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
 
-    // Run with QuantFormat::Q4k — also verifies the Browse-level auto-
+    // Run with QuantFormat::Q4K — also verifies the Browse-level auto-
     // promotion to "all" that the streaming extractor applies when
     // quant != None.
     let mut cb = larql_vindex::SilentBuildCallbacks;
@@ -2515,7 +2515,7 @@ fn streaming_extract_q4k_from_safetensors() {
         5,
         larql_vindex::ExtractLevel::Browse,
         larql_vindex::StorageDtype::F32,
-        QuantFormat::Q4k,
+        QuantFormat::Q4K,
         larql_vindex::WriteWeightsOptions::default(),
         larql_vindex::Q4kWriteOptions::default(),
         false,
@@ -2532,7 +2532,7 @@ fn streaming_extract_q4k_from_safetensors() {
     assert!(output_dir.join("weight_manifest.json").exists());
     assert!(output_dir.join("index.json").exists());
 
-    // Q4k path writes its own filenames; the non-Q4 names should be absent.
+    // Q4K path writes its own filenames; the non-Q4 names should be absent.
     assert!(
         !output_dir.join("attn_weights.bin").exists(),
         "Q4 path should not emit attn_weights.bin"
@@ -2541,7 +2541,7 @@ fn streaming_extract_q4k_from_safetensors() {
     // ── Config schema ──
     let cfg = larql_vindex::load_vindex_config(&output_dir).unwrap();
     assert_eq!(cfg.num_layers, num_layers);
-    assert_eq!(cfg.quant, QuantFormat::Q4k, "config.quant must be Q4k");
+    assert_eq!(cfg.quant, QuantFormat::Q4K, "config.quant must be Q4K");
     assert!(cfg.has_model_weights, "config.has_model_weights must flip true");
 
     // ── attn manifest ──
@@ -2632,13 +2632,13 @@ fn streaming_extract_q4k_from_safetensors() {
         "interleaved_q4k.bin size must equal sum of manifest lengths"
     );
 
-    // ── load_model_weights on a Q4k vindex must surface a clear error ──
+    // ── load_model_weights on a Q4K vindex must surface a clear error ──
     // The float-weight loader can't reconstruct a ModelWeights struct
     // from Q4_K/Q6_K blocks; callers must go through
     // `VectorIndex::load_attn_q4k` / `load_interleaved_q4k` instead.
     let mut lcb = larql_vindex::SilentLoadCallbacks;
     match larql_vindex::load_model_weights(&output_dir, &mut lcb) {
-        Ok(_) => panic!("load_model_weights on a Q4k vindex must error"),
+        Ok(_) => panic!("load_model_weights on a Q4K vindex must error"),
         Err(e) => {
             let msg = e.to_string();
             assert!(
@@ -2735,7 +2735,7 @@ fn quant_block_format_serde_roundtrip() {
     // expect the literal "Q4_K" and "Q6_K" on the wire. The enum uses
     // #[serde(rename)] to keep those strings; a future refactor must
     // not drift to e.g. "Q4K" without also updating every reader.
-    use larql_vindex::format::weights::write::QuantBlockFormat;
+    use larql_vindex::format::weights::write_q4k::QuantBlockFormat;
     let q4 = serde_json::to_string(&QuantBlockFormat::Q4K).unwrap();
     let q6 = serde_json::to_string(&QuantBlockFormat::Q6K).unwrap();
     assert_eq!(q4, "\"Q4_K\"");
@@ -3355,7 +3355,7 @@ fn streaming_extract_q4k_carries_ple_tensors() {
         5,
         larql_vindex::ExtractLevel::Browse,
         larql_vindex::StorageDtype::F32,
-        QuantFormat::Q4k,
+        QuantFormat::Q4K,
         larql_vindex::WriteWeightsOptions::default(),
         larql_vindex::Q4kWriteOptions::default(),
         false,
@@ -3588,7 +3588,7 @@ fn streaming_extract_preserves_per_layer_intermediate_for_variable_ffn() {
         5,
         larql_vindex::ExtractLevel::Browse,
         larql_vindex::StorageDtype::F32,
-        QuantFormat::Q4k,
+        QuantFormat::Q4K,
         larql_vindex::WriteWeightsOptions::default(),
         larql_vindex::Q4kWriteOptions::default(),
         false,

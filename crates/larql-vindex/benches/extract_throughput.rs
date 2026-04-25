@@ -1,7 +1,7 @@
 //! Streaming-extract throughput bench.
 //!
 //! Compares `build_vindex_streaming` with `QuantFormat::None` (f32
-//! write path) vs `QuantFormat::Q4k` (streaming quantise) on a
+//! write path) vs `QuantFormat::Q4K` (streaming quantise) on a
 //! single-layer synthetic safetensors fixture shaped like a real LLM.
 //!
 //! The headline this bench produces: how long does the one-pass Q4_K
@@ -117,7 +117,7 @@ fn bench_extract_throughput(c: &mut Criterion) {
 
     for (tag, quant) in [
         ("f32", QuantFormat::None),
-        ("q4k", QuantFormat::Q4k),
+        ("q4k", QuantFormat::Q4K),
     ] {
         let out_dir = bench_root.join(format!("out_{tag}"));
         group.bench_with_input(BenchmarkId::from_parameter(tag), &quant, |b, &q| {

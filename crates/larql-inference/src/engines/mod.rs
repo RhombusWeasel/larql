@@ -106,16 +106,18 @@ impl EngineKind {
 
     /// Build a boxed engine, dispatching compute through `backend`.
     pub fn build(self, backend: Box<dyn ComputeBackend>) -> Box<dyn KvEngine> {
+        self.build_with_profiling(backend, false)
+    }
+
+    /// Build a boxed engine with optional per-stage decode profiling.
+    pub fn build_with_profiling(self, backend: Box<dyn ComputeBackend>, profiling: bool) -> Box<dyn KvEngine> {
         match self {
             EngineKind::MarkovResidual { window_size } => {
-                Box::new(markov_residual::MarkovResidualEngine::with_backend(
-                    window_size, backend,
-                ))
+                Box::new(markov_residual::MarkovResidualEngine::with_backend(window_size, backend)
+                    .with_profiling(profiling))
             }
             EngineKind::UnlimitedContext { window_size } => {
-                Box::new(unlimited_context::UnlimitedContextEngine::with_backend(
-                    window_size, backend,
-                ))
+                Box::new(unlimited_context::UnlimitedContextEngine::with_backend(window_size, backend))
             }
         }
     }

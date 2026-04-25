@@ -152,8 +152,8 @@ fn run_case(
 
     let cfg = larql_vindex::load_vindex_config(vindex_path)
         .map_err(|e| format!("load_vindex_config: {e}"))?;
-    if cfg.quant != QuantFormat::Q4k {
-        return Err(format!("only Q4k vindexes are supported by this suite (got {:?})", cfg.quant));
+    if cfg.quant != QuantFormat::Q4K {
+        return Err(format!("only Q4K vindexes are supported by this suite (got {:?})", cfg.quant));
     }
 
     let mut weights = load_model_weights_q4k(vindex_path, &mut cb)

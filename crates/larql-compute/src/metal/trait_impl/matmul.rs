@@ -69,14 +69,15 @@ impl MetalBackend {
         let x_buf = self.bufs.transient_from_f32(x);
         let out_buf = self.bufs.output((n * 4) as u64);
 
-        use crate::metal::shaders::f32_gemv as sh;
+        // Geometry travels with the f32_gemv KernelHandle.
+        let kernel = &self.f32_gemv_pipeline;
         let n_u32 = n as u32;
         let k_u32 = k as u32;
-        let num_tgs = (n as u64).div_ceil(sh::ROWS_PER_TG);
+        let num_tgs = (n as u64).div_ceil(kernel.rows_per_tg);
 
         let cmd = self.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.f32_gemv_pipeline);
+        enc.set_compute_pipeline_state(&kernel.state);
         enc.set_buffer(0, Some(&w_buf), 0);
         enc.set_buffer(1, Some(&x_buf), 0);
         enc.set_buffer(2, Some(&out_buf), 0);
@@ -84,7 +85,7 @@ impl MetalBackend {
         enc.set_bytes(4, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
         enc.dispatch_thread_groups(
             metal::MTLSize::new(num_tgs, 1, 1),
-            metal::MTLSize::new(sh::THREADS_PER_TG, 1, 1),
+            metal::MTLSize::new(kernel.threads_per_tg, 1, 1),
         );
         enc.end_encoding();
         cmd.commit();
@@ -100,14 +101,15 @@ impl MetalBackend {
         let x_buf = self.bufs.transient_from_f32(x);
         let out_buf = self.bufs.output((n * 4) as u64);
 
-        use crate::metal::shaders::f16_gemv as sh;
+        // Geometry travels with the f16_gemv KernelHandle.
+        let kernel = &self.f16_gemv_pipeline;
         let n_u32 = n as u32;
         let k_u32 = k as u32;
-        let num_tgs = (n as u64).div_ceil(sh::ROWS_PER_TG);
+        let num_tgs = (n as u64).div_ceil(kernel.rows_per_tg);
 
         let cmd = self.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.f16_gemv_pipeline);
+        enc.set_compute_pipeline_state(&kernel.state);
         enc.set_buffer(0, Some(&w_buf), 0);
         enc.set_buffer(1, Some(&x_buf), 0);
         enc.set_buffer(2, Some(&out_buf), 0);
@@ -115,7 +117,7 @@ impl MetalBackend {
         enc.set_bytes(4, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
         enc.dispatch_thread_groups(
             metal::MTLSize::new(num_tgs, 1, 1),
-            metal::MTLSize::new(sh::THREADS_PER_TG, 1, 1),
+            metal::MTLSize::new(kernel.threads_per_tg, 1, 1),
         );
         enc.end_encoding();
         cmd.commit();

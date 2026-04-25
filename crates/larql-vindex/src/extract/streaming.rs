@@ -41,13 +41,13 @@ pub fn build_vindex_streaming(
     weight_opts: crate::format::weights::WriteWeightsOptions,
     q4k_opts: crate::format::weights::Q4kWriteOptions,
     // Skip writing `gate_vectors.bin` entirely. Only valid when
-    // `quant == Q4k` — the loader synthesizes gate from Q4K at load
+    // `quant == Q4K` — the loader synthesizes gate from Q4K at load
     // time. Refused otherwise because without a Q4K interleaved file
     // the gate would be unrecoverable.
     drop_gate_vectors: bool,
     callbacks: &mut dyn IndexBuildCallbacks,
 ) -> Result<(), VindexError> {
-    if drop_gate_vectors && quant != QuantFormat::Q4k {
+    if drop_gate_vectors && quant != QuantFormat::Q4K {
         return Err(VindexError::Parse(
             "--drop-gate-vectors requires --quant q4k (the loader rebuilds gate from Q4K)".into(),
         ));
@@ -544,7 +544,7 @@ pub fn build_vindex_streaming(
                     &streaming_source, output_dir, callbacks, level_opts,
                 )?;
             }
-            QuantFormat::Q4k => {
+            QuantFormat::Q4K => {
                 // Q4K doesn't write `up_weights.bin` / `down_weights.bin`
                 // at all — the FFN weights live in `interleaved_q4k.bin`.
                 // `ffn_compact` is a no-op here by construction. Level

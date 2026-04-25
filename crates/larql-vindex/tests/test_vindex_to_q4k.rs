@@ -270,7 +270,7 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
 
     // ── Manifest ──
     let dst_cfg = larql_vindex::load_vindex_config(&dst_dir).unwrap();
-    assert_eq!(dst_cfg.quant, QuantFormat::Q4k);
+    assert_eq!(dst_cfg.quant, QuantFormat::Q4K);
     assert!(dst_cfg.has_model_weights);
     assert!(dst_cfg.checksums.is_none(), "checksums must be cleared (source's no longer apply)");
 

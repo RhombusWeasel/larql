@@ -6,6 +6,19 @@
 //! matrix operations. Every LARQL crate (inference, vindex) uses this trait —
 //! the caller never knows whether the operation runs on CPU or GPU.
 //!
+//! ## Trait split
+//!
+//! `ComputeBackend` is the umbrella trait every caller takes as
+//! `&dyn ComputeBackend`. It supertraits four narrower traits, each in
+//! its own module:
+//!
+//! - [`MatMul`] — f32 / f16 matmul, gemv, batch matmul
+//! - [`QuantMatVec`] — unified `quant_matvec` + per-format pre-quantised helpers
+//! - [`DecodeBackend`] — KV-cached decode + prefill + MoE hook
+//! - umbrella `ComputeBackend` — `name`, `device_info`, [`Capability`] probe
+//!
+//! `use larql_compute::prelude::*;` brings every sub-trait in scope at once.
+//!
 //! ## Backends
 //!
 //! | Backend | Feature | Operations |
@@ -17,11 +30,26 @@
 //! ## Quick start
 //!
 //! ```rust,no_run
-//! use larql_compute::{ComputeBackend, default_backend, cpu_backend, dot, norm, cosine};
+//! use larql_compute::prelude::*;
+//! use larql_compute::{default_backend, QuantFormat};
 //!
 //! let backend = default_backend();
-//! println!("Using: {}", backend.name());
+//! println!("Using: {} ({})", backend.name(), backend.device_info());
+//!
+//! // Branch on capability instead of probing for `Option::None`:
+//! if backend.supports(Capability::F32Gemv) {
+//!     // Specialised LM-head gemv is available on this backend.
+//! }
 //! ```
+//!
+//! ## Adding a quant format
+//!
+//! Adding e.g. FP4 = one [`QuantFormat`] variant + one match arm in
+//! [`QuantMatVec::quant_matvec`]'s default impl + one CPU kernel + one
+//! Metal shader. The Metal shader gets a `Kernel` marker (impl
+//! `metal::kernel::TiledKernel`) so its name + dispatch geometry travel
+//! with it via [`metal::kernel::KernelHandle`] — no parallel
+//! `shaders::*::ROWS_PER_TG` imports that could drift from the pipeline.
 //!
 //! ## Feature flags
 //!

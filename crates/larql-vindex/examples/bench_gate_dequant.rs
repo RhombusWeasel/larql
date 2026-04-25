@@ -97,9 +97,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = load_vindex_config(&vindex_path)?;
-    if config.quant != larql_vindex::QuantFormat::Q4k {
+    if config.quant != larql_vindex::QuantFormat::Q4K {
         return Err(format!(
-            "vindex quant is {}, expected Q4k — this benchmark is Q4K-specific",
+            "vindex quant is {}, expected Q4K — this benchmark is Q4K-specific",
             config.quant
         )
         .into());

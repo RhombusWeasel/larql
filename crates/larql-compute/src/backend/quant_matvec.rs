@@ -1,13 +1,19 @@
 //! `QuantMatVec` — quantised matrix × vector operations.
 //!
-//! [`Self::quant_matvec`] is the unified entry point — `out[N] = W[N, K] · x[K]`
-//! with `W` in any [`crate::QuantFormat`]. Adding a new quant format
-//! is one match arm in the default impl plus a kernel module.
+//! Two entry points by intent:
 //!
-//! The legacy per-format helpers (`q4_matvec`, `q4k_matvec`,
-//! `q6k_matvec`) stay around for hot-path callers that have already
-//! pre-quantised their input — but new callers should reach for
-//! `quant_matvec` (see ROADMAP P1a).
+//! - [`Self::quant_matvec`] — **the convenience API.** Takes f32
+//!   input, dispatches on [`crate::QuantFormat`], internally
+//!   quantises to Q8 for Q4_0 / Q8_0. New callers should reach for
+//!   this.
+//! - [`Self::q4_matvec`] / [`Self::q4k_matvec`] / [`Self::q6k_matvec`]
+//!   — **the pre-quantised-input fast path.** Hot decode paths
+//!   pre-quantise the layer's input once and reuse it across many
+//!   matvecs in that layer (gate, up, LM head, …). They take
+//!   already-Q8 inputs and skip the per-call quantisation.
+//!
+//! Adding a new quant format = `QuantFormat` variant + match arm in
+//! `quant_matvec` + per-format helper for the fast path.
 
 use crate::QuantFormat;
 
@@ -41,12 +47,13 @@ pub trait QuantMatVec {
         }
     }
 
-    // ── Per-format helpers ──
+    // ── Pre-quantised fast path ──
     //
     // These exist because the hot decode path pre-quantises its input
-    // once and reuses it across many gate/up matvecs in a layer; the
-    // unified `quant_matvec` re-quantises every call. Migration to a
-    // pre-quantised path on `quant_matvec` is its own follow-up.
+    // once and reuses it across many matvecs in a layer; the unified
+    // `quant_matvec` re-quantises every call. Use these when the
+    // caller already has Q8-quantised input on hand; reach for
+    // `quant_matvec` otherwise.
 
     /// Q4_0 × Q8 matvec. `Some` if the backend supports Q4_0.
     fn q4_matvec(

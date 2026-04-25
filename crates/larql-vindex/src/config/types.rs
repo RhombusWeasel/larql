@@ -41,7 +41,7 @@ pub struct VindexConfig {
     pub dtype: crate::config::dtype::StorageDtype,
     /// Quantisation format of the model weights written alongside this
     /// vindex. `None` means float storage controlled by `dtype`;
-    /// `Q4k` means Q4_K/Q6_K blocks in `attn_weights_q4k.bin` +
+    /// `Q4K` means Q4_K/Q6_K blocks in `attn_weights_q4k.bin` +
     /// `interleaved_q4k.bin`. Loaders dispatch on this field so they
     /// don't have to sniff filenames.
     #[serde(default)]
@@ -157,14 +157,14 @@ impl std::fmt::Display for ExtractLevel {
 pub enum QuantFormat {
     #[default]
     None,
-    Q4k,
+    Q4K,
 }
 
 impl std::fmt::Display for QuantFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::None => write!(f, "none"),
-            Self::Q4k => write!(f, "q4k"),
+            Self::Q4K => write!(f, "q4k"),
         }
     }
 }

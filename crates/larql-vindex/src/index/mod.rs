@@ -12,9 +12,7 @@
 
 pub mod types;
 pub mod core;
-mod gate;
 mod gate_trait;
-mod walk;
 #[cfg(test)]
 mod ffn_dispatch_tests;
 pub mod compute;

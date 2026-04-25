@@ -72,7 +72,7 @@ enum QuantizeCommand {
     ///
     /// Source must be extracted with `--level inference` or `--level all`
     /// (needs the full f32/f16 weights to quantise).
-    Q4k {
+    Q4K {
         /// Existing vindex directory (the source).
         #[arg(long)]
         input: PathBuf,
@@ -174,7 +174,7 @@ fn run_quantize(cmd: QuantizeCommand) -> Result<(), Box<dyn std::error::Error>> 
             compliance_floor, threshold,
             force, strict, no_sidecar, quiet,
         }),
-        QuantizeCommand::Q4k { input, output, down_q4k, force, quiet } => {
+        QuantizeCommand::Q4K { input, output, down_q4k, force, quiet } => {
             run_quantize_q4k(QuantizeQ4kOpts { input, output, down_q4k, force, quiet })
         }
     }

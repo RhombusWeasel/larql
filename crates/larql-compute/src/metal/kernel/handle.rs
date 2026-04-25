@@ -54,7 +54,7 @@ impl KernelHandle {
     ) -> Option<Self> {
         let f = library.get_function(kernel_name, None).ok()?;
         let state = device.new_compute_pipeline_state_with_function(&f).ok()?;
-        let cap = state.max_total_threads_per_threadgroup() as u64;
+        let cap = state.max_total_threads_per_threadgroup();
         if cap < threads_per_tg {
             eprintln!(
                 "[metal] kernel `{kernel_name}`: pipeline cap {cap} < requested \

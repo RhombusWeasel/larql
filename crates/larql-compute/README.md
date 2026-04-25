@@ -6,6 +6,21 @@ Hardware-accelerated compute backends for LARQL. CPU (BLAS + NEON Q4), Metal GPU
 
 Provides a `ComputeBackend` trait that abstracts all hardware-specific matrix operations. Every LARQL crate (inference, vindex) uses this trait — the caller never knows whether the operation runs on CPU or GPU.
 
+The trait is split into four sub-traits, each with its own focus:
+
+| Sub-trait | What's there |
+|---|---|
+| [`MatMul`](src/backend/matmul.rs) | f32 / f16 matmul, `matmul_transb`, `f32_gemv`, `f16_gemv`, batch matmul |
+| [`QuantMatVec`](src/backend/quant_matvec.rs) | unified `quant_matvec(format, …)` + per-format pre-quantised fast paths |
+| [`DecodeBackend`](src/backend/decode.rs) | KV-cached decode + multi-position prefill + MoE hook |
+| (umbrella) `ComputeBackend` | `name`, `device_info`, `Capability`-based feature probe |
+
+Most callers stay typed against `&dyn ComputeBackend`; `use larql_compute::prelude::*;` brings every sub-trait in scope at once.
+
+## Adding a new quant format
+
+Adding e.g. FP4 = one `QuantFormat` enum variant + one match arm in `QuantMatVec::quant_matvec`'s default impl + one CPU kernel + one Metal shader. The Metal shader gets a `Kernel` marker (impl `metal::kernel::TiledKernel`) so its name + dispatch geometry travel with it — no separate constants importing.
+
 ## Backends
 
 | Backend | Feature flag | f32 matmul | Quantized ops | Pipeline |
@@ -83,7 +98,7 @@ the shader source is small and the bench harness still exercises them).
 | Element-wise | **residual_add**, **scale_vector** | |
 | RoPE | **rope_apply** (prefill multi-pos), **rope_at_pos** (prefill stage), **rope_at_pos_batched** (decode) | All bit-equal at the production geometries |
 | Fused ops | **rms_norm_q8**, **residual_norm**, **residual_norm_q8** | Multi-op fusion |
-| Experimental / unwired | causal_attention, q4_matvec_v2/v3/v5, q4_sparse_matvec, q8_proj_rope, q4k_geglu_silu_down, q4k_geglu_gelu_tanh_down, v_norm (singleton), turboquant_encode/decode, graph_walk_knn | Kept compiled; not dispatched in production decode/prefill |
+| Experimental / unwired | causal_attention, q4_sparse_matvec, q8_proj_rope, q4k_geglu_silu_down, q4k_geglu_gelu_tanh_down, v_norm (singleton), turboquant_encode/decode, graph_walk_knn | Kept compiled; not dispatched in production decode/prefill |
 
 ## Safe Buffer Access
 
@@ -97,7 +112,8 @@ pub fn read_buffer_f32(buf: &metal::Buffer, len: usize) -> Vec<f32>
 ## Quick Start
 
 ```rust
-use larql_compute::{ComputeBackend, default_backend};
+use larql_compute::prelude::*;
+use larql_compute::{default_backend, QuantFormat};
 
 let backend = default_backend();
 println!("Using: {} ({})", backend.name(), backend.device_info());
@@ -105,17 +121,42 @@ println!("Using: {} ({})", backend.name(), backend.device_info());
 // f32 matmul
 let c = backend.matmul_transb(a.view(), b.view());
 
-// Q4_K matvec (Ollama-compatible format)
-let scores = backend.q4k_matvec(&q4k_data, &x, rows, hidden);
+// Unified quant matvec — dispatches on format. Q4_K / Q4_KF / Q6_K
+// take f32 input directly; Q4_0 / Q8_0 internally re-quantise.
+let scores = backend.quant_matvec(QuantFormat::Q4_K, &q4k_data, &x, rows, hidden);
 
-// KV-cached decode (one token through all layers)
+// Pre-quantised fast path for hot decode loops (avoid re-quantising
+// the layer's input on every gate/up matvec):
+let scores = backend.q4_matvec(&q4_0_data, &q8_x, &q8_scales, rows, hidden);
+
+// Capability probe — branch on what the backend accelerates instead
+// of pattern-matching on `Option<…> = None`.
+if backend.supports(Capability::F32Gemv) {
+    let logits = backend.f32_gemv_force(lm_head.view(), &h_last);
+}
+
+// KV-cached decode (one token through all layers).
 let h = backend.decode_token(&layers, &x, hidden, inter, q_dim, kv_dim,
     num_q_heads, num_kv_heads, head_dim, rope_base);
 
-// GPU prefill (seq>1, populates KV cache)
+// GPU prefill (seq>1, populates KV cache).
 let h = backend.prefill_q4(&layers, &x, hidden, inter, q_dim, kv_dim,
     seq_len, num_q_heads, num_kv_heads, head_dim, rope_base, qk_norm, softcap);
 ```
+
+## KernelHandle: pipeline + dispatch geometry, bundled
+
+Every simdgroup-tiled Metal kernel exports a `Kernel` marker (impl
+`metal::kernel::TiledKernel`) carrying its name + `ROWS_PER_TG` +
+`THREADS_PER_TG`. `KernelHandle::from_kernel::<…::Kernel>(device, library)`
+compiles the pipeline and bundles those constants alongside it.
+Dispatchers read `kernel.rows_per_tg` / `kernel.threads_per_tg` — no
+parallel `shaders::*::ROWS_PER_TG` imports that could drift from the
+pipeline name. Construction also asserts
+`pipeline.maxTotalThreadsPerThreadgroup() >= threads_per_tg` so silent
+simdgroup drop is caught at startup, not at goldens-fail time. (See
+the `q4_matvec_v4` 75 %-row drop entry in `ROADMAP.md`'s ship log for
+the bug class this prevents.)
 
 ## Linear algebra primitives (`cpu/ops/linalg.rs`)
 
@@ -146,31 +187,48 @@ Demo:  `cargo run --release -p larql-compute --example demo_ridge_solve`
 
 ```
 src/
-  lib.rs              Re-exports from pipeline.rs and backend.rs
+  lib.rs              Re-exports + `prelude` module
   pipeline.rs         QuantFormat, QuantWeight, NormType, FfnType, Activation, FullPipelineLayer
-  backend.rs          ComputeBackend trait (15 methods)
+
+  backend/            (folder, one file per concern)
+    mod.rs            Umbrella `ComputeBackend` (name/device_info/supports)
+    matmul.rs         `MatMul` — f32 / f16 matmul + gemv
+    quant_matvec.rs   `QuantMatVec` — unified `quant_matvec(format, …)` + per-format helpers
+    decode.rs         `DecodeBackend` — KV-cached decode + prefill + MoE hook
+    capability.rs     `Capability` enum — what a backend accelerates
+    helpers.rs        `dot_proj_gpu` / `matmul_gpu` (free functions)
 
   cpu/
-    mod.rs            CpuBackend (BLAS f32 + C Q4 + Q4_K/Q6_K reference)
+    mod.rs            CpuBackend
     ops/              f32_matmul, q4_matvec, q4_vecmat, q4k_matvec, q6k_matvec,
                       q4_common (quantizers: Q4_0, Q4_K, Q4_KF, Q6_K, GGUF Q4_K),
-                      q8_matvec, vector, attention, geglu
+                      q8_matvec, vector, attention, geglu, linalg
 
   metal/              (feature-gated: --features metal)
-    mod.rs            MetalBackend (30+ pipeline states, KV cache)
-    trait_impl.rs     ComputeBackend dispatch (Q4_K/Q8 dual-path)
+    mod.rs            MetalBackend (~30 pipeline handles + KV cache)
+    kernel/           `KernelHandle` + `TiledKernel` trait
+      handle.rs       Pipeline + geometry, bundled
+      traits.rs       The trait shader files implement to expose constants
+    trait_impl/       (one file per sub-trait)
+      mod.rs          Umbrella ComputeBackend impl + Capability mapping
+      matmul.rs       MatMul impl + f32_gemv / f16_gemv encoders
+      quant_matvec.rs QuantMatVec impl
+      decode.rs       DecodeBackend impl
     decode/           KV-cached decode (norm→QKV→attend→O→FFN per layer)
-      mod.rs          decode_token + decode_token_with_moe_fn (top-level loop)
+      mod.rs          decode_token + decode_token_with_moe_fn
       encode_qkv.rs   Step 1 — input norm + format-aware fused QKV
       encode_ffn.rs   Step 6 — format-aware FFN (Q4_KF / Q4_K / Q4_0)
       moe_combine.rs  Hybrid-MoE outer combine (Gemma 4 26B A4B)
       diag.rs         Per-stage / residual / NaN dump helpers
     prefill.rs        GPU prefill for seq>1
     buffers.rs        GPU buffer cache + read_buffer_f32
-    shaders/          Metal kernel sources (one file per shader)
+    shaders/          Metal kernel sources (one file per shader; each
+                      tiled shader has a `Kernel` marker for KernelHandle)
     stages/           Reusable stage encoders (qkv_proj, rope, qk_norm,
                       ffn, residual, layer_scalar, quant_matvec, …)
-    ops/              GPU dispatch helpers (full_pipeline, kv_cache, …)
+    ops/              GPU dispatch helpers
+      full_pipeline/  `dispatch_full_pipeline` + `LayerBuffers` + dump + kv_copy
+      …               kv_cache, q4_matvec, q4_batched, …
 
   csrc/q4_dot.c       ARM NEON Q4 kernel
 ```
@@ -185,7 +243,7 @@ cargo test -p larql-compute
 cargo test -p larql-compute --features metal
 ```
 
-~165 tests with `--features metal` across:
+180 tests with `--features metal` across:
 
 - `tests/test_metal_shaders.rs` — quantization round-trips, cross-backend
   correctness (Metal vs CPU with tolerance), shader compilation, fused
@@ -218,62 +276,51 @@ The cross-backend / cross-stage parity layer lives in `larql-inference`:
 
 ## Examples
 
-### Demos
+Nine examples in three groups — see [`examples/README.md`](examples/README.md) for a one-line description of each.
 
 ```bash
-# Architecture overview — guided tour of all major design decisions
-cargo run --release --features metal -p larql-compute --example demo_architecture
-
-# Basic usage — backend detection, matmul, Q4 dispatch
+# Demos (teach the API)
 cargo run --release --features metal -p larql-compute --example demo_basic
+cargo run --release --features metal -p larql-compute --example demo_architecture
+cargo run --release --features metal -p larql-compute --example demo_ridge_solve
+
+# Compares (full-pipeline benchmarks — distinct from kernel-level criterion suite)
+cargo run --release --features metal -p larql-compute --example compare_decode      # Q4_K decode latency
+cargo run --release --features metal -p larql-compute --example compare_formats     # Q4_KF vs Q4_K vs Q8
+cargo run --release --features metal -p larql-compute --example compare_generation  # End-to-end tok/s
+cargo run --release --features metal -p larql-compute --example compare_pipeline    # Q4_K fused vs Q8 fused
+cargo run --release --features metal -p larql-compute --example compare_ollama      # Head-to-head vs Ollama
+
+# Diagnostic
+cargo run --release --features metal -p larql-compute --example debug_decode_pipeline
 ```
 
-### Benchmarks: Compare (us vs Ollama)
-
-The headline number — production decode tok/s vs Ollama on the same
-hardware — comes from the CLI's `bench` subcommand, which loads a
-real vindex and timing-matches a live `ollama generate` round trip:
+The headline tok/s vs Ollama uses the CLI's `bench` subcommand against a real vindex:
 
 ```bash
 larql bench gemma3-4b-q4k-v2 --backends metal --tokens 50 --ollama gemma3:4b
 ```
 
-The synthetic-weight comparisons under `--example` are kernel-level
-microbenchmarks (no real model), useful for isolating one shader at a
-time:
+## Benchmarks
+
+Three Criterion benches — see [`benches/README.md`](benches/README.md):
+
+| Bench | Surface |
+|---|---|
+| `quant_matvec` | Q4_0/Q4_K/Q4_KF/Q6_K × 3 shapes × cpu/metal — the regression-detector |
+| `matmul` | f32/f16 matmul + lm-head gemv at three shapes |
+| `linalg` | Cholesky + ridge solve |
 
 ```bash
-cargo run --release --features metal -p larql-compute --example compare_decode     # Q4_K vs Q8, KV cached
-cargo run --release --features metal -p larql-compute --example compare_generation  # Prefill + decode
-cargo run --release --features metal -p larql-compute --example compare_pipeline    # Attention + FFN breakdown
-cargo run --release --features metal -p larql-compute --example compare_formats     # Q4_KF vs Q4_K vs GGUF
-cargo run --release --features metal -p larql-compute --example compare_ollama      # Synthetic LARQL vs live Ollama
+make bench           # run all three
+make bench-save      # record a baseline named `main`
+make bench-check     # re-run; fail if any cell regressed
 ```
 
-The synthetic-weight numbers run faster than real-vindex decode (no
-weight-load / lm-head overhead). The real number is what `larql bench`
-reports against a production vindex.
+The detector lives in `scripts/bench-regress.sh`; CI starter at
+`.github/workflows/bench-regress.yml`.
 
-### Benchmarks: Profile (bottleneck analysis)
-
-```bash
-cargo run --release --features metal -p larql-compute --example profile_components   # Every op isolated over 34 layers
-cargo run --release --features metal -p larql-compute --example profile_operations   # CPU vs Metal per-operation
-cargo run --release --features metal -p larql-compute --example profile_kernels      # Q4 v1-v5, sparse, attention
-cargo run --release --features metal -p larql-compute --example profile_raw_dispatch # Pure kernel, zero overhead
-cargo run --release --features metal -p larql-compute --example profile_new_kernels  # New model-agnostic kernels
-cargo run --release --features metal -p larql-compute --example profile_kv_cache     # Attention vs cache length
-cargo run --release --features metal -p larql-compute --example profile_bandwidth    # Raw memory throughput
-```
-
-### Benchmarks: Best Run
-
-```bash
-cargo run --release --features metal -p larql-compute --example best_pipeline       # Full pipeline, 1 cmd buffer
-cargo run --release --features metal -p larql-compute --example best_multi_layer     # Multi-layer batch
-```
-
-### Diagnostics: parity bisect
+## Diagnostics: parity bisect
 
 When a forward path drifts (CPU vs Metal, or Metal decode vs a fresh
 prefill), the per-stage bisect tool localises the divergence to a

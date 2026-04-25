@@ -88,7 +88,7 @@ fn main() {
         5,
         ExtractLevel::All,
         StorageDtype::F32,
-        QuantFormat::Q4k,
+        QuantFormat::Q4K,
         larql_vindex::WriteWeightsOptions::default(),
         larql_vindex::Q4kWriteOptions::default(),
         false,

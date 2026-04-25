@@ -189,7 +189,7 @@ fn run_larql(
     q4_index.load_interleaved_q4k(vindex_path)?;
 
     let cfg = larql_vindex::load_vindex_config(vindex_path)?;
-    if cfg.quant != larql_vindex::QuantFormat::Q4k {
+    if cfg.quant != larql_vindex::QuantFormat::Q4K {
         return Err(format!(
             "larql bench currently requires a Q4K vindex (got {:?})", cfg.quant,
         ).into());
@@ -302,7 +302,7 @@ fn run_engine(
 ) -> Result<BenchRow, Box<dyn std::error::Error>> {
     use larql_inference::forward::hidden_to_raw_logits;
 
-    let mut engine = kind.build(backend);
+    let mut engine = kind.build_with_profiling(backend, args.profile);
     let info = engine.info();
     let label = format!("{} [{}]", info.name, info.backend);
 
@@ -360,6 +360,11 @@ fn run_engine(
 
     if args.verbose {
         eprintln!("[bench] {} post-decode: {}", info.name, engine.info().description);
+    }
+    if args.profile {
+        if let Some(summary) = engine.stage_summary() {
+            summary.print();
+        }
     }
 
     Ok(BenchRow {

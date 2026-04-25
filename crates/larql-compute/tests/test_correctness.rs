@@ -88,6 +88,38 @@ fn default_backend_has_name() {
     assert!(!be.name().is_empty());
 }
 
+/// `Capability` truth table for `CpuBackend`. Pins what the backend
+/// claims it can accelerate so a regression in `cpu/mod.rs::supports`
+/// can't quietly slip through.
+#[test]
+fn cpu_backend_capability_truth_table() {
+    use larql_compute::Capability;
+
+    let cpu = cpu_backend();
+
+    // CPU accelerates the quant matvec family + Q4 vecmat (the latter
+    // uses the C kernel). Everything GPU-flavoured returns false.
+    let supported = [Capability::QuantMatVec, Capability::Q4VecMat];
+    let unsupported = [
+        Capability::F32Gemv,
+        Capability::F16Gemv,
+        Capability::Q4PairBatch,
+        Capability::FullPipelineQ4,
+        Capability::MultiLayerQ4Ffn,
+        Capability::DecodeToken,
+        Capability::DecodeMoe,
+        Capability::DecodeProfile,
+        Capability::PrefillQ4,
+    ];
+
+    for cap in supported {
+        assert!(cpu.supports(cap), "expected CpuBackend to support {cap:?}");
+    }
+    for cap in unsupported {
+        assert!(!cpu.supports(cap), "expected CpuBackend to NOT support {cap:?}");
+    }
+}
+
 /// Pin the unified `quant_matvec` dispatch: every supported format on
 /// the CPU backend must produce the same output as its per-format
 /// helper. This is the contract callers depend on when migrating off

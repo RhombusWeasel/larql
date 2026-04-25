@@ -518,8 +518,8 @@ mod experts {
     /// Metal is available + requested, pick a decode strategy.
     fn pick_strategy(quant: larql_vindex::QuantFormat, metal_ready: bool) -> Strategy {
         match (quant, metal_ready) {
-            (larql_vindex::QuantFormat::Q4k, true) => Strategy::MetalQ4K,
-            (larql_vindex::QuantFormat::Q4k, false) => Strategy::CpuQ4K,
+            (larql_vindex::QuantFormat::Q4K, true) => Strategy::MetalQ4K,
+            (larql_vindex::QuantFormat::Q4K, false) => Strategy::CpuQ4K,
             _ => Strategy::CpuF32,
         }
     }
@@ -697,7 +697,7 @@ mod experts {
         #[test]
         fn pick_strategy_q4k_with_metal_picks_metal() {
             assert!(matches!(
-                pick_strategy(QuantFormat::Q4k, true),
+                pick_strategy(QuantFormat::Q4K, true),
                 Strategy::MetalQ4K
             ));
         }
@@ -705,7 +705,7 @@ mod experts {
         #[test]
         fn pick_strategy_q4k_without_metal_picks_cpu_q4k() {
             assert!(matches!(
-                pick_strategy(QuantFormat::Q4k, false),
+                pick_strategy(QuantFormat::Q4K, false),
                 Strategy::CpuQ4K
             ));
         }

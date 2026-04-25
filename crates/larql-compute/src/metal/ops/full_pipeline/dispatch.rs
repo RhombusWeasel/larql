@@ -16,7 +16,7 @@ use std::ffi::c_void;
 use metal::*;
 
 use crate::metal::buffers::BufferCache;
-use super::q4_common::Q4Pipelines;
+use crate::metal::ops::q4_common::Q4Pipelines;
 
 /// Weights for one transformer layer — ALL Q4 + norm weights.
 /// Matches `crate::FullPipelineLayer` but with borrowed Metal-friendly data.
@@ -116,7 +116,7 @@ pub fn dispatch_full_pipeline(
     rope_at_pos_pipeline: Option<&ComputePipelineState>,
     qk_norm_pipeline: Option<&ComputePipelineState>,
     scale_vector_pipeline: Option<&ComputePipelineState>,
-    mut kv_cache: Option<&mut super::kv_cache::KVCache>,
+    kv_cache: Option<&mut crate::metal::ops::kv_cache::KVCache>,
     layers: &[crate::FullPipelineLayer],
     x: &[f32],
     hidden: usize,
@@ -132,116 +132,54 @@ pub fn dispatch_full_pipeline(
     softcap: f32,
 ) -> Vec<f32> {
     let num_layers = layers.len();
-    let _hidden_val = hidden as u32;
-    let _inter_val = inter as u32;
-    let _n_blocks = (hidden / 32) as u32;
 
-    // Pre-cache Q8 attention weight buffers (higher precision for Q/K dot products)
-    // Stable across calls → cache by slice identity (skips per-token Metal-buffer
-    // allocation for ~68+ norm/scale handles on 34-layer Gemma 3 4B).
-    let wq_bufs: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.wq.data)).collect();
-    let wq_scale_bufs: Vec<_> = layers.iter().map(|l| bufs.get_f32(l.wq.scales.unwrap_or(&[]))).collect();
-    let wk_bufs: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.wk.data)).collect();
-    let wk_scale_bufs: Vec<_> = layers.iter().map(|l| bufs.get_f32(l.wk.scales.unwrap_or(&[]))).collect();
-    let wv_bufs: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.wv.data)).collect();
-    let wv_scale_bufs: Vec<_> = layers.iter().map(|l| bufs.get_f32(l.wv.scales.unwrap_or(&[]))).collect();
-    let wo_bufs: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.wo.data)).collect();
-    let _wo_scale_bufs: Vec<_> = layers.iter().map(|l| bufs.get_f32(l.wo.scales.unwrap_or(&[]))).collect();
-    // Q4 FFN weight buffers
-    let gate_bufs: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.gate.data)).collect();
-    let up_bufs: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.up.data)).collect();
-    let down_bufs: Vec<_> = layers.iter().map(|l| bufs.get_bytes(l.down.data)).collect();
+    // All per-layer scratch + cached weight buffers in one struct.
+    // See `LayerBuffers::allocate` for the sizing rationale (Gemma 4
+    // mixed sliding/global geometry, Q8 staging shared between the
+    // attention-input and O-projection paths, etc.).
+    let lb = super::buffers::LayerBuffers::allocate(
+        bufs, layers, x, hidden, inter, seq_len, q_dim,
+    );
+    // Local aliases to keep the orchestration body readable. Using
+    // shared references means the body's existing `wq_bufs[l]` etc.
+    // resolve through `Vec<Buffer>` indexing unchanged.
+    let wq_bufs        = &lb.wq;
+    let wq_scale_bufs  = &lb.wq_scale;
+    let wk_bufs        = &lb.wk;
+    let wk_scale_bufs  = &lb.wk_scale;
+    let wv_bufs        = &lb.wv;
+    let wv_scale_bufs  = &lb.wv_scale;
+    let wo_bufs        = &lb.wo;
+    let gate_bufs      = &lb.gate;
+    let up_bufs        = &lb.up;
+    let down_bufs      = &lb.down;
+    let input_norm_bufs    = &lb.input_norm;
+    let post_attn_norm_bufs = &lb.post_attn_norm;
+    let pre_ffn_norm_bufs  = &lb.pre_ffn_norm;
+    let post_ffn_norm_bufs = &lb.post_ffn_norm;
+    let h_bufs         = &lb.h;
+    let norm_outs      = &lb.norm_out;
+    let q_outs         = &lb.q_out;
+    let k_outs         = &lb.k_out;
+    let v_outs         = &lb.v_out;
+    let attn_outs      = &lb.attn_out;
+    let o_outs         = &lb.o_out;
+    let h_post_attns   = &lb.h_post_attn;
+    let ffn_norm_outs  = &lb.ffn_norm_out;
+    let gate_outs      = &lb.gate_out;
+    let up_outs        = &lb.up_out;
+    let act_bufs_vec   = &lb.act_buf;
+    let down_outs      = &lb.down_out;
+    let q8_bufs        = &lb.q8;
+    let q8s_bufs       = &lb.q8s;
+    let ffn_q8_bufs    = &lb.ffn_q8;
+    let ffn_q8s_bufs   = &lb.ffn_q8s;
+    let q8_row_max     = lb.q8_row_max;
+    let q8s_row_bytes  = lb.q8s_row_bytes;
 
-    // Norm weight buffers — also stable; cache.
-    let input_norm_bufs: Vec<_> = layers.iter().map(|l| bufs.get_f32(l.input_norm)).collect();
-    let post_attn_norm_bufs: Vec<_> = layers.iter().map(|l| bufs.get_f32(l.post_attn_norm)).collect();
-    let pre_ffn_norm_bufs: Vec<Option<_>> = layers.iter().map(|l| {
-        l.pre_ffn_norm.map(|n| bufs.get_f32(n))
-    }).collect();
-    let post_ffn_norm_bufs: Vec<Option<_>> = layers.iter().map(|l| {
-        l.post_ffn_norm.map(|n| bufs.get_f32(n))
-    }).collect();
-
-    // Initial hidden state as f32 buffer
-    let mut h_bufs = Vec::with_capacity(num_layers + 1);
-    h_bufs.push(bufs.transient_from_f32(x));
-
-    // Pre-allocate all intermediate buffers
-    let mut norm_outs = Vec::with_capacity(num_layers);
-    let mut q_outs = Vec::with_capacity(num_layers);
-    let mut k_outs = Vec::with_capacity(num_layers);
-    let mut v_outs = Vec::with_capacity(num_layers);
-    let mut attn_outs = Vec::with_capacity(num_layers);
-    let mut o_outs = Vec::with_capacity(num_layers);
-    let mut h_post_attns = Vec::with_capacity(num_layers);
-    let mut ffn_norm_outs = Vec::with_capacity(num_layers);
-    let mut gate_outs = Vec::with_capacity(num_layers);
-    let mut up_outs = Vec::with_capacity(num_layers);
-    let mut act_bufs_vec = Vec::with_capacity(num_layers);
-    let mut down_outs = Vec::with_capacity(num_layers);
-
-    let mut q8_bufs = Vec::with_capacity(num_layers);
-    let mut q8s_bufs = Vec::with_capacity(num_layers);
-    let mut ffn_q8_bufs = Vec::with_capacity(num_layers);
-    let mut ffn_q8s_bufs = Vec::with_capacity(num_layers);
-
-    // All per-position buffers are scaled by seq_len. Single-position
-    // (seq_len == 1, decode) is the existing fast path; multi-position
-    // (seq_len > 1, prefill) is the fix for the previous undersized-buffer
-    // crash — every downstream stage (RoPE, fused attention, KV cache copy)
-    // already assumes seq_len-many rows.
-    //
-    // Gemma 4 uses different Q/KV dims per layer (sliding head_dim=256 vs
-    // global head_dim=512), so each per-layer intermediate buffer is sized
-    // from that layer's own `layer.num_q_heads * layer.head_dim`, not the
-    // function-level `q_dim` / `kv_dim` (which only reflect one variant).
-    // Gemma 3 / Llama / Mistral all have constant head_dim so this reduces
-    // to the same allocation as before.
-    //
-    // The Q8 staging buffers (`q8_bufs` / `q8s_bufs`) are shared between
-    // the Q8 attention-input path (hidden floats → Q8 hidden bytes) and the
-    // O-projection input path (layer_q_dim floats → Q8 bytes). Sized at
-    // max(hidden, max_layer_q_dim) per position so both writers fit with offsets.
-    let max_layer_q_dim = layers.iter()
-        .map(|l| l.num_q_heads * l.head_dim)
-        .max().unwrap_or(q_dim);
-    let q8_row_max = hidden.max(max_layer_q_dim);
-    let q8s_row_bytes = q8_row_max.div_ceil(32) * 4;
-    for layer in layers.iter().take(num_layers) {
-        let lq = layer.num_q_heads * layer.head_dim;
-        let lkv = layer.num_kv_heads * layer.head_dim;
-        norm_outs.push(bufs.output((seq_len * hidden * 4) as u64));
-        q_outs.push(bufs.output((seq_len * lq * 4) as u64));
-        k_outs.push(bufs.output((seq_len * lkv * 4) as u64));
-        v_outs.push(bufs.output((seq_len * lkv * 4) as u64));
-        attn_outs.push(bufs.output((seq_len * lq * 4) as u64));
-        o_outs.push(bufs.output((seq_len * hidden * 4) as u64));
-        h_post_attns.push(bufs.output((seq_len * hidden * 4) as u64));
-        ffn_norm_outs.push(bufs.output((seq_len * hidden * 4) as u64));
-        gate_outs.push(bufs.output((seq_len * inter * 4) as u64));
-        up_outs.push(bufs.output((seq_len * inter * 4) as u64));
-        act_bufs_vec.push(bufs.output((seq_len * inter * 4) as u64));
-        down_outs.push(bufs.output((seq_len * hidden * 4) as u64));
-        h_bufs.push(bufs.output((seq_len * hidden * 4) as u64));
-        q8_bufs.push(bufs.output((seq_len * q8_row_max) as u64));
-        q8s_bufs.push(bufs.output((seq_len * q8s_row_bytes) as u64));
-        ffn_q8_bufs.push(bufs.output((seq_len * hidden) as u64));
-        ffn_q8s_bufs.push(bufs.output((seq_len * hidden.div_ceil(32) * 4) as u64));
-    }
-
-    let mut cmd = queue.new_command_buffer();
+    let mut cmd = queue.new_command_buffer().to_owned();
     let dump_path = std::env::var("LARQL_METAL_DUMP_LAYERS").ok();
-    // Dump h_embed (input to layer 0) before any compute — lets us
-    // verify CPU and Metal start from the same point.
-    if let Some(ref dir) = dump_path {
-        let ptr = h_bufs[0].contents() as *const f32;
-        if !ptr.is_null() {
-            let s = unsafe { std::slice::from_raw_parts(ptr, seq_len * hidden) };
-            let bytes: Vec<u8> = s.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let path = format!("{dir}/metal_h_embed.f32");
-            let _ = std::fs::write(&path, &bytes);
-        }
-    }
+    super::dump::dump_h_embed(dump_path.as_deref(), &lb, seq_len, hidden);
 
     for l in 0..num_layers {
         let eps = layers[l].eps;
@@ -372,21 +310,10 @@ pub fn dispatch_full_pipeline(
         }
 
         // Stage dump: Q just after QKV projection, before QK-norm.
-        if dump_path.is_some() && l == 0 {
-            cmd.commit();
-            cmd.wait_until_completed();
-            let ptr = q_outs[l].contents() as *const f32;
-            if !ptr.is_null() {
-                let n = seq_len * layer_q_dim;
-                let s = unsafe { std::slice::from_raw_parts(ptr, n) };
-                let bytes: Vec<u8> = s.iter().flat_map(|v| v.to_le_bytes()).collect();
-                let _ = std::fs::write(
-                    format!("{}/metal_L0_q_out_raw.f32", dump_path.as_ref().unwrap()),
-                    &bytes,
-                );
-            }
-            cmd = queue.new_command_buffer();
-        }
+        cmd = super::dump::dump_layer0_q_after_stage(
+            dump_path.as_deref(), queue, cmd, &lb, "raw",
+            seq_len, layer_q_dim, l,
+        );
 
         // ── 3a. QK-norm on Q and K (pre-RoPE). Gemma 3 / Gemma 4. ──
         let applied_prerope_qk_norm = if use_qk_norm {
@@ -415,21 +342,10 @@ pub fn dispatch_full_pipeline(
         };
 
         // Stage dump: Q after QK-norm, before RoPE.
-        if dump_path.is_some() && l == 0 {
-            cmd.commit();
-            cmd.wait_until_completed();
-            let ptr = q_outs[l].contents() as *const f32;
-            if !ptr.is_null() {
-                let n = seq_len * layer_q_dim;
-                let s = unsafe { std::slice::from_raw_parts(ptr, n) };
-                let bytes: Vec<u8> = s.iter().flat_map(|v| v.to_le_bytes()).collect();
-                let _ = std::fs::write(
-                    format!("{}/metal_L0_q_out_after_qk_norm.f32", dump_path.as_ref().unwrap()),
-                    &bytes,
-                );
-            }
-            cmd = queue.new_command_buffer();
-        }
+        cmd = super::dump::dump_layer0_q_after_stage(
+            dump_path.as_deref(), queue, cmd, &lb, "after_qk_norm",
+            seq_len, layer_q_dim, l,
+        );
 
         // ── 3b. Apply RoPE separately when populating KV cache ──
         let use_separate_rope = kv_cache.is_some() && rope_at_pos_pipeline.is_some();
@@ -577,76 +493,23 @@ pub fn dispatch_full_pipeline(
             enc.end_encoding();
         }
 
-        // Optional per-layer residual dump (LARQL_METAL_DUMP_LAYERS=<dir>).
-        // Commits the buffer up to this layer, reads h_bufs[l+1], writes to
-        // `{dir}/metal_layer_{l}.f32` as raw little-endian floats. Enables
-        // diffing against the CPU reference layer-by-layer to bisect the
-        // first layer where the Metal compute path diverges from CPU.
-        if let Some(ref dir) = dump_path {
-            cmd.commit();
-            cmd.wait_until_completed();
-            let write_f32 = |name: &str, buf: &metal::Buffer, n: usize| {
-                let ptr = buf.contents() as *const f32;
-                if ptr.is_null() { return; }
-                let s = unsafe { std::slice::from_raw_parts(ptr, n) };
-                let bytes: Vec<u8> = s.iter().flat_map(|v| v.to_le_bytes()).collect();
-                let path = format!("{dir}/metal_layer_{l:02}_{name}.f32");
-                if let Err(e) = std::fs::write(&path, &bytes) {
-                    eprintln!("[dump] failed to write {path}: {e}");
-                }
-            };
-            // End-of-layer residual (matches CPU dump exactly).
-            write_f32("h_out", &h_bufs[l + 1], seq_len * hidden);
-            // h_post_attn for every layer — cheap and lets the residual-diff
-            // tool bisect drift into attention vs FFN at any layer. Without
-            // this, L0 was the only layer with this snapshot available.
-            write_f32("h_post_attn", &h_post_attns[l], seq_len * hidden);
-            // Per-stage snapshots for layer 0 by default, or the layer
-            // named by `LARQL_STAGE_DUMP_LAYER` — useful for bisecting
-            // drift at a specific later layer (e.g. Gemma 4 global L5).
-            let stage_layer = std::env::var("LARQL_STAGE_DUMP_LAYER")
-                .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-            if l == stage_layer {
-                write_f32("norm_out",     &norm_outs[l],     seq_len * hidden);
-                write_f32("q_out",        &q_outs[l],        seq_len * layer_q_dim);
-                write_f32("k_out",        &k_outs[l],        seq_len * layer_kv_dim);
-                write_f32("v_out",        &v_outs[l],        seq_len * layer_kv_dim);
-                write_f32("attn_out",     &attn_outs[l],     seq_len * layer_q_dim);
-                write_f32("o_out",        &o_outs[l],        seq_len * hidden);
-                write_f32("ffn_norm_out", &ffn_norm_outs[l], seq_len * hidden);
-                write_f32("gate_out",     &gate_outs[l],     seq_len * inter);
-                write_f32("up_out",       &up_outs[l],       seq_len * inter);
-                write_f32("act_buf",      &act_bufs_vec[l],  seq_len * inter);
-                write_f32("down_out",     &down_outs[l],     seq_len * hidden);
-            }
-            cmd = queue.new_command_buffer();
-        }
+        // End-of-layer dump (LARQL_METAL_DUMP_LAYERS=<dir>) — bisects
+        // CPU/Metal drift layer-by-layer.
+        cmd = super::dump::dump_layer_snapshots(
+            dump_path.as_deref(), queue, cmd, &lb,
+            layers, l, seq_len, hidden, inter,
+        );
     }
 
     cmd.commit();
     cmd.wait_until_completed();
 
-    // Populate KV cache from GPU-computed RoPE'd K and V (post-commit, buffers readable)
-    if let Some(ref mut kv) = kv_cache {
-        for l in 0..num_layers {
-            let lhd = layers[l].head_dim;
-            let lnkv = layers[l].num_kv_heads;
-            while kv.layers.len() <= l {
-                kv.layers.push(super::kv_cache::LayerKVCache::new(
-                    bufs, 4096, lnkv, lhd));
-            }
-            let total_kv = seq_len * lnkv * lhd;
-            let k_src = k_outs[l].contents() as *const f32;
-            let v_src = v_outs[l].contents() as *const f32;
-            let k_dst = kv.layers[l].k_cache.contents() as *mut f32;
-            let v_dst = kv.layers[l].v_cache.contents() as *mut f32;
-            unsafe {
-                std::ptr::copy_nonoverlapping(k_src, k_dst, total_kv);
-                std::ptr::copy_nonoverlapping(v_src, v_dst, total_kv);
-            }
-            kv.layers[l].current_len = seq_len;
-        }
-    }
+    // Post-commit: populate persistent KV cache from GPU-computed
+    // RoPE'd K/V (buffers are readable now that the command buffer is
+    // finished).
+    super::kv_copy::populate_kv_after_commit(
+        kv_cache, bufs, &lb, layers, seq_len,
+    );
 
     // Read final hidden state — `seq_len * hidden` floats, caller reshapes
     // to [seq_len, hidden] (see `layer_graph::generate`).

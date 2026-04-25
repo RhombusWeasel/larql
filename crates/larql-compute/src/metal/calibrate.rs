@@ -74,3 +74,56 @@ fn bench_median<F: FnMut()>(n: usize, mut f: F) -> u64 {
     times.sort_unstable();
     times[n / 2]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metal::MetalBackend;
+
+    /// `calibrate()` returns a threshold inside the legal envelope:
+    /// `[MIN_FLOP_FLOOR, DEFAULT_FLOP_THRESHOLD]` (inclusive on the
+    /// upper bound — `best` starts at default and only goes down via
+    /// `best.min(flops)`, so the worst case is "Metal never beats CPU"
+    /// and we keep the conservative default).
+    #[test]
+    fn calibrate_returns_threshold_in_legal_envelope() {
+        let Some(metal) = MetalBackend::new() else { return; };
+        // Use the inherent helpers to access the private fields.
+        // `f32_ops` and the buffer cache are the only inputs `calibrate()` needs.
+        // Rather than reach into private state, just call `metal.calibrate()`
+        // and read back via the public `flop_threshold()` accessor.
+        metal.calibrate();
+        let t = metal.flop_threshold();
+        assert!(
+            t >= MIN_FLOP_FLOOR,
+            "calibrated threshold {t} below MIN_FLOP_FLOOR={MIN_FLOP_FLOOR}"
+        );
+        assert!(
+            t <= DEFAULT_FLOP_THRESHOLD,
+            "calibrated threshold {t} above DEFAULT_FLOP_THRESHOLD={DEFAULT_FLOP_THRESHOLD}"
+        );
+    }
+
+    /// `set_flop_threshold` clamps to `MIN_FLOP_FLOOR`. Pin the
+    /// invariant that "no caller can set a threshold below the floor"
+    /// — small dispatches dominated by Metal command-buffer overhead
+    /// would benchmark slower than CPU and the auto-router would
+    /// thrash.
+    #[test]
+    fn set_flop_threshold_clamps_to_min_floor() {
+        let Some(metal) = MetalBackend::new() else { return; };
+        metal.set_flop_threshold(0);
+        assert_eq!(metal.flop_threshold(), MIN_FLOP_FLOOR);
+        metal.set_flop_threshold(MIN_FLOP_FLOOR / 2);
+        assert_eq!(metal.flop_threshold(), MIN_FLOP_FLOOR);
+        metal.set_flop_threshold(MIN_FLOP_FLOOR * 100);
+        assert_eq!(metal.flop_threshold(), MIN_FLOP_FLOOR * 100);
+    }
+
+    // Note: calibration isn't deterministic across runs — at small
+    // shapes Metal can win one run and lose the next (timing noise on
+    // shared-system CPU/GPU contention). Repeatability *isn't* a
+    // contract of `calibrate()`. The legal-envelope test above is
+    // enough to catch real regressions; the worst case is the
+    // conservative default kicks in.
+}

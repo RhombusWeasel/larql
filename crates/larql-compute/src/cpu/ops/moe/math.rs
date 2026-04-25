@@ -83,3 +83,106 @@ pub(super) fn top_k(v: &[f32], k: usize) -> (Vec<usize>, Vec<f32>) {
     let values: Vec<f32> = indexed.iter().map(|(_, v)| *v).collect();
     (indices, values)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BF16 round-trip on the standard handful of "easy" floats —
+    /// catches an endianness flip or a bit-shift typo.
+    #[test]
+    fn bf16_to_f32_known_values() {
+        // 1.0 in BF16 = 0x3F80
+        let bytes = vec![0x80u8, 0x3F];
+        assert_eq!(bf16_to_f32(&bytes), vec![1.0]);
+        // 0.0
+        assert_eq!(bf16_to_f32(&[0x00, 0x00]), vec![0.0]);
+        // -1.0 in BF16 = 0xBF80
+        assert_eq!(bf16_to_f32(&[0x80, 0xBF]), vec![-1.0]);
+        // 5.0 in BF16 = 0x40A0
+        assert_eq!(bf16_to_f32(&[0xA0, 0x40]), vec![5.0]);
+        // Multiple values in one call
+        let bytes = vec![0x80, 0x3F, 0x80, 0xBF, 0xA0, 0x40];
+        assert_eq!(bf16_to_f32(&bytes), vec![1.0, -1.0, 5.0]);
+    }
+
+    /// `rms_norm(constant_x, weight=1, offset=0)` — RMS of [c,c,…] is
+    /// |c|, so out[i] = c / |c| * 1 = sign(c).
+    #[test]
+    fn rms_norm_constant_input() {
+        let x = vec![2.0; 8];
+        let w = vec![1.0; 8];
+        let out = rms_norm(&x, &w, 0.0, 0.0);
+        for &v in &out { assert!((v - 1.0).abs() < 1e-5, "expected 1.0, got {v}"); }
+    }
+
+    /// `rms_norm` with empty weight slice returns the input unchanged
+    /// (defensive guard for "weight tensor not present").
+    #[test]
+    fn rms_norm_empty_weight_passthrough() {
+        let x = vec![3.0, 4.0, 5.0];
+        let out = rms_norm(&x, &[], 1e-6, 0.0);
+        assert_eq!(out, x);
+    }
+
+    /// Parameter-free RMSNorm: scales `x` so that `mean(out²) ≈ 1`.
+    #[test]
+    fn rms_norm_no_weight_normalises_to_unit_rms() {
+        let x = vec![2.0, 4.0, 6.0, 8.0];
+        let out = rms_norm_no_weight(&x, 1e-6);
+        let mean_sq: f32 = out.iter().map(|v| v * v).sum::<f32>() / out.len() as f32;
+        assert!((mean_sq - 1.0).abs() < 1e-4, "mean(out²)={mean_sq:.5} ≠ 1.0");
+    }
+
+    /// SiLU(0) = 0, SiLU(x) → x as x → ∞, SiLU(x) → 0 as x → -∞.
+    #[test]
+    fn silu_known_values() {
+        assert_eq!(silu(0.0), 0.0);
+        assert!(silu(10.0) > 9.99);
+        assert!(silu(-10.0).abs() < 1e-3);
+    }
+
+    /// `top_k` returns the largest k values in descending order.
+    #[test]
+    fn top_k_descending_with_k_capped_at_len() {
+        let (idx, val) = top_k(&[0.1, 0.5, 0.3, 0.9, 0.2], 3);
+        assert_eq!(idx, vec![3, 1, 2]);  // values 0.9, 0.5, 0.3
+        assert_eq!(val, vec![0.9, 0.5, 0.3]);
+
+        // k > len — get all in descending order.
+        let (idx, _) = top_k(&[0.1, 0.5, 0.3], 99);
+        assert_eq!(idx, vec![1, 2, 0]);
+    }
+
+    /// `softmax` produces a probability distribution.
+    #[test]
+    fn softmax_sums_to_one() {
+        let mut v = vec![1.0f32, 2.0, 3.0, 4.0];
+        softmax(&mut v);
+        let sum: f32 = v.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "softmax sum={sum} ≠ 1");
+        // Largest input → largest output.
+        let max_idx = v.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+        assert_eq!(max_idx, 3, "max input index should be max output index");
+    }
+
+    /// `matmul_vec` agrees with a hand-rolled scalar reference.
+    #[test]
+    fn matmul_vec_matches_scalar_reference() {
+        let w = vec![1.0, 2.0, 3.0,    // row 0
+                     4.0, 5.0, 6.0];   // row 1
+        let x = vec![1.0, 1.0, 1.0];
+        let out = matmul_vec(&x, &w, 2, 3);
+        // Hand-computed: row0 = 1+2+3 = 6; row1 = 4+5+6 = 15.
+        assert_eq!(out, vec![6.0, 15.0]);
+    }
+
+    /// Empty input dimensions return a zero-filled output of the
+    /// requested length — defensive guard, not a panic.
+    #[test]
+    fn matmul_vec_zero_dimensions_returns_zeros() {
+        let out = matmul_vec(&[], &[], 4, 0);
+        assert_eq!(out, vec![0.0, 0.0, 0.0, 0.0]);
+    }
+}

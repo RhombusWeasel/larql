@@ -96,7 +96,7 @@ pub struct ExtractIndexArgs {
 fn parse_quant(s: &str) -> Result<larql_vindex::QuantFormat, String> {
     match s.to_lowercase().as_str() {
         "none" | "" => Ok(larql_vindex::QuantFormat::None),
-        "q4k" | "q4_k" => Ok(larql_vindex::QuantFormat::Q4k),
+        "q4k" | "q4_k" => Ok(larql_vindex::QuantFormat::Q4K),
         _ => Err(format!("unknown quant format: {s} (expected: none, q4k)")),
     }
 }
@@ -201,7 +201,7 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
     //   default              → F32
     // f16 is the default now; --f32 opts out. `--quant q4k` always
     // forces f16 on the side-channel tensors.
-    let dtype = if args.f32 && args.quant != larql_vindex::QuantFormat::Q4k {
+    let dtype = if args.f32 && args.quant != larql_vindex::QuantFormat::Q4K {
         larql_vindex::StorageDtype::F32
     } else {
         larql_vindex::StorageDtype::F16
@@ -265,13 +265,13 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
             level,
             ffn_compact: args.compact,
         };
-        if args.drop_gate_vectors && args.quant != larql_vindex::QuantFormat::Q4k {
+        if args.drop_gate_vectors && args.quant != larql_vindex::QuantFormat::Q4K {
             return Err(
                 "--drop-gate-vectors requires --quant q4k (gate is rebuilt from Q4K at load)"
                     .into(),
             );
         }
-        if args.down_q4k && args.quant != larql_vindex::QuantFormat::Q4k {
+        if args.down_q4k && args.quant != larql_vindex::QuantFormat::Q4K {
             return Err(
                 "--down-q4k requires --quant q4k (only the Q4K writer honours this flag)".into(),
             );

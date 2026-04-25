@@ -48,7 +48,7 @@ fn find_q4k_vindex() -> Option<PathBuf> {
         if candidate.is_dir() {
             // Verify it's actually Q4_K — non-Q4 vindexes would fail downstream.
             if let Ok(cfg) = load_vindex_config(candidate) {
-                if cfg.quant == QuantFormat::Q4k {
+                if cfg.quant == QuantFormat::Q4K {
                     return Some(candidate.clone());
                 }
             }

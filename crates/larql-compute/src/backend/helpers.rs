@@ -31,3 +31,65 @@ pub fn matmul_gpu(
         None => a.dot(b),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CpuBackend;
+    use ndarray::Array2;
+
+    fn synth(rows: usize, cols: usize, seed: u64) -> Array2<f32> {
+        let mut s = seed;
+        Array2::from_shape_fn((rows, cols), |_| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((s >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
+        })
+    }
+
+    fn max_diff(a: &Array2<f32>, b: &Array2<f32>) -> f32 {
+        a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    }
+
+    /// `None` backend → ndarray fallback. Pin the pure-CPU `a @ b^T`.
+    #[test]
+    fn dot_proj_gpu_none_backend_uses_ndarray() {
+        let a = synth(4, 8, 1);
+        let b = synth(6, 8, 2);
+        let result = dot_proj_gpu(&a, &b, None);
+        let expected = a.dot(&b.t());
+        assert_eq!(result.shape(), &[4, 6]);
+        assert!(max_diff(&result, &expected) < 1e-6);
+    }
+
+    /// `Some(CpuBackend)` → goes through trait, must equal the `None`
+    /// fallback (both are CPU paths, just routed differently).
+    #[test]
+    fn dot_proj_gpu_some_backend_matches_fallback() {
+        let a = synth(4, 8, 1);
+        let b = synth(6, 8, 2);
+        let cpu = CpuBackend;
+        let routed = dot_proj_gpu(&a, &b, Some(&cpu as &dyn ComputeBackend));
+        let fallback = dot_proj_gpu(&a, &b, None);
+        assert!(max_diff(&routed, &fallback) < 1e-5);
+    }
+
+    #[test]
+    fn matmul_gpu_none_backend_uses_ndarray() {
+        let a = synth(4, 8, 3);
+        let b = synth(8, 6, 4);
+        let result = matmul_gpu(&a, &b, None);
+        let expected = a.dot(&b);
+        assert_eq!(result.shape(), &[4, 6]);
+        assert!(max_diff(&result, &expected) < 1e-6);
+    }
+
+    #[test]
+    fn matmul_gpu_some_backend_matches_fallback() {
+        let a = synth(4, 8, 3);
+        let b = synth(8, 6, 4);
+        let cpu = CpuBackend;
+        let routed = matmul_gpu(&a, &b, Some(&cpu as &dyn ComputeBackend));
+        let fallback = matmul_gpu(&a, &b, None);
+        assert!(max_diff(&routed, &fallback) < 1e-5);
+    }
+}

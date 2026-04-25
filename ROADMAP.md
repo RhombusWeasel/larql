@@ -414,18 +414,22 @@ field on `MetalBackend`, and the call sites lose their direct
 `shaders::*::ROWS_PER_TG` imports. Mechanical — same pattern as
 the v4 transformation, just repeated.
 
-#### Migrate callers off the per-format matvec helpers (open)
+#### Q4_0 fast path: add `quant_matvec_q8_input` (open)
 
-P1a landed `quant_matvec(format, weights, x, n, k)` as the unified
-entry point, but the per-format helpers `q4_matvec`, `q4k_matvec`,
-`q6k_matvec` still exist on the trait — kept around because hot
-decode paths pre-quantise the input once and reuse it across many
-gate/up matvecs in a layer (the unified method re-quantises every
-call). Migration plan: add a pre-quantised variant
-`quant_matvec_q8_input` on `QuantMatVec` for the Q4_0/Q8_0 path,
-route remaining callsites through it, then delete the per-format
-helpers. Until then `quant_matvec` is the API for new code and the
-per-format methods are legacy.
+P1a landed `quant_matvec(format, weights, x, n, k)` as the f32-input
+convenience API. The per-format helpers `q4_matvec`, `q4k_matvec`,
+`q6k_matvec` aren't legacy — they're the pre-quantised-input fast
+path that the four hot decode callers (`lm_head.rs`,
+`gate_knn.rs` ×2, `attention/gpu.rs`) need to avoid re-quantising
+their already-Q8 inputs on every matvec.
+
+What's missing is a unified pre-quantised entry point. Adding
+`quant_matvec_q8_input(format, weights, q8_x, q8_scales, n, k)`
+would let those four callers express their intent through
+[`QuantMatVec`] in a format-aware way (today they hard-code
+`q4_matvec`, which only handles Q4_0; a Q4_K hot path would have to
+add another helper). Once that's there, the per-format helpers can
+become deprecated thin wrappers.
 
 #### Extract stage helpers from `dispatch_full_pipeline` (open)
 
@@ -437,28 +441,41 @@ procedure (~570 LOC, one function). Apply the
 helpers. Pure organisation work, no behaviour change — same kind
 of mechanical commit as the v4 KernelHandle spread.
 
-#### Replace `decode_profile.rs` with a `Profile` decorator (open)
+#### Restore per-stage decode profiling via a `Profile` decorator (open)
 
-`metal/decode_profile.rs` (567 LOC) is a near-duplicate of
-`metal/decode/mod.rs` with per-command-buffer timing tags. Today
-it's only consulted under `LARQL_PROFILE_SPLIT=1`, so it carries no
-production risk, but it's a DRY violation. Replace by threading an
-optional timing hook through `decode/mod.rs` and have
-`decode_token_split_profile` populate a `Profile` struct that
-records each command buffer's wall time. Once parity is verified,
-delete `decode_profile.rs` outright.
+`metal/decode_profile.rs` was a 567-LOC duplicate of
+`metal/decode/mod.rs` with per-command-buffer timing tags around
+each layer's attn / gate+up / down submissions. Deleted; the
+`decode_token_split_profile` shim now just wraps the live
+`decode_token` and prints whole-token timing under
+`LARQL_PROFILE_SPLIT=1`.
 
-#### Plug `benches/quant_matvec` into CI (open)
+The split-stage diagnostic (which sub-stage dominates per-layer
+cost) is gone until a proper decorator lands. Plan: thread an
+optional `ProfileTimings { attn_ms, gate_up_ms, down_ms }`
+parameter through `decode_token_with_moe_fn`, accumulate the cost
+of each per-stage command buffer commit into the right bucket. The
+existing decode encoder already creates separate command buffers
+per stage; the only missing piece is the timing hook.
 
-P1b shipped the bench suite covering Q4_0/Q4_K/Q4_KF/Q6_K × decode/
-prefill/lm-head shapes × CPU/Metal — but it only runs when a human
-types `cargo bench`. Wire it to CI on PRs: stash a baseline
-under `target/criterion/` keyed by main, run the suite on each PR,
-post a comment with the per-cell delta. The 75 %-row drop bug would
-have shown as a 4× throughput cliff on `quant_matvec_q4_0/metal/
-lm_head_262144` weeks before goldens caught it — that's the
-detection cadence we want from CI, not from a goldens-fail two
-weeks later.
+Until then, `instruments`-based profiling on the GPU remains the
+ground-truth tool for "which sub-stage is hot."
+
+#### Plug `benches/quant_matvec` into CI (Make targets shipped, GHA template)
+
+`make bench-save` records a baseline; `make bench-check` re-runs
+the suite and fails if any cell regresses past Criterion's noise
+threshold. The detection logic lives in `scripts/bench-regress.sh`
+(env-tunable threshold, baseline name, feature flags).
+
+GitHub Actions starter at `.github/workflows/bench-regress.yml` —
+runs on `macos-14` so Metal cells benchmark too, caches baselines
+between runs, treats a cold-cache run as neutral (no false-fail on
+the first PR after CI is stood up).
+
+Open follow-up: actually wire the workflow up once CI infra is
+adopted — today the project ships with `make ci` but no automated
+runner. The bench suite is ready; only the trigger is missing.
 
 ### `--compact` loader reconstruction — WalkFfn-only today
 

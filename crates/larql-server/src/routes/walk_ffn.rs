@@ -340,7 +340,7 @@ pub(crate) fn run_full_output_core(
         .map_err(ServerError::InferenceUnavailable)?;
 
     let patched = model.patched.blocking_read();
-    let is_q4k = model.config.quant == larql_vindex::QuantFormat::Q4k;
+    let is_q4k = model.config.quant == larql_vindex::QuantFormat::Q4K;
     let walk_ffn = if is_q4k {
         None
     } else {

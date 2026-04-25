@@ -94,6 +94,8 @@ pub struct MarkovResidualEngine {
     window_size: Option<usize>,
     store: Option<RsStore>,
     backend: Box<dyn ComputeBackend>,
+    profiling: bool,
+    profile: EngineProfiler,
 }
 
 impl MarkovResidualEngine {
@@ -102,7 +104,13 @@ impl MarkovResidualEngine {
     }
 
     pub fn with_backend(window_size: Option<usize>, backend: Box<dyn ComputeBackend>) -> Self {
-        Self { window_size, store: None, backend }
+        Self { window_size, store: None, backend, profiling: false, profile: EngineProfiler::default() }
+    }
+
+    /// Enable per-stage decode timing. Adds ~1µs overhead per decode step.
+    pub fn with_profiling(mut self, enabled: bool) -> Self {
+        self.profiling = enabled;
+        self
     }
 
     /// Total memory of the engine state in bytes.
@@ -150,7 +158,11 @@ impl KvEngine for MarkovResidualEngine {
 
     fn decode_step(&mut self, weights: &ModelWeights, token_id: u32) -> Option<Array2<f32>> {
         let rs = self.store.take()?;
-        let (hidden, new_rs) = rs_decode_step(weights, token_id, rs, self.backend.as_ref())?;
+        let (hidden, new_rs) = if self.profiling {
+            rs_decode_step_profiled(weights, token_id, rs, self.backend.as_ref(), &mut self.profile)?
+        } else {
+            rs_decode_step(weights, token_id, rs, self.backend.as_ref())?
+        };
         self.store = Some(new_rs);
         Some(hidden)
     }
@@ -158,6 +170,13 @@ impl KvEngine for MarkovResidualEngine {
     fn memory_bytes(&self) -> usize { self.total_memory_bytes() }
     fn window_tokens(&self) -> usize { self.window_tokens() }
     fn cold_bytes(&self) -> usize { self.cold_bytes() }
+
+    fn stage_summary(&self) -> Option<DecodeStageSummary> {
+        if !self.profiling || self.profile.decode_total.count == 0 {
+            return None;
+        }
+        Some(self.profile.summary("markov-rs", self.backend.name()))
+    }
 }
 
 // ─── Core functions ───────────────────────────────────────────────────────────
@@ -196,6 +215,7 @@ pub fn rs_prefill(
     let mut rs = RsStore {
         stored,
         cold_residuals: None,
+        cold_kv: None,
         cold_abs_start: 0,
         next_position: seq_len,
         max_window,
@@ -207,7 +227,20 @@ pub fn rs_prefill(
     }
     let cold_rows = cold.first().map_or(0, |c| c.shape()[0]);
     if cold_rows > 0 {
+        // Pre-compute and cache K/V for the cold residuals. These are static —
+        // the same tokens at the same absolute positions — so we compute them once
+        // here and reuse them every decode step instead of running recompute_kv
+        // on the full (cold + hot) concat each time.
+        let cold_kv: Vec<SharedKV> = (0..num_layers)
+            .map(|layer| {
+                let h = &cold[layer];
+                let (k, v) = recompute_kv(weights, h, layer, 0, backend)
+                    .expect("cold K/V pre-computation failed");
+                (k, v)
+            })
+            .collect();
         rs.cold_residuals = Some(cold);
+        rs.cold_kv = Some(cold_kv);
         rs.cold_abs_start = 0;
     }
 
@@ -216,53 +249,139 @@ pub fn rs_prefill(
     RsPrefillResult { hidden: last_row(&h), store: rs, memory_bytes, window_tokens }
 }
 
-/// Run one decode step, recomputing K/V from stored residuals.
+/// Run one decode step using cached cold K/V + recomputed hot K/V.
+///
+/// When `rs.cold_kv` is populated (set during `rs_prefill`), the cold tier's
+/// K/V is read from cache — avoiding the dominant per-step cost of running
+/// `recompute_kv` on static residuals that never change.
+///
+/// `profiler` accumulates per-stage times when `Some`.
 pub fn rs_decode_step(
     weights: &ModelWeights,
     new_token_id: u32,
     rs: RsStore,
     backend: &dyn ComputeBackend,
 ) -> Option<(Array2<f32>, RsStore)> {
+    rs_decode_step_inner(weights, new_token_id, rs, backend, None)
+}
+
+pub(crate) fn rs_decode_step_profiled(
+    weights: &ModelWeights,
+    new_token_id: u32,
+    rs: RsStore,
+    backend: &dyn ComputeBackend,
+    profiler: &mut EngineProfiler,
+) -> Option<(Array2<f32>, RsStore)> {
+    rs_decode_step_inner(weights, new_token_id, rs, backend, Some(profiler))
+}
+
+fn rs_decode_step_inner(
+    weights: &ModelWeights,
+    new_token_id: u32,
+    rs: RsStore,
+    backend: &dyn ComputeBackend,
+    mut profiler: Option<&mut EngineProfiler>,
+) -> Option<(Array2<f32>, RsStore)> {
+    use std::time::Instant;
+
     let num_layers = weights.num_layers;
     let abs_position = rs.next_position;
+    let t_step = if profiler.is_some() { Some(Instant::now()) } else { None };
 
     let mut h_new = embed_tokens_pub(weights, &[new_token_id]);
     let mut new_stored: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
 
+    // Accumulated per-stage times across layers for this step.
+    let mut recompute_cold_us = 0.0f64;
+    let mut recompute_hot_us  = 0.0f64;
+    let mut attention_us = 0.0f64;
+    let mut ffn_us = 0.0f64;
+
     for layer in 0..num_layers {
         let h_hot = &rs.stored[layer];
         let s_hot = h_hot.shape()[0];
+        let hot_abs_start = abs_position.saturating_sub(s_hot);
 
-        let (h_full, full_abs_start) = if let Some(cold) = &rs.cold_residuals {
-            let h_cold = &cold[layer];
-            let s_cold = h_cold.shape()[0];
-            if s_cold > 0 {
-                let hidden = h_hot.shape()[1];
-                let mut combined = Array2::<f32>::zeros((s_cold + s_hot, hidden));
-                combined.slice_mut(s![..s_cold, ..]).assign(h_cold);
-                combined.slice_mut(s![s_cold.., ..]).assign(h_hot);
-                (combined, rs.cold_abs_start)
-            } else {
-                (h_hot.clone(), abs_position.saturating_sub(s_hot))
-            }
+        // ── K/V for the full attention prefix (cold + hot) ──────────────────
+        //
+        // Optimisation: if `cold_kv` is cached (populated during rs_prefill),
+        // skip recompute_kv for the cold tier entirely.  Only recompute the hot
+        // window, then concat with the pre-computed cold K/V.
+        let (k_full, v_full) = if let Some(cold_kv) = &rs.cold_kv {
+            // Cold tier: read from cache (zero extra compute).
+            let (k_cold, v_cold) = &cold_kv[layer];
+
+            // Hot tier: recompute from hot-window residuals only.
+            let t_hot = if profiler.is_some() { Some(Instant::now()) } else { None };
+            let (k_hot, v_hot) = recompute_kv(weights, h_hot, layer, hot_abs_start, backend)?;
+            if let Some(t) = t_hot { recompute_hot_us += t.elapsed().as_secs_f64() * 1e6; }
+
+            // Concat: cold K/V (static) + hot K/V (fresh).
+            let c = k_cold.shape()[0];
+            let kv_dim = k_cold.shape()[1];
+            let mut k_combined = Array2::<f32>::zeros((c + s_hot, kv_dim));
+            k_combined.slice_mut(s![..c, ..]).assign(k_cold);
+            k_combined.slice_mut(s![c.., ..]).assign(&k_hot);
+            let mut v_combined = Array2::<f32>::zeros((c + s_hot, kv_dim));
+            v_combined.slice_mut(s![..c, ..]).assign(v_cold);
+            v_combined.slice_mut(s![c.., ..]).assign(&v_hot);
+            (k_combined, v_combined)
         } else {
-            (h_hot.clone(), abs_position.saturating_sub(s_hot))
+            // No cache: fall back to full recompute on cold+hot concat.
+            let (h_full, full_abs_start) = if let Some(cold) = &rs.cold_residuals {
+                let h_cold = &cold[layer];
+                let s_cold = h_cold.shape()[0];
+                if s_cold > 0 {
+                    let hidden = h_hot.shape()[1];
+                    let mut combined = Array2::<f32>::zeros((s_cold + s_hot, hidden));
+                    combined.slice_mut(s![..s_cold, ..]).assign(h_cold);
+                    combined.slice_mut(s![s_cold.., ..]).assign(h_hot);
+                    (combined, rs.cold_abs_start)
+                } else {
+                    (h_hot.clone(), hot_abs_start)
+                }
+            } else {
+                (h_hot.clone(), hot_abs_start)
+            };
+            let t_cold = if profiler.is_some() { Some(Instant::now()) } else { None };
+            let (k, v) = recompute_kv(weights, &h_full, layer, full_abs_start, backend)?;
+            if let Some(t) = t_cold { recompute_cold_us += t.elapsed().as_secs_f64() * 1e6; }
+            (k, v)
         };
 
-        let (k_recomputed, v_recomputed) =
-            recompute_kv(weights, &h_full, layer, full_abs_start, backend)?;
-
+        // Save pre-layer residual before processing the new token.
         new_stored.push(h_new.clone());
 
+        // ── Attention ────────────────────────────────────────────────────────
+        let t_attn = if profiler.is_some() { Some(Instant::now()) } else { None };
         let (h_post_attn, _new_kv) = run_attention_block_decode_step_backend(
-            weights, &h_new, layer, Some(&(k_recomputed, v_recomputed)), abs_position, Some(backend),
+            weights, &h_new, layer, Some(&(k_full, v_full)), abs_position, Some(backend),
         )?;
+        if let Some(t) = t_attn { attention_us += t.elapsed().as_secs_f64() * 1e6; }
 
+        // ── FFN ──────────────────────────────────────────────────────────────
+        let t_ffn = if profiler.is_some() { Some(Instant::now()) } else { None };
         let bffn = BackendFfn { weights, backend };
         let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &bffn, false);
+        if let Some(t) = t_ffn { ffn_us += t.elapsed().as_secs_f64() * 1e6; }
+
         h_new = h_out;
     }
 
+    // ── Update profiler ─────────────────────────────────────────────────────
+    if let (Some(prof), Some(t_step)) = (profiler.as_mut(), t_step) {
+        prof.recompute_cold.total_us += recompute_cold_us;
+        prof.recompute_cold.count += 1;
+        prof.recompute_hot.total_us += recompute_hot_us;
+        prof.recompute_hot.count += 1;
+        prof.attention.total_us += attention_us;
+        prof.attention.count += 1;
+        prof.ffn.total_us += ffn_us;
+        prof.ffn.count += 1;
+        prof.decode_total.record(t_step);
+    }
+
+    // ── Update hot window ───────────────────────────────────────────────────
     let mut updated_stored: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
     for (stored, new_row) in rs.stored.iter().zip(new_stored.iter()) {
         let s_old = stored.shape()[0];
@@ -274,17 +393,22 @@ pub fn rs_decode_step(
     }
 
     let cold_residuals = rs.cold_residuals;
+    let cold_kv = rs.cold_kv;
     let cold_abs_start = rs.cold_abs_start;
     let max_window = rs.max_window;
 
     let mut updated_rs = RsStore {
         stored: updated_stored,
         cold_residuals,
+        cold_kv,
         cold_abs_start,
         next_position: abs_position + 1,
         max_window,
     };
 
+    // Clip hot window; merge overflow into cold tier.
+    // Note: we don't update cold_kv for overflow rows here — the cold tier
+    // grows only during prefill, not during the decode loop for a fixed prompt.
     let mut overflow: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
     for layer in 0..num_layers {
         updated_rs.clip_layer(layer, &mut overflow);
@@ -307,6 +431,9 @@ pub fn rs_decode_step(
                 updated_rs.cold_residuals = Some(overflow);
             }
         }
+        // cold_kv is invalidated by overflow; clear it so future steps fall back
+        // to full recompute for correctness.
+        updated_rs.cold_kv = None;
     }
 
     Some((last_row(&h_new), updated_rs))
@@ -399,6 +526,7 @@ mod tests {
         RsStore {
             stored,
             cold_residuals: None,
+            cold_kv: None,
             cold_abs_start: 0,
             next_position: seq_len,
             max_window: window,
@@ -497,6 +625,7 @@ mod tests {
         let mut rs = RsStore {
             stored: hot,
             cold_residuals: Some(existing_cold),
+            cold_kv: None,
             cold_abs_start: 0,
             next_position: 5,
             max_window: Some(window),
