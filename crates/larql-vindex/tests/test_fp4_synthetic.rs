@@ -10,6 +10,7 @@
 //! points that doesn't depend on a developer having converted the
 //! reference vindex. Complements the real-fixture integration test.
 
+use larql_vindex::format::filenames::*;
 use std::path::Path;
 
 use larql_models::quant::fp4_block::BLOCK_ELEMENTS;
@@ -86,9 +87,9 @@ fn build_minimal_vindex() -> (
     let up_refs: Vec<&[f32]> = up.iter().map(|v| v.as_slice()).collect();
     let down_refs: Vec<&[f32]> = down.iter().map(|v| v.as_slice()).collect();
 
-    write_fp4_projection(&dir.join("gate_vectors_fp4.bin"), hidden, &gate_refs).unwrap();
-    write_fp4_projection(&dir.join("up_features_fp4.bin"), hidden, &up_refs).unwrap();
-    write_fp8_projection(&dir.join("down_features_fp8.bin"), hidden, &down_refs).unwrap();
+    write_fp4_projection(&dir.join(GATE_VECTORS_FP4_BIN), hidden, &gate_refs).unwrap();
+    write_fp4_projection(&dir.join(UP_FEATURES_FP4_BIN), hidden, &up_refs).unwrap();
+    write_fp8_projection(&dir.join(DOWN_FEATURES_FP8_BIN), hidden, &down_refs).unwrap();
 
     // Index.json — uses Default derive + FRU.
     let layers: Vec<VindexLayerInfo> = per_layer_features

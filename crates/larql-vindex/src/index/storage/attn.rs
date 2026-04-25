@@ -16,7 +16,7 @@ use crate::index::core::VectorIndex;
 impl VectorIndex {
     /// Load Q8 attention weights + manifest for GPU full pipeline.
     pub fn load_attn_q8(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join("attn_weights_q8.bin");
+        let path = dir.join(ATTN_WEIGHTS_Q8_BIN);
         if !path.exists() {
             return Err(VindexError::Parse("attn_weights_q8.bin not found".into()));
         }
@@ -24,7 +24,7 @@ impl VectorIndex {
         let mmap = unsafe { mmap_optimized(&file)? };
         self.projections.attn_q8_mmap = Some(Arc::new(mmap));
 
-        let manifest_path = dir.join("attn_weights_q8_manifest.json");
+        let manifest_path = dir.join(ATTN_WEIGHTS_Q8_MANIFEST_JSON);
         if manifest_path.exists() {
             let json: Vec<serde_json::Value> = serde_json::from_str(
                 &std::fs::read_to_string(&manifest_path)
@@ -85,15 +85,28 @@ impl VectorIndex {
                     .map_err(|e| VindexError::Parse(e.to_string()))?
             ).map_err(|e| VindexError::Parse(e.to_string()))?;
 
-            // Each entry: {key, shape, format, offset, length}
+            // Each entry: {key, shape, format, offset, length}.
+            //
+            // Format is required. We used to default to `"Q4_K"` here
+            // when the field was missing, which silently masked
+            // malformed manifests — see ROADMAP P0 "Replace
+            // unwrap_or(Q4_K) silent fallbacks".
             let entries: Vec<(usize, usize, String)> = json.iter()
                 .map(|e| {
                     let offset = e["offset"].as_u64().unwrap_or(0) as usize;
                     let length = e["length"].as_u64().unwrap_or(0) as usize;
-                    let format = e["format"].as_str().unwrap_or("Q4_K").to_string();
-                    (offset, length, format)
+                    let tag = e["format"].as_str().ok_or_else(|| VindexError::Parse(
+                        "attn_weights_q4k_manifest entry missing `format` field".into(),
+                    ))?;
+                    if crate::quant::registry::lookup(tag).is_none() {
+                        return Err(VindexError::Parse(format!(
+                            "attn_weights_q4k_manifest: unknown format tag {tag:?} \
+                             — quant::registry has no entry"
+                        )));
+                    }
+                    Ok((offset, length, tag.to_string()))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, VindexError>>()?;
             self.projections.attn_q4k_manifest = Some(entries);
         }
         self.projections.attn_q4k_mmap = Some(Arc::new(mmap));
@@ -117,7 +130,7 @@ impl VectorIndex {
 
     /// Load Q4 attention weights + manifest for GPU full pipeline.
     pub fn load_attn_q4(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join("attn_weights_q4.bin");
+        let path = dir.join(ATTN_WEIGHTS_Q4_BIN);
         if !path.exists() {
             return Err(VindexError::Parse("attn_weights_q4.bin not found".into()));
         }
@@ -126,7 +139,7 @@ impl VectorIndex {
         self.projections.attn_q4_mmap = Some(Arc::new(mmap));
 
         // Load manifest with per-matrix offsets
-        let manifest_path = dir.join("attn_weights_q4_manifest.json");
+        let manifest_path = dir.join(ATTN_WEIGHTS_Q4_MANIFEST_JSON);
         if manifest_path.exists() {
             let json: Vec<serde_json::Value> = serde_json::from_str(
                 &std::fs::read_to_string(&manifest_path)

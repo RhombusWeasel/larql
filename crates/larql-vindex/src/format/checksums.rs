@@ -38,7 +38,7 @@ pub fn compute_checksums(dir: &Path) -> Result<HashMap<String, String>, VindexEr
         "up_weights.bin",
         "down_weights.bin",
         NORMS_BIN,
-        "lm_head.bin",
+        LM_HEAD_BIN,
     ];
 
     for filename in &files {

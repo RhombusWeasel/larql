@@ -25,6 +25,18 @@ pub enum Activation {
     GeluTanh,
 }
 
+/// Optional fused activation+down kernels. When `down_format == Q4_K`
+/// and the matching kernel is supplied, [`encode_gated`] skips the
+/// separate GEGLU dispatch and dispatches the fused kernel —
+/// eliminates one dispatch + the inter-sized activation buffer
+/// write/read per position.
+pub struct FusedGegluDown<'a> {
+    /// `q4k_geglu_silu_down` — Llama, Mistral, Qwen (SiLU activation).
+    pub silu: Option<&'a crate::metal::kernel::KernelHandle>,
+    /// `q4k_geglu_gelu_tanh_down` — Gemma, GPT-2, Phi.
+    pub gelu_tanh: Option<&'a crate::metal::kernel::KernelHandle>,
+}
+
 /// Gated FFN (Llama / Gemma / Qwen): `down(act(gate) * up)`.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_gated(
@@ -32,6 +44,7 @@ pub fn encode_gated(
     pipes: &quant_matvec::Pipelines<'_>,
     geglu_silu_pipeline: &ComputePipelineState,
     geglu_gelu_tanh_pipeline: &ComputePipelineState,
+    fused_down: FusedGegluDown<'_>,
     gate_format: crate::QuantFormat,
     up_format: crate::QuantFormat,
     down_format: crate::QuantFormat,
@@ -75,7 +88,41 @@ pub fn encode_gated(
         );
     }
 
-    // Multi-position elementwise GEGLU.
+    // Fast path: Q4_K down + supplied fused kernel → skip GEGLU
+    // dispatch entirely, fuse activation into down. Otherwise, fall
+    // through to the separated path.
+    let fused_kernel = if down_format == crate::QuantFormat::Q4_K {
+        match activation {
+            Activation::SiLU => fused_down.silu,
+            Activation::GeluTanh => fused_down.gelu_tanh,
+        }
+    } else {
+        None
+    };
+
+    if let Some(kernel) = fused_kernel {
+        for pos in 0..seq_len {
+            let h_off = pos as u64 * h_stride_bytes;
+            let inter_off = pos as u64 * inter_stride_bytes;
+            let n_tgs = (hidden as u64).div_ceil(kernel.rows_per_tg);
+            let n_val = hidden as u32;
+            let k_val = inter as u32;
+            enc.set_compute_pipeline_state(&kernel.state);
+            enc.set_buffer(0, Some(down_buf), 0);
+            enc.set_buffer(1, Some(gate_scratch), inter_off);
+            enc.set_buffer(2, Some(up_scratch), inter_off);
+            enc.set_buffer(3, Some(down_out), h_off);
+            enc.set_bytes(4, 4, &n_val as *const u32 as *const c_void);
+            enc.set_bytes(5, 4, &k_val as *const u32 as *const c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(n_tgs, 1, 1),
+                MTLSize::new(kernel.threads_per_tg, 1, 1),
+            );
+        }
+        return;
+    }
+
+    // Separated path: GEGLU then format-aware down.
     {
         let total_inter = (seq_len * inter) as u64;
         let total_inter_val = (seq_len * inter) as u32;
@@ -91,9 +138,6 @@ pub fn encode_gated(
         enc.dispatch_threads(MTLSize::new(total_inter, 1, 1), MTLSize::new(256, 1, 1));
     }
 
-    // Down projection per position. Q4_K / Q4_KF / Q6_K take f32 input
-    // (no Q8 staging). Q4_0 / Q8_0 here fall through the generic path —
-    // today no production vindex uses those formats for down.
     for pos in 0..seq_len {
         let h_off = pos as u64 * h_stride_bytes;
         let inter_off = pos as u64 * inter_stride_bytes;

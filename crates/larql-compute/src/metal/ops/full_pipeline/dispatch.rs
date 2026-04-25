@@ -116,6 +116,12 @@ pub fn dispatch_full_pipeline(
     rope_at_pos_pipeline: Option<&ComputePipelineState>,
     qk_norm_pipeline: Option<&ComputePipelineState>,
     scale_vector_pipeline: Option<&ComputePipelineState>,
+    // Fused activation+down kernels (KernelHandles). Engaged when
+    // down.format == Q4_K — saves one dispatch + an inter-sized
+    // activation buffer write/read per position. None for backends
+    // that don't have these compiled.
+    fused_q4k_geglu_silu_down: Option<&crate::metal::kernel::KernelHandle>,
+    fused_q4k_geglu_gelu_tanh_down: Option<&crate::metal::kernel::KernelHandle>,
     kv_cache: Option<&mut crate::metal::ops::kv_cache::KVCache>,
     layers: &[crate::FullPipelineLayer],
     x: &[f32],
@@ -398,6 +404,10 @@ pub fn dispatch_full_pipeline(
             } else {
                 ffn::encode_gated(
                     enc, &qm_pipes, geglu_pipeline, geglu_gelu_tanh_pipeline,
+                    ffn::FusedGegluDown {
+                        silu: fused_q4k_geglu_silu_down,
+                        gelu_tanh: fused_q4k_geglu_gelu_tanh_down,
+                    },
                     layers[l].gate.format, layers[l].up.format, layers[l].down.format, act,
                     &gate_bufs[l], &up_bufs[l], &down_bufs[l],
                     &ffn_norm_outs[l], &ffn_q8_bufs[l], &ffn_q8s_bufs[l],

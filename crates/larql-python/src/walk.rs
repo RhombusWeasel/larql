@@ -57,7 +57,7 @@ fn load_mmap_weights(dir: &Path) -> Result<(ModelWeights, Vec<WeightMmap>), Stri
     let mut mmaps: Vec<WeightMmap> = Vec::new();
     let mut mmap_index: HashMap<String, usize> = HashMap::new();
 
-    let weight_files = ["attn_weights.bin", "up_weights.bin", "down_weights.bin", "norms.bin", "lm_head.bin"];
+    let weight_files = ["attn_weights.bin", "up_weights.bin", "down_weights.bin", "norms.bin", LM_HEAD_BIN];
     for fname in &weight_files {
         let path = dir.join(fname);
         if path.exists() {

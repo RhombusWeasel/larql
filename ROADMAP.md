@@ -585,6 +585,44 @@ the attention weights taking a third of RAM.
 
 ## Done (ship log)
 
+### Wired fused `q4k_geglu_silu_down` / `q4k_geglu_gelu_tanh_down` (2026-04-25)
+
+**~6 % decode speedup on all-Q4_K extracts** (gemma3-4b-q4k-downq4k:
+65.8 → 70.1 tok/s, GPU forward 14.06 → 13.26ms). The fused
+activation+down kernel skips one dispatch + the `inter`-sized
+activation buffer write/read per layer per position. Production
+extracts using Q6_K down (gemma3-4b-q4k-v2, llama2-7b-q4k,
+mistral-7b-q4k) keep the separated path — the fused kernel only
+handles Q4_K down, see follow-up below for Q6_K extension.
+
+**Why it wasn't wired before.** The shader, `KernelHandle` markers,
+and pipeline state were all shipped but no caller dispatched it —
+listed as "experimental / unwired" in the README. The
+`compare_ollama` diagnostic surfaced FFN as the bottleneck (87 % of
+GPU forward) and pointed at this kernel as low-hanging fruit.
+
+**What landed.**
+- Routed in `metal/decode/encode_ffn.rs::encode_q4k_ffn` via a new
+  `encode_q4k_fused_geglu_down` helper. Gated on
+  `layer.down.format == Q4_K` so Q6_K-down models (the production
+  default for Gemma 3/4) keep the original path.
+- Routed in `metal/stages/ffn.rs::encode_gated` via a new
+  `FusedGegluDown { silu, gelu_tanh }` argument. Same gating.
+- `dispatch_full_pipeline` extended with two optional
+  `KernelHandle` params; both `decode_token_with_moe` and
+  `prefill_q4` hand them in.
+
+**Pinned by.** New `tests/test_kernel_q4k_geglu_down.rs` —
+fused-vs-separated parity at four geometries (smoke, gemma3-4b
+production FFN, gemma4-31b FFN, both silu and gelu_tanh
+activations). 5 tests, all green.
+
+**Open follow-up.** Add `q6k_geglu_silu_down` / `q6k_geglu_gelu_tanh_down`
+shaders so the fusion fires on the Gemma 3/4 production path
+(currently their down weights are Q6_K). The Q4_K shader is the
+template; a Q6_K version would unlock the same ~6 % win on every
+production model. ~150 LOC of MSL.
+
 ### `compute` crate hygiene — five of six follow-ups closed (2026-04-25)
 
 Six follow-ups dropped out of the `q4_matvec_v4` review (see the

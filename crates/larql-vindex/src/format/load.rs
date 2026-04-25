@@ -10,8 +10,8 @@ use crate::error::VindexError;
 use crate::config::VindexConfig;
 use crate::format::filenames::{
     DOWN_META_BIN, EMBEDDINGS_BIN, GATE_VECTORS_BIN, INDEX_JSON,
-    INTERLEAVED_Q4K_BIN, INTERLEAVED_Q4K_MANIFEST_JSON, LM_HEAD_Q4_BIN,
-    TOKENIZER_JSON,
+    INTERLEAVED_Q4K_BIN, INTERLEAVED_Q4K_MANIFEST_JSON,
+    LM_HEAD_BIN, LM_HEAD_Q4_BIN, TOKENIZER_JSON,
 };
 use crate::index::{IndexLoadCallbacks, VectorIndex};
 
@@ -198,7 +198,7 @@ impl VectorIndex {
         // `lm_head_q4.bin` is present in the vindex directory. The
         // untied models that ship those files are always extracted with
         // one of them, so presence is a reliable untied-signal.
-        let has_separate_lm_head = dir.join("lm_head.bin").exists()
+        let has_separate_lm_head = dir.join(LM_HEAD_BIN).exists()
             || dir.join(LM_HEAD_Q4_BIN).exists();
         if !has_separate_lm_head {
             if let Ok(f) = std::fs::File::open(dir.join(EMBEDDINGS_BIN)) {

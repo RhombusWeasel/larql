@@ -18,6 +18,174 @@
 - `make coverage` + `make coverage-summary` ready (`cargo-llvm-cov`
   install required)
 
+## P0: Round 2 cleanup (2026-04-25 second audit)
+
+The first audit shipped (registry, filenames module, substores, file
+splits, golden tests, coverage). A second audit on the post-refactor
+state caught residue from that work plus paths the first scan missed.
+
+### Add 8 missing filename constants
+**Impact**: Closes the "wrong filename → silent fallback" class for the
+files the first audit didn't grep for
+**Effort**: Low
+**Status**: Not started
+
+The first migration covered the 19 names in the original list but
+missed:
+
+| Constant | Occurrences | Why missed |
+|---|---|---|
+| `LM_HEAD_BIN` | **10×** | not in first grep — used in extract, walk, build_lm_head_q4, convert_q4k, load, checksums, huggingface, write_f32, lm_head |
+| `GATE_VECTORS_FP4_BIN` | 7× | FP4 family (exp 26) landed after baseline |
+| `DOWN_FEATURES_FP8_BIN` | 5× | same |
+| `UP_FEATURES_FP4_BIN` | 4× | same |
+| `ATTN_WEIGHTS_Q4_BIN` + `ATTN_WEIGHTS_Q4_MANIFEST_JSON` | 1× each | low-traffic sibling of Q4K manifest |
+| `ATTN_WEIGHTS_Q8_BIN` + `ATTN_WEIGHTS_Q8_MANIFEST_JSON` | 1× each | same |
+
+Add to `format::filenames`, migrate the 28 sites.
+
+### Migrate ~20 unmigrated `"Q4_K"`/`"Q6_K"` dispatch sites
+**Impact**: Eliminates the dispatch-by-string-literal class the
+registry was meant to subsume
+**Effort**: Low–Medium
+**Status**: Not started
+
+Of 50 surviving format-tag literals, ~20 are still **dispatch sites**
+in `match` arms / `if format == "Q4_K"` conditionals — the registry
+covers the call shape, but these specific sites weren't migrated.
+Each should become a `registry::lookup(tag)?` lookup with explicit
+error on unknown tags.
+
+### Replace `unwrap_or("Q4_K")` silent fallbacks
+**Impact**: Malformed manifest no longer silently assumes Q4_K
+**Effort**: Tiny
+**Status**: Not started
+
+`ffn_store.rs:276` and `attn.rs:93` both contain
+`unwrap_or("Q4_K")` reads off manifest JSON. A bad / missing
+`format` field today silently defaults to Q4_K, which is exactly the
+silent-fallback class the registry was supposed to kill. Replace with
+`registry::lookup(...)?` returning a parse error.
+
+## P1: Folder + file layout polish (round 2)
+
+### Rename top-level `vindex/src/storage/` → `engine/`
+**Impact**: Removes the `storage/` clash with `index/storage/`
+**Effort**: Low (pure rename)
+**Status**: Not started
+
+Two `storage/` directories at different levels of the tree confuse
+navigation:
+- `vindex/src/storage/` — `engine.rs`, `epoch.rs`, `memit_store.rs`,
+  `status.rs` — that's **L0/L1/L2 lifecycle**, not data layout.
+- `vindex/src/index/storage/` — gate / ffn / projection / metadata
+  substores — actual data access.
+
+The top-level dir's contents are about the `StorageEngine` lifecycle
+(epoch, compaction, MEMIT solver). Rename to `engine/` so the path
+becomes `crate::engine::StorageEngine`. `index/storage/` keeps its
+name (correct for what it holds).
+
+### Rename the duplicate `fp4_storage.rs` files
+**Impact**: Removes the same-filename-different-concerns confusion
+**Effort**: Low (pure rename)
+**Status**: Not started
+
+- `format/fp4_storage.rs` → `format/fp4_codec.rs` (write/read codec
+  + layout math; *encoding* concern)
+- `index/storage/fp4_storage.rs` → `index/storage/fp4_store.rs`
+  (runtime `Fp4Storage` struct + row accessors; matches `gate_store`,
+  `ffn_store` convention)
+
+### Merge `ffn_data.rs` into `ffn_store.rs`
+**Impact**: Removes the awkward data/impl split inside `index/storage/`
+**Effort**: Low
+**Status**: Not started
+
+`ffn_data.rs` (~80 L) carries the `FfnStore` struct + `Clone` impl;
+`ffn_store.rs` (~720 L) carries the `impl VectorIndex` accessor /
+loader methods that touch FfnStore fields. They cite each other in
+every method. Merge — same shape as `gate_store.rs` (which lives in
+one file).
+
+### Inline `gate_trait.rs` (198 L of one-liner pass-through)
+**Impact**: One source of truth for `GateIndex` impl; less file
+juggling when searching for a method
+**Effort**: Low
+**Status**: Not started
+
+Every method in `gate_trait.rs` is `fn foo(...) { self.foo(...) }` —
+identity forwarding because `impl GateIndex for VectorIndex` lives in
+a separate file from the methods themselves. After the refactor the
+ceremony has zero benefit. Move the impl block back next to the
+methods (in `core.rs` or per-concern in `compute/`) and delete the
+file. `PatchedVindex`'s `overlay_gate_trait.rs` stays — its methods
+do real overlay-vs-base lookup work.
+
+### Rename `accessors.rs` → `gate_accessors.rs`
+**Impact**: Generic name disambiguated; future `ffn_accessors.rs` etc.
+follow the same pattern
+**Effort**: Tiny
+**Status**: Not started
+
+`index/storage/accessors.rs` is gate-specific (gate_vector,
+gate_vectors_at, warmup, describe_ffn_backend) but the name implies a
+catch-all accessor module.
+
+## P2: Config split + forward scalability
+
+### Split `config/types.rs` (624 L, 15 unrelated types)
+**Impact**: Future quant/MoE additions scoped to one file
+**Effort**: Medium (move-only)
+**Status**: Not started
+
+Split into:
+- `config/index.rs` — `VindexConfig`, `VindexLayerInfo`, `DownMeta*`
+- `config/quantization.rs` — `QuantFormat`, `Precision`,
+  `ProjectionFormat`, `Projections`, `Fp4Config`
+- `config/model.rs` — `VindexModelConfig` (model family, MoE, rope, …)
+- `config/compliance.rs` — `ComplianceGate`, `LayerBands`
+
+`mod.rs` re-exports the previous flat surface for back-compat.
+
+### Parallelize gate KNN for batch inference
+**Impact**: 2–4× prefill throughput on multi-token batches
+**Effort**: Medium
+**Status**: Forward-looking
+
+`gate_matmul` already runs across all positions in one BLAS call but
+the per-position top-K selection is sequential. Rayon-shard the
+selection across rows (or fold into a single batched argpartial). Not
+urgent — Metal kernel work (Q6_K dequant + 8-rows/TG) is the bigger
+throughput lever.
+
+### `VindexStorage` trait abstraction
+**Impact**: Lets Redis / S3 / GPU-residency backends plug in
+**Effort**: Medium
+**Status**: Forward-looking
+
+The substore extraction got most of the way there. Formalise a
+sealed `VindexStorage` trait (mmap-agnostic row accessor) so Q4K row
+reads can route through Redis-cached or S3-buffered backends without
+walk-kernel changes.
+
+### Expert-level sharding protocol
+**Impact**: Unlocks > 256-expert MoE sharding-within-layer
+**Effort**: Medium
+**Status**: Forward-looking
+
+Today `larql-router` shards by layer, not by expert ID within a
+layer. For DeepSeek-V4-class models (1K+ experts) experts need to
+shard across servers. Add an `ExpertRoute` message type to
+`larql-router-protocol` and wire `GridState` dispatch.
+
+### Won't-fix for now
+
+- **`detect.rs` (1391 L) split** — cohesive; single entry point
+  dispatching to 12 architectures. Splitting fragments without
+  modularity gain. Wait for a second detection system before
+  revisiting.
+
 ## P0: Code-quality cleanup (2026-04-25 audit)
 
 Findings from the codebase-wide audit (six parallel agents covering

@@ -39,7 +39,7 @@ pub(crate) const VINDEX_WEIGHT_FILES: &[&str] = &[
     NORMS_BIN,
     "up_weights.bin",
     "down_weights.bin",
-    "lm_head.bin",
+    LM_HEAD_BIN,
     WEIGHT_MANIFEST_JSON,
 ];
 

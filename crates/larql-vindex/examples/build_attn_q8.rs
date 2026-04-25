@@ -6,6 +6,7 @@
 //! Usage:
 //!   cargo run --release -p larql-vindex --example build_attn_q8 -- <vindex_dir>
 
+use larql_vindex::format::filenames::*;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
@@ -31,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Source: {} ({:.1} MB)", src.display(), mmap.len() as f64 / 1e6);
 
     let t0 = Instant::now();
-    let out_path = dir.join("attn_weights_q8.bin");
+    let out_path = dir.join(ATTN_WEIGHTS_Q8_BIN);
     let mut out = std::fs::File::create(&out_path)?;
     let mut total_q8 = 0usize;
     let mut total_f32 = 0usize;
@@ -121,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Output: {} ({:.1} MB, {:.1}x compression)", out_path.display(), total_q8 as f64 / 1e6, ratio);
     println!("  Time: {:.1}s", elapsed);
 
-    let manifest_out = dir.join("attn_weights_q8_manifest.json");
+    let manifest_out = dir.join(ATTN_WEIGHTS_Q8_MANIFEST_JSON);
     std::fs::write(&manifest_out, serde_json::to_string_pretty(&q8_manifest)?)?;
     println!("  Manifest: {} ({} entries)", manifest_out.display(), q8_manifest.len());
     println!("=== Done ===");

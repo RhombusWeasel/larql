@@ -3,6 +3,7 @@
 //! Usage:
 //!   cargo run --release -p larql-vindex --example build_lm_head_q4 -- <vindex_dir>
 
+use larql_vindex::format::filenames::*;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
@@ -13,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| { eprintln!("Usage: build_lm_head_q4 <vindex_dir>"); std::process::exit(1); });
     let dir = Path::new(&dir);
 
-    let src = dir.join("lm_head.bin");
+    let src = dir.join(LM_HEAD_BIN);
     if !src.exists() {
         return Err("lm_head.bin not found".into());
     }

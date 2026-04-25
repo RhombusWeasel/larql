@@ -167,7 +167,7 @@ pub fn vindex_to_q4k(
         UP_FEATURES_BIN,
         DOWN_FEATURES_BIN,
         INTERLEAVED_BIN,
-        "lm_head.bin",
+        LM_HEAD_BIN,
         NORMS_BIN,
         WEIGHT_MANIFEST_JSON,
         INDEX_JSON,

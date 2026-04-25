@@ -1,5 +1,6 @@
 //! Tests for the larql-vindex crate.
 
+use larql_vindex::format::filenames::*;
 use larql_vindex::{
     FeatureMeta, GateIndex, VectorIndex, VindexConfig, VindexLayerInfo,
 };
@@ -1806,7 +1807,7 @@ fn extract_synthetic_model_f32() {
     assert!(dir.join("up_weights.bin").exists());
     assert!(dir.join("down_weights.bin").exists());
     assert!(dir.join("norms.bin").exists());
-    assert!(dir.join("lm_head.bin").exists());
+    assert!(dir.join(LM_HEAD_BIN).exists());
     assert!(dir.join("weight_manifest.json").exists());
 
     // Binary down_meta should be non-empty (JSONL no longer written)
@@ -2988,7 +2989,7 @@ fn lm_head_knn_returns_top_k() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let lm_bytes: Vec<u8> = lm_head.iter().flat_map(|f| f.to_le_bytes()).collect();
-    std::fs::write(dir.join("lm_head.bin"), &lm_bytes).unwrap();
+    std::fs::write(dir.join(LM_HEAD_BIN), &lm_bytes).unwrap();
 
     let mut idx = VectorIndex::new(vec![None], vec![None], 1, hidden);
     idx.load_lm_head(&dir).unwrap();

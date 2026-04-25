@@ -344,9 +344,9 @@ mod tests {
         let up_refs: Vec<&[f32]> = up.iter().map(|v| v.as_slice()).collect();
         let down_refs: Vec<&[f32]> = down.iter().map(|v| v.as_slice()).collect();
 
-        write_fp4_projection(&tmp.0.join("gate_vectors_fp4.bin"), hidden, &gate_refs).unwrap();
-        write_fp4_projection(&tmp.0.join("up_features_fp4.bin"), hidden, &up_refs).unwrap();
-        write_fp8_projection(&tmp.0.join("down_features_fp8.bin"), hidden, &down_refs).unwrap();
+        write_fp4_projection(&tmp.0.join(GATE_VECTORS_FP4_BIN), hidden, &gate_refs).unwrap();
+        write_fp4_projection(&tmp.0.join(UP_FEATURES_FP4_BIN), hidden, &up_refs).unwrap();
+        write_fp8_projection(&tmp.0.join(DOWN_FEATURES_FP8_BIN), hidden, &down_refs).unwrap();
 
         let storage = Fp4Storage::load(
             &tmp.0,
@@ -373,10 +373,10 @@ mod tests {
         // Write correct gate + up, but truncate down.
         let layer = synth_layer(4, hidden, 1.0);
         let refs: Vec<&[f32]> = vec![layer.as_slice()];
-        write_fp4_projection(&tmp.0.join("gate_vectors_fp4.bin"), hidden, &refs).unwrap();
-        write_fp4_projection(&tmp.0.join("up_features_fp4.bin"), hidden, &refs).unwrap();
+        write_fp4_projection(&tmp.0.join(GATE_VECTORS_FP4_BIN), hidden, &refs).unwrap();
+        write_fp4_projection(&tmp.0.join(UP_FEATURES_FP4_BIN), hidden, &refs).unwrap();
         // Truncated down file — write only 100 bytes instead of full.
-        std::fs::write(tmp.0.join("down_features_fp8.bin"), vec![0u8; 100]).unwrap();
+        std::fs::write(tmp.0.join(DOWN_FEATURES_FP8_BIN), vec![0u8; 100]).unwrap();
 
         let err = Fp4Storage::load(&tmp.0, option_b_cfg(), layer_features.to_vec(), hidden);
         assert!(err.is_err(), "expected size validation to fail on truncated down");
@@ -578,8 +578,8 @@ mod tests {
         let hidden = 256;
         let layer = synth_layer(2, hidden, 1.0);
         let refs: Vec<&[f32]> = vec![layer.as_slice()];
-        write_fp4_projection(&tmp.0.join("gate_vectors_fp4.bin"), hidden, &refs).unwrap();
-        write_fp4_projection(&tmp.0.join("up_features_fp4.bin"), hidden, &refs).unwrap();
+        write_fp4_projection(&tmp.0.join(GATE_VECTORS_FP4_BIN), hidden, &refs).unwrap();
+        write_fp4_projection(&tmp.0.join(UP_FEATURES_FP4_BIN), hidden, &refs).unwrap();
         // No down file at all.
 
         let mut cfg = Cfg::option_b_default();

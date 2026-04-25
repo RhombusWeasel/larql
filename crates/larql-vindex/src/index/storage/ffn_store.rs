@@ -268,15 +268,26 @@ impl VectorIndex {
             )
             .map_err(|e| VindexError::Parse(e.to_string()))?;
 
+            // Format is required. The previous `unwrap_or("Q4_K")`
+            // default silently masked malformed manifests — see
+            // ROADMAP P0 "Replace unwrap_or(Q4_K) silent fallbacks".
             let entries: Vec<(usize, usize, String)> = json
                 .iter()
                 .map(|e| {
                     let offset = e["offset"].as_u64().unwrap_or(0) as usize;
                     let length = e["length"].as_u64().unwrap_or(0) as usize;
-                    let format = e["format"].as_str().unwrap_or("Q4_K").to_string();
-                    (offset, length, format)
+                    let tag = e["format"].as_str().ok_or_else(|| VindexError::Parse(
+                        "interleaved_q4k_manifest entry missing `format` field".into(),
+                    ))?;
+                    if crate::quant::registry::lookup(tag).is_none() {
+                        return Err(VindexError::Parse(format!(
+                            "interleaved_q4k_manifest: unknown format tag {tag:?} \
+                             — quant::registry has no entry"
+                        )));
+                    }
+                    Ok((offset, length, tag.to_string()))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, VindexError>>()?;
             self.ffn.interleaved_q4k_manifest = Some(entries);
         }
         Ok(())

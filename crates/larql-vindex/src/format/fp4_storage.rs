@@ -224,6 +224,9 @@ pub fn read_fp8_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::filenames::{
+        DOWN_FEATURES_FP8_BIN, GATE_VECTORS_FP4_BIN,
+    };
     use std::io::Write as IoWrite;
 
     /// A tempdir helper that cleans up at drop, using std::fs only.
@@ -267,7 +270,7 @@ mod tests {
             .collect();
         let layer_refs: Vec<&[f32]> = layer_values.iter().map(|v| v.as_slice()).collect();
 
-        let path = tmp.0.join("gate_vectors_fp4.bin");
+        let path = tmp.0.join(GATE_VECTORS_FP4_BIN);
         write_fp4_projection(&path, hidden, &layer_refs).unwrap();
 
         let decoded = read_fp4_projection(&path, hidden, &per_layer_features).unwrap();
@@ -302,7 +305,7 @@ mod tests {
             .collect();
         let layer_refs: Vec<&[f32]> = layer_values.iter().map(|v| v.as_slice()).collect();
 
-        let path = tmp.0.join("down_features_fp8.bin");
+        let path = tmp.0.join(DOWN_FEATURES_FP8_BIN);
         write_fp8_projection(&path, hidden, &layer_refs).unwrap();
 
         let decoded = read_fp8_projection(&path, hidden, &per_layer_features).unwrap();
@@ -341,7 +344,7 @@ mod tests {
             .map(|&n| synthetic_layer(n, hidden, 0.9))
             .collect();
         let layer_refs: Vec<&[f32]> = layer_values.iter().map(|v| v.as_slice()).collect();
-        let path = tmp.0.join("gate_vectors_fp4.bin");
+        let path = tmp.0.join(GATE_VECTORS_FP4_BIN);
         write_fp4_projection(&path, hidden, &layer_refs).unwrap();
         let size = std::fs::metadata(&path).unwrap().len() as usize;
         let expected = per_layer_features.iter().sum::<usize>() * fp4_feature_bytes(hidden);

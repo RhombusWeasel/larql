@@ -471,12 +471,12 @@ pub fn write_model_weights_with_opts(
     if write_lm_head {
         if let Some((data, rows, cols)) = source.lm_head() {
             let lm_bytes = crate::config::dtype::encode_floats(&data, dtype);
-            std::fs::write(dir.join("lm_head.bin"), &lm_bytes)?;
+            std::fs::write(dir.join(LM_HEAD_BIN), &lm_bytes)?;
             entries.push(WeightEntry {
                 key: "lm_head.weight".into(), kind: "tensor".into(),
                 shape: vec![rows, cols],
                 offset: 0, length: lm_bytes.len() as u64,
-                file: "lm_head.bin".into(),
+                file: LM_HEAD_BIN.into(),
             });
         }
     }

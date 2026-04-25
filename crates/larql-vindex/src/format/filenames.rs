@@ -38,11 +38,21 @@ pub const INTERLEAVED_Q4K_MANIFEST_JSON: &str = "interleaved_q4k_manifest.json";
 
 // ── Attention weights ──────────────────────────────────────────────────
 pub const ATTN_WEIGHTS_BIN: &str = "attn_weights.bin";
+pub const ATTN_WEIGHTS_Q4_BIN: &str = "attn_weights_q4.bin";
+pub const ATTN_WEIGHTS_Q4_MANIFEST_JSON: &str = "attn_weights_q4_manifest.json";
 pub const ATTN_WEIGHTS_Q4K_BIN: &str = "attn_weights_q4k.bin";
 pub const ATTN_WEIGHTS_Q4K_MANIFEST_JSON: &str = "attn_weights_q4k_manifest.json";
+pub const ATTN_WEIGHTS_Q8_BIN: &str = "attn_weights_q8.bin";
+pub const ATTN_WEIGHTS_Q8_MANIFEST_JSON: &str = "attn_weights_q8_manifest.json";
 
 // ── LM head ────────────────────────────────────────────────────────────
+pub const LM_HEAD_BIN: &str = "lm_head.bin";
 pub const LM_HEAD_Q4_BIN: &str = "lm_head_q4.bin";
+
+// ── FP4 / FP8 projections (exp 26) ─────────────────────────────────────
+pub const GATE_VECTORS_FP4_BIN: &str = "gate_vectors_fp4.bin";
+pub const UP_FEATURES_FP4_BIN: &str = "up_features_fp4.bin";
+pub const DOWN_FEATURES_FP8_BIN: &str = "down_features_fp8.bin";
 
 // ── HuggingFace upload manifest order ──────────────────────────────────
 //
@@ -79,12 +89,16 @@ mod tests {
         let names = [
             INDEX_JSON, TOKENIZER_JSON, TOKENIZER_CONFIG_JSON,
             WEIGHT_MANIFEST_JSON, EMBEDDINGS_BIN, NORMS_BIN,
-            GATE_VECTORS_BIN, GATE_VECTORS_Q4_BIN, DOWN_META_BIN,
-            DOWN_FEATURES_BIN, UP_FEATURES_BIN,
+            GATE_VECTORS_BIN, GATE_VECTORS_Q4_BIN, GATE_VECTORS_FP4_BIN,
+            DOWN_META_BIN, DOWN_FEATURES_BIN, DOWN_FEATURES_FP8_BIN,
+            UP_FEATURES_BIN, UP_FEATURES_FP4_BIN,
             INTERLEAVED_BIN, INTERLEAVED_Q4_BIN, INTERLEAVED_Q4K_BIN,
-            INTERLEAVED_Q4K_MANIFEST_JSON, ATTN_WEIGHTS_BIN,
+            INTERLEAVED_Q4K_MANIFEST_JSON,
+            ATTN_WEIGHTS_BIN,
+            ATTN_WEIGHTS_Q4_BIN, ATTN_WEIGHTS_Q4_MANIFEST_JSON,
             ATTN_WEIGHTS_Q4K_BIN, ATTN_WEIGHTS_Q4K_MANIFEST_JSON,
-            LM_HEAD_Q4_BIN,
+            ATTN_WEIGHTS_Q8_BIN, ATTN_WEIGHTS_Q8_MANIFEST_JSON,
+            LM_HEAD_BIN, LM_HEAD_Q4_BIN,
         ];
         let unique: std::collections::HashSet<_> = names.iter().collect();
         assert_eq!(unique.len(), names.len(), "duplicate filename constant");

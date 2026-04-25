@@ -89,7 +89,7 @@ impl VectorIndex {
 
     /// Load lm_head from lm_head.bin for KNN logit lookup.
     pub fn load_lm_head(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join("lm_head.bin");
+        let path = dir.join(LM_HEAD_BIN);
         if !path.exists() {
             return Err(VindexError::Parse("lm_head.bin not found".into()));
         }

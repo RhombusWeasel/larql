@@ -10,6 +10,7 @@
 //!  - Atomic-rename: `<out>.tmp/` is cleaned up.
 //!  - `force` flag behaves (refuses by default, overwrites when set).
 
+use larql_vindex::format::filenames::*;
 use std::path::{Path, PathBuf};
 
 use larql_vindex::quant::{
@@ -130,8 +131,8 @@ fn vindex_to_fp4_option_b_smoke() {
     // Output layout matches Option B: gate as linked source + up_fp4 + down_fp8.
     assert!(dst.join("index.json").exists(), "index.json missing");
     assert!(dst.join("gate_vectors.bin").exists(), "gate_vectors.bin (source) not linked");
-    assert!(dst.join("up_features_fp4.bin").exists(), "up FP4 file missing");
-    assert!(dst.join("down_features_fp8.bin").exists(), "down FP8 file missing");
+    assert!(dst.join(UP_FEATURES_FP4_BIN).exists(), "up FP4 file missing");
+    assert!(dst.join(DOWN_FEATURES_FP8_BIN).exists(), "down FP8 file missing");
     assert!(dst.join("fp4_compliance.json").exists(), "sidecar missing");
 
     // Staging directory cleaned up.
@@ -148,8 +149,8 @@ fn vindex_to_fp4_option_b_smoke() {
     assert_eq!(projs["up"]["precision"], "fp4");
     assert_eq!(projs["down"]["precision"], "fp8");
     assert_eq!(projs["gate"]["file"], "gate_vectors.bin");
-    assert_eq!(projs["up"]["file"], "up_features_fp4.bin");
-    assert_eq!(projs["down"]["file"], "down_features_fp8.bin");
+    assert_eq!(projs["up"]["file"], UP_FEATURES_FP4_BIN);
+    assert_eq!(projs["down"]["file"], DOWN_FEATURES_FP8_BIN);
 
     // Report fields consistent with Option B.
     assert_eq!(report.policy, Policy::B);
@@ -193,7 +194,7 @@ fn vindex_to_fp4_force_overwrites_existing() {
     let config = Fp4ConvertConfig { policy: Policy::B, force: true, ..Default::default() };
     let _ = vindex_to_fp4(&src, &dst, &config).unwrap();
     assert!(!dst.join("stale.bin").exists(), "force should have cleared stale contents");
-    assert!(dst.join("up_features_fp4.bin").exists());
+    assert!(dst.join(UP_FEATURES_FP4_BIN).exists());
 }
 
 #[test]

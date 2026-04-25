@@ -3,6 +3,10 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
+use crate::format::filenames::{
+    DOWN_FEATURES_FP8_BIN, GATE_VECTORS_FP4_BIN, UP_FEATURES_FP4_BIN,
+};
+
 /// Metadata stored in index.json inside a .vindex directory.
 ///
 /// All fields implement `Default`. Prefer
@@ -288,9 +292,9 @@ impl Fp4Config {
     /// Option B default: FP4 gate + FP4 up + FP8 down.
     pub fn option_b_default() -> Self {
         Self::v1_defaults(Projections {
-            gate: ProjectionFormat { precision: Precision::Fp4, file: "gate_vectors_fp4.bin".into() },
-            up:   ProjectionFormat { precision: Precision::Fp4, file: "up_features_fp4.bin".into() },
-            down: ProjectionFormat { precision: Precision::Fp8, file: "down_features_fp8.bin".into() },
+            gate: ProjectionFormat { precision: Precision::Fp4, file: GATE_VECTORS_FP4_BIN.into() },
+            up:   ProjectionFormat { precision: Precision::Fp4, file: UP_FEATURES_FP4_BIN.into() },
+            down: ProjectionFormat { precision: Precision::Fp8, file: DOWN_FEATURES_FP8_BIN.into() },
         })
     }
 }
@@ -531,8 +535,8 @@ mod fp4_schema_tests {
         assert!(matches!(cfg.projections.gate.precision, Precision::Fp4));
         assert!(matches!(cfg.projections.up.precision, Precision::Fp4));
         assert!(matches!(cfg.projections.down.precision, Precision::Fp8));
-        assert_eq!(cfg.projections.gate.file, "gate_vectors_fp4.bin");
-        assert_eq!(cfg.projections.down.file, "down_features_fp8.bin");
+        assert_eq!(cfg.projections.gate.file, GATE_VECTORS_FP4_BIN);
+        assert_eq!(cfg.projections.down.file, DOWN_FEATURES_FP8_BIN);
         assert_eq!(cfg.compliance_gate.threshold_ratio, 16.0);
         assert_eq!(cfg.compliance_gate.min_compliant_fraction, 0.99);
         assert!(matches!(cfg.compliance_gate.fallback_precision, Precision::Fp8));

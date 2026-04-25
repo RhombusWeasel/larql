@@ -9,6 +9,7 @@
 //!      `vindex_to_q4k`, then verify the output layout, manifest,
 //!      and weight round-trip on a sampled Q4_K block.
 
+use larql_vindex::format::filenames::*;
 use std::path::PathBuf;
 
 use larql_vindex::quant::{vindex_to_q4k, Q4kConvertConfig};
@@ -260,7 +261,7 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
     }
 
     // The f32 weight files vindex_to_q4k explicitly skips from hard-linking.
-    for f in ["attn_weights.bin", "up_weights.bin", "down_weights.bin", "interleaved.bin", "lm_head.bin"] {
+    for f in ["attn_weights.bin", "up_weights.bin", "down_weights.bin", "interleaved.bin", LM_HEAD_BIN] {
         assert!(!dst_dir.join(f).exists(),
             "{f} should NOT have been hard-linked (the Q4K weight files replace it)");
     }

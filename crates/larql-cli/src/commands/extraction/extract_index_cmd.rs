@@ -329,7 +329,7 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
         "up_weights.bin",
         "down_weights.bin",
         NORMS_BIN,
-        "lm_head.bin",
+        LM_HEAD_BIN,
         WEIGHT_MANIFEST_JSON,
     ] {
         let path = args.output.join(name);

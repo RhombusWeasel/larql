@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn attn_matches_quant_variants() {
         assert!(Part::Attn.matches(ATTN_WEIGHTS_BIN));
-        assert!(Part::Attn.matches("attn_weights_q4.bin"));
+        assert!(Part::Attn.matches(ATTN_WEIGHTS_Q4_BIN));
         assert!(Part::Attn.matches(ATTN_WEIGHTS_Q4K_BIN));
         assert!(Part::Attn.matches(ATTN_WEIGHTS_Q4K_MANIFEST_JSON));
         assert!(!Part::Attn.matches(GATE_VECTORS_BIN));

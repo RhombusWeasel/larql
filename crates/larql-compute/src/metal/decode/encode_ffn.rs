@@ -175,26 +175,37 @@ impl MetalBackend {
                 MTLSize::new(q4k_gu::THREADS_PER_TG, 1, 1),
             );
 
-            self.encode_geglu(enc, layer, bufs, inter_val, inter as u64);
-
-            // Down projection — format-aware. Gemma 3 4B ships Q6_K
-            // down even when gate/up are Q4_K. `inter_padded` matches
-            // the stored super-block layout.
-            use crate::metal::stages::quant_matvec::{self as qmv, Pipelines};
-            let pipes = Pipelines {
-                q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
-                q4k_matvec_fallback: &self.q4k_matvec_pipeline.state,
-                q6k_matvec: &self.q6k_matvec_pipeline.state,
-                q4_matvec: &self.q4.matvec,
-            };
-            qmv::encode(
-                enc, layer.down.format, bufs.down_w,
-                bufs.act_buf, 0,
-                bufs.act_buf, 0, bufs.act_buf, 0, // Q8 unused for f32 input
-                bufs.down_out, 0,
-                &pipes,
-                hidden, inter_padded,
-            );
+            // Fast path: down is Q4_K → fused activation+down kernel
+            // skips the GEGLU dispatch and the inter-sized activation
+            // buffer write/read. Verified parity against the
+            // separated path in `test_kernel_q4k_geglu_down.rs`.
+            //
+            // Slow path: down is Q4_KF / Q6_K / Q4_0 → separated
+            // GEGLU then format-aware down dispatch (Gemma 3/4 ship
+            // Q6_K down, so this is the hot path on those models;
+            // the fused kernel is skipped).
+            if layer.down.format == crate::QuantFormat::Q4_K {
+                self.encode_q4k_fused_geglu_down(
+                    enc, layer, bufs, hidden, inter_padded, hidden_val, inter_padded_val,
+                );
+            } else {
+                self.encode_geglu(enc, layer, bufs, inter_val, inter as u64);
+                use crate::metal::stages::quant_matvec::{self as qmv, Pipelines};
+                let pipes = Pipelines {
+                    q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
+                    q4k_matvec_fallback: &self.q4k_matvec_pipeline.state,
+                    q6k_matvec: &self.q6k_matvec_pipeline.state,
+                    q4_matvec: &self.q4.matvec,
+                };
+                qmv::encode(
+                    enc, layer.down.format, bufs.down_w,
+                    bufs.act_buf, 0,
+                    bufs.act_buf, 0, bufs.act_buf, 0, // Q8 unused for f32 input
+                    bufs.down_out, 0,
+                    &pipes,
+                    hidden, inter_padded,
+                );
+            }
             let _ = n_tgs_down;
         } else {
             let n_tgs_up = (inter as u64).div_ceil(q4k::ROWS_PER_TG);
@@ -297,6 +308,42 @@ impl MetalBackend {
         enc.set_buffer(2, Some(bufs.act_buf), 0);
         enc.set_bytes(3, 4, &inter_val as *const u32 as *const std::ffi::c_void);
         enc.dispatch_threads(MTLSize::new(inter_threads, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// Fused `activation(gate) * up → q4k_matvec(W_down)` in one
+    /// dispatch, replacing the separated GEGLU + Q4_K down pair.
+    ///
+    /// Only fires when `layer.down.format == Q4_K` — gated by the
+    /// caller. Picks `silu_down` or `gelu_tanh_down` based on the
+    /// layer's activation. Behaviour pinned by
+    /// `test_kernel_q4k_geglu_down.rs::*_gemma3_4b_ffn`.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_q4k_fused_geglu_down(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        layer: &FullPipelineLayer,
+        bufs: &FfnBufs<'_>,
+        hidden: usize,
+        _inter_padded: usize,
+        hidden_val: u32,
+        inter_padded_val: u32,
+    ) {
+        let kernel = match layer.activation {
+            crate::Activation::GeluTanh => &self.q4k_geglu_gelu_tanh_down_pipeline,
+            _ => &self.q4k_geglu_silu_down_pipeline,
+        };
+        let n_tgs_down = (hidden as u64).div_ceil(kernel.rows_per_tg);
+        enc.set_compute_pipeline_state(&kernel.state);
+        enc.set_buffer(0, Some(bufs.down_w), 0);
+        enc.set_buffer(1, Some(bufs.gate_out_scratch), 0);
+        enc.set_buffer(2, Some(bufs.up_out), 0);
+        enc.set_buffer(3, Some(bufs.down_out), 0);
+        enc.set_bytes(4, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &inter_padded_val as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new(n_tgs_down, 1, 1),
+            MTLSize::new(kernel.threads_per_tg, 1, 1),
+        );
     }
 
     fn encode_activation(
