@@ -219,3 +219,93 @@ fn rope_at_pos_batched_q_heads_global() {
 // require exposing a pipeline accessor we don't have and isn't worth
 // the surface change. The decode-only `rope_at_pos_batched` is what
 // we don't have indirect coverage for, hence the targeted tests above.
+
+// ── rope_at_pos_batched_qk: fused Q+K heads in one dispatch ─────────────────
+
+/// Compare `rope_at_pos_batched_qk` (fused) against two separate
+/// `rope_at_pos_batched` calls (Q heads, then K heads).
+fn assert_rope_batched_qk_matches_separate(
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    rope_base: f32,
+    pos: usize,
+    label: &str,
+) {
+    let metal = get_metal();
+
+    // Same input data for Q and K
+    let q_in: Vec<f32> = (0..num_q_heads * head_dim)
+        .map(|i| ((i as f32 * 0.011).sin() + 0.2) * 0.5)
+        .collect();
+    let k_in: Vec<f32> = (0..num_kv_heads * head_dim)
+        .map(|i| ((i as f32 * 0.013).cos() + 0.1) * 0.5)
+        .collect();
+
+    // Reference: CPU RoPE on Q and K separately
+    let mut ref_q = q_in.clone();
+    let mut ref_k = k_in.clone();
+    for h in 0..num_q_heads {
+        cpu_rope_at_pos(head_dim, rotary_dim, rope_base, pos,
+                        &mut ref_q[h*head_dim..(h+1)*head_dim]);
+    }
+    for h in 0..num_kv_heads {
+        cpu_rope_at_pos(head_dim, rotary_dim, rope_base, pos,
+                        &mut ref_k[h*head_dim..(h+1)*head_dim]);
+    }
+
+    // Fused: rope_at_pos_batched_qk
+    let q_buf = metal.bufs().transient_from_f32(&q_in);
+    let k_buf = metal.bufs().transient_from_f32(&k_in);
+
+    let hd = head_dim as u32;
+    let rdim = rotary_dim as u32;
+    let pos_u = pos as u32;
+    let nq = num_q_heads as u32;
+    let rope_pairs = (if rotary_dim == 0 { head_dim } else { rotary_dim }) / 2;
+    let total_heads = (num_q_heads + num_kv_heads) as u64;
+
+    let cmd = metal.queue().new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&metal.rope_at_pos_batched_qk_pipeline);
+    enc.set_buffer(0, Some(&q_buf), 0);
+    enc.set_buffer(1, Some(&k_buf), 0);
+    enc.set_bytes(2, 4, &hd as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(3, 4, &rope_base as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &pos_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &rdim as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &nq as *const u32 as *const std::ffi::c_void);
+    enc.dispatch_threads(
+        metal::MTLSize::new(rope_pairs as u64, total_heads, 1),
+        metal::MTLSize::new((rope_pairs as u64).min(256), 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let got_q = larql_compute::metal::buffers::read_buffer_f32(&q_buf, num_q_heads * head_dim);
+    let got_k = larql_compute::metal::buffers::read_buffer_f32(&k_buf, num_kv_heads * head_dim);
+
+    let dq = max_diff(&ref_q, &got_q);
+    assert!(dq < 1e-5, "{label} Q: max_diff {dq:.3e}");
+    let dk = max_diff(&ref_k, &got_k);
+    assert!(dk < 1e-5, "{label} K: max_diff {dk:.3e}");
+}
+
+#[test]
+fn rope_at_pos_batched_qk_smoke() {
+    assert_rope_batched_qk_matches_separate(4, 2, 16, 16, 10000.0, 5, "smoke");
+}
+
+#[test]
+fn rope_at_pos_batched_qk_gemma3_4b() {
+    // 32 Q + 16 KV heads, head_dim=256, full rotation, pos=42
+    assert_rope_batched_qk_matches_separate(32, 16, 256, 256, 10000.0, 42, "gemma3-4b");
+}
+
+#[test]
+fn rope_at_pos_batched_qk_partial_rotary() {
+    // Gemma 4 global: head_dim=512, rotary_dim=128 (25%)
+    assert_rope_batched_qk_matches_separate(4, 2, 512, 128, 500000.0, 7, "gemma4-global-partial");
+}

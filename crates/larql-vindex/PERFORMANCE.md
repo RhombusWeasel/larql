@@ -5,6 +5,87 @@ sections preserved for diff continuity. The 2026-04-25 audit added
 end-to-end Q4K decode numbers (was synthetic-only) plus a confirmed
 mmap residency map.
 
+## Perf round-4 (2026-04-25): four shipped wins
+
+End-to-end decode is **86.7 % GPU forward** (lives in `larql-compute`/
+`larql-metal`, not vindex). Vindex itself is a thin mmap shim during
+real Metal decode. The round-4 audit found four measurable
+vindex-side wins; all are shipped, all measured by criterion benches.
+
+### W1. `top_k_from_scores` → bounded min-heap
+
+Replaced the `Vec<(usize, f32)>::select_nth_unstable_by` of size N
+with a `BinaryHeap` of capacity K. Allocation drops from O(N) to
+O(K) — for Gemma 4B walks (K=10, N=10240), 5.4 MB → 16 KB per token.
+
+| Bench | Before | After | Δ |
+|---|---|---|---|
+| `gate_knn 4096×512` | 425 µs | 352 µs | **-18 %** |
+| `walk 14L×4096×512` | 5.79 ms | 2.20 ms | **-62 %** |
+| `gate_knn 10240×2560` | 2.66 ms | 2.65 ms | flat (BLAS dominates) |
+
+`cargo bench -p larql-vindex --bench vindex_ops -- gate_knn_per_layer`
+
+### W2. Feature-major Q4_K down (`down_features_q4k.bin`)
+
+Down-proj is stored `[hidden, intermediate]` on disk, so per-feature
+decode requires gathering across `hidden` separate rows. The legacy
+path (`q4k_ffn_layer` cache) amortises by dequantising the whole
+layer + transposing once. The W2 fix emits a feature-major file at
+extract time so per-feature decode is a single row dequant.
+
+| K (active features) | Cache+transpose | Feature-major | Speedup |
+|---|---|---|---|
+| 100 (sparse) | 77.6 ms | **31.8 µs** | **2440×** |
+| 1024 (medium) | 81.7 ms | **325 µs** | **251×** |
+| 10240 (full) | 82.9 ms | **3.24 ms** | **25×** |
+
+Numbers are *first-access* — the cache amortises across many calls
+to the same layer, so the gap narrows on warm cache. For grid/MoE
+shards (each shard touches each layer once or twice; cache never
+amortises) feature-major is the operating regime.
+
+Opt-in at extract: `--feature-major-down` on `larql extract-index`
+or `larql convert quantize q4k`. Adds ~14 MB / layer to disk on
+Gemma 4B; eliminates the ~840 MB heap cache ceiling.
+
+`cargo bench -p larql-vindex --bench q4k_cache -- q4k_down_cache_vs_feature_major`
+
+### W3. Parallel HNSW warmup across layers
+
+`warmup_hnsw_all_layers()` rayon-shards layer builds. Per-layer HNSW
+build itself stays serial (algorithm requires it). Side-fix:
+`get_or_build_hnsw` no longer holds the cache lock during the ~76 ms
+per-layer build, so concurrent KNN on different layers no longer
+blocks (matters for grid shards with parallel layer-range routing).
+
+| Bench | Serial | Parallel | Speedup |
+|---|---|---|---|
+| dense-8L (10240×2560) | 395 ms | 109 ms | **3.6×** |
+| moe-4L (32768×2560) | 785 ms | 276 ms | **2.8×** |
+
+Estimated 34-layer Gemma 4B HNSW warmup: ~2.6 s serial → ~700 ms
+parallel. Sub-linear in cores because the search-level inner loop is
+memory-bound — bounding BLAS to 1 thread inside the rayon pool was
+investigated and *slightly hurt* (109 → 113 ms), so no further wins
+from BLAS-tuning.
+
+`cargo bench -p larql-vindex --bench hnsw_decode -- hnsw_warmup`
+
+### P2. Parallel batch top-K for prefill
+
+`gate_knn_batch` now `par_iter`s the per-position top-K extraction
+when `seq_len ≥ 16`. Decode (seq_len=1) takes the same serial path
+as before; prefill paths get the parallel speedup.
+
+| seq_len | Serial (RAYON=1) | Parallel | Δ |
+|---|---|---|---|
+| 1 (decode) | 2.78 ms | 2.73 ms | flat (below threshold) |
+| 64 | 5.42 ms | 5.05 ms | -7 % |
+| 256 (typical prefill) | 11.31 ms | 8.56 ms | **-24 %** |
+
+`cargo bench -p larql-vindex --bench vindex_ops -- gate_knn_batch`
+
 ## End-to-end decode (2026-04-25, real Q4K Gemma 3 4B)
 
 `larql bench /path/to/gemma3-4b-q4k-streaming.vindex --tokens 30

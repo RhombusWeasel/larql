@@ -184,3 +184,23 @@ kernel void residual_norm_store(
     }
 }
 "#;
+
+pub struct RmsNormQ8Kernel;
+impl crate::metal::kernel::ShaderKernel for RmsNormQ8Kernel {
+    const KERNEL_NAME: &'static str = "rms_norm_q8";
+}
+
+pub struct ResidualNormKernel;
+impl crate::metal::kernel::ShaderKernel for ResidualNormKernel {
+    const KERNEL_NAME: &'static str = "residual_norm";
+}
+
+pub struct ResidualNormQ8Kernel;
+impl crate::metal::kernel::ShaderKernel for ResidualNormQ8Kernel {
+    const KERNEL_NAME: &'static str = "residual_norm_q8";
+}
+
+pub struct ResidualNormStoreKernel;
+impl crate::metal::kernel::ShaderKernel for ResidualNormStoreKernel {
+    const KERNEL_NAME: &'static str = "residual_norm_store";
+}

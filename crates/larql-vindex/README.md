@@ -307,7 +307,7 @@ the safetensors shards, skipping the f32 intermediate entirely. Pass
 `QuantFormat::Q4k` (or `--quant q4k` on the CLI) to emit Ollama-
 compatible blocks:
 
-- Q/K/O/gate/up → Q4_K (148 bytes per 256 values)
+- Q/K/O/gate/up → Q4_K (144 bytes per 256 values, GGUF-canonical)
 - V/down → Q6_K (210 bytes per 256 values)
 
 Output files: `attn_weights_q4k.bin` + `interleaved_q4k.bin` with
@@ -350,10 +350,83 @@ Load dequantises to f32 at mmap time and inserts into `weights.tensors`.
   `logits_to_predictions` peak on the wrong token — there is no "fail
   loudly" mode for a dropped softcap, only a silent accuracy hit.
 
+## Recommended setup for `larql-inference`
+
+Production decode through `larql-inference` is **full-K Metal**:
+`q4k_matmul_transb` streams Q4_K bytes from the mmap straight into a
+GPU shader (no per-feature loops, no dequant cache). The vindex's job
+on this path is to be a thin mmap shim — most knobs below shift weight
+between disk, RSS, and startup latency rather than steady-state tok/s.
+
+### Default — single-host Metal decode (Gemma / Llama / Qwen / ...)
+
+```bash
+larql extract-index <model> -o <vindex> --quant q4k
+```
+
+That's it. Metal decode bypasses the `q4k_ffn_layer` cache entirely
+(`q4k_ffn_cache after larql-metal: 0 populated slots, 0.0 MB` — see
+`PERFORMANCE.md`), so you don't need `--feature-major-down`. HNSW is
+optional — leave it off unless you're going to interpret-walk.
+
+### Multi-shard grid (`larql-router` + per-layer-range `larql-server`)
+
+```bash
+larql extract-index <model> -o <vindex> --quant q4k --feature-major-down
+```
+
+Each shard `larql-server` mmaps its layer range. Adding
+`--feature-major-down` (W2, see ADR-009) emits `down_features_q4k.bin`,
+which lets each shard skip the ~840 MB heap cache ceiling on its
+slice. Recommended when:
+
+- shard count is high (per-shard RSS budget is tight),
+- the model is large enough that 14 MB / layer of disk overhead is
+  acceptable in exchange for bounded RSS (Gemma 4B → +500 MB),
+- workloads include CPU walk fallback (the cache *would* otherwise fire).
+
+If the shard host has spare cores at startup, eager-build HNSW across
+its layer range:
+
+```rust
+index.enable_hnsw(200);
+index.warmup_hnsw_all_layers();   // 3.6× speedup on 8L Gemma; ~700 ms for 34L
+```
+
+### MoE expert hosts (Kimi K-series, DeepSeek-V3+)
+
+Same as the grid recipe. Each expert host touches its experts once or
+twice per token, never amortising the `q4k_ffn_layer` cache. With
+`--feature-major-down` the per-feature down decode is a single row
+dequant (2440× faster on first access at K=100, 25× at full K — see
+PERFORMANCE.md round-4). Cap the legacy cache at 1 layer or 0:
+
+```bash
+larql serve <vindex> --max-q4k-cache-layers 1
+```
+
+### Interpretability / walk-heavy CPU pipelines
+
+Walks query gate KNN per layer rather than full-K matmul. Enable the
+parallel batch path (automatic for `seq_len ≥ 16`) and HNSW warmup at
+startup:
+
+```rust
+let index = VectorIndex::load_vindex(&path, ...)?;
+index.enable_hnsw(200);
+index.warmup_hnsw_all_layers();
+let trace = index.walk(&query, &layers, 10);
+```
+
+For batch / prefill (multi-position walks), `gate_knn_batch` already
+parallelises per-position top-K extraction when `seq_len ≥ 16` — no
+caller change needed. Production prefill at seq_len=256 sees -24 % vs
+the serial path.
+
 ## Testing
 
 ```bash
-cargo test -p larql-vindex                                                      # 328 tests (180 unit + 148 integration; all green as of 2026-04-25)
+cargo test -p larql-vindex                                                      # 331 tests (180 unit + 151 integration; all green as of 2026-04-25)
 
 # Demos (synthetic fixtures, no model download needed)
 cargo run -p larql-vindex --example demo_features                               # Feature showcase (build, KNN, patches, MoE, f16)
@@ -511,11 +584,12 @@ pinned layers skip PCIe transfers and the gradient steepens.
 | [docs/adr/006](docs/adr/006-hnsw-index.md) | HNSW graph index for sub-linear KNN |
 | [docs/adr/007](docs/adr/007-interleaved-layout.md) | Interleaved weight layout (TLB optimization) |
 | [docs/adr/008](docs/adr/008-quantizer-source-of-truth.md) | Single source of truth for quantizers |
+| [docs/adr/009](docs/adr/009-feature-major-down.md) | Feature-major Q4_K down (W2 cache bypass) |
 
 ## Status
 
 ```
-Tests:      328 passing (180 unit + 148 integration; clippy clean as of 2026-04-25)
+Tests:      331 passing (180 unit + 151 integration; clippy clean as of 2026-04-25)
 Warnings:   0 (build), 0 (clippy --all-targets)
 Formats:    f32, Q8_0, Q4_K, Q6_K, Q4_0, FP4, FP8
 Models:     Gemma 2/3/4, Llama, Mistral, Mixtral, Qwen, Phi, DeepSeek, Granite, StarCoder2, GPT-OSS, GPT-2

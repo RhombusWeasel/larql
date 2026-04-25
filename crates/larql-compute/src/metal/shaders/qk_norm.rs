@@ -108,3 +108,13 @@ kernel void qk_norm_qk(
     }
 }
 "#;
+
+pub struct Kernel;
+impl crate::metal::kernel::ShaderKernel for Kernel {
+    const KERNEL_NAME: &'static str = "qk_norm";
+}
+
+pub struct QkKernel;
+impl crate::metal::kernel::ShaderKernel for QkKernel {
+    const KERNEL_NAME: &'static str = "qk_norm_qk";
+}

@@ -135,3 +135,23 @@ kernel void rope_at_pos_batched_qk(
     x[base_idx + d + hdim] = re * sin_a + im * cos_a;
 }
 "#;
+
+pub struct RopeApplyKernel;
+impl crate::metal::kernel::ShaderKernel for RopeApplyKernel {
+    const KERNEL_NAME: &'static str = "rope_apply";
+}
+
+pub struct RopeAtPosKernel;
+impl crate::metal::kernel::ShaderKernel for RopeAtPosKernel {
+    const KERNEL_NAME: &'static str = "rope_at_pos";
+}
+
+pub struct RopeAtPosBatchedKernel;
+impl crate::metal::kernel::ShaderKernel for RopeAtPosBatchedKernel {
+    const KERNEL_NAME: &'static str = "rope_at_pos_batched";
+}
+
+pub struct RopeAtPosBatchedQkKernel;
+impl crate::metal::kernel::ShaderKernel for RopeAtPosBatchedQkKernel {
+    const KERNEL_NAME: &'static str = "rope_at_pos_batched_qk";
+}

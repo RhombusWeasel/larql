@@ -107,3 +107,13 @@ kernel void kv_cache_append(
     V_cache[pos * total + tid] = new_v[tid];
 }
 "#;
+
+pub struct AttendKernel;
+impl crate::metal::kernel::ShaderKernel for AttendKernel {
+    const KERNEL_NAME: &'static str = "kv_attention";
+}
+
+pub struct AppendKernel;
+impl crate::metal::kernel::ShaderKernel for AppendKernel {
+    const KERNEL_NAME: &'static str = "kv_cache_append";
+}

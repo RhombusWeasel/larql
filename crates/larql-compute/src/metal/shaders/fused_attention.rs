@@ -193,3 +193,8 @@ kernel void fused_attention(
     }
 }
 "#;
+
+pub struct Kernel;
+impl crate::metal::kernel::ShaderKernel for Kernel {
+    const KERNEL_NAME: &'static str = "fused_attention";
+}

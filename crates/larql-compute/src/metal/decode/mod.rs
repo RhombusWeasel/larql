@@ -272,10 +272,6 @@ impl MetalBackend {
                 let rdim = layer_rotary_dim as u32;
                 let rope_pairs = (layer_rotary_dim / 2) as u64;
                 let num_q = layer_num_q_heads as u32;
-                let num_kv = layer_num_kv_heads as u32;
-
-                // Fused Q+K RoPE: one dispatch covers rope_pairs × (q+kv heads).
-                // Saves 1 dispatch per layer × 34 = 34 dispatches/token.
                 let total_qk_heads = (layer_num_q_heads + layer_num_kv_heads) as u64;
                 enc.set_compute_pipeline_state(&self.rope_at_pos_batched_qk_pipeline);
                 enc.set_buffer(0, Some(&q_out), 0);
@@ -338,8 +334,8 @@ impl MetalBackend {
                 use crate::metal::stages::quant_matvec::Pipelines;
                 let pipes = Pipelines {
                     q4kf_proj: Some(&self.q4kf_proj_pipeline.state),
-                    q4k_matvec_fallback: &self.q4k_proj_pipeline.state,
-                    q6k_matvec: &self.q6k_matvec_pipeline.state,
+                    q4k_matvec_fallback: &self.q4k_proj_pipeline,
+                    q6k_matvec: &self.q6k_matvec_pipeline,
                     q4_matvec: &self.q4.matvec,
                 };
                 crate::metal::stages::o_proj::encode(

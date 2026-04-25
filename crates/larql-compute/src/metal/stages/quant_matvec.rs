@@ -34,19 +34,16 @@ use crate::metal::kernel::KernelHandle;
 /// passes `None` for `q4kf_proj`). The dispatcher falls back to
 /// `q4k_matvec_fallback` when the preferred shader is absent.
 ///
-/// `q4_matvec` is a [`KernelHandle`] — geometry travels with the
-/// pipeline (the bug class q4_matvec_v4 hit). The `q4k_*` / `q6k_*`
-/// fields are still bare `ComputePipelineState` because some callsites
-/// hand in `q4k_proj` for the matvec slot (a different pipeline that
-/// happens to share the dispatcher contract). Wrapping those in
-/// `KernelHandle` is its own follow-up — markers exist at
-/// `shaders::q4k_matvec::Kernel`, `shaders::q6k_matvec::Kernel`, etc.
+/// All fields are now `&KernelHandle` so geometry travels with the
+/// pipeline — the bug class where a different pipeline (e.g. `q4k_proj`)
+/// was passed in the matvec slot and the dispatch used the WRONG
+/// `ROWS_PER_TG` from the shader module is now caught at compile time.
 pub struct Pipelines<'a> {
     /// Preferred shader for `Q4_K` / `Q4_KF` — 144-byte GGUF llama.cpp-exact.
     pub q4kf_proj: Option<&'a ComputePipelineState>,
     /// Fallback for `Q4_K` if `q4kf_proj` is unavailable.
-    pub q4k_matvec_fallback: &'a ComputePipelineState,
-    pub q6k_matvec: &'a ComputePipelineState,
+    pub q4k_matvec_fallback: &'a KernelHandle,
+    pub q6k_matvec: &'a KernelHandle,
     pub q4_matvec: &'a KernelHandle,
 }
 
@@ -99,12 +96,9 @@ pub fn encode(
                     MTLSize::new(q4kf::THREADS_PER_TG, 1, 1),
                 );
             } else {
-                // Bare pipeline path — geometry comes from the shader
-                // module (callsites hand in either q4k_matvec or
-                // q4k_proj here, which happen to share dispatch shape).
-                use crate::metal::shaders::q4k_matvec as q4k;
-                let num_tgs = (num_rows as u64).div_ceil(q4k::ROWS_PER_TG);
-                enc.set_compute_pipeline_state(pipes.q4k_matvec_fallback);
+                let kh = pipes.q4k_matvec_fallback;
+                let num_tgs = (num_rows as u64).div_ceil(kh.rows_per_tg);
+                enc.set_compute_pipeline_state(&kh.state);
                 enc.set_buffer(0, Some(w_buf), 0);
                 enc.set_buffer(1, Some(f32_in), f32_in_off);
                 enc.set_buffer(2, Some(out_buf), out_off);
@@ -112,14 +106,14 @@ pub fn encode(
                 enc.set_bytes(4, 4, &k as *const u32 as *const c_void);
                 enc.dispatch_thread_groups(
                     MTLSize::new(num_tgs, 1, 1),
-                    MTLSize::new(q4k::THREADS_PER_TG, 1, 1),
+                    MTLSize::new(kh.threads_per_tg, 1, 1),
                 );
             }
         }
         crate::QuantFormat::Q6_K => {
-            use crate::metal::shaders::q6k_matvec as q6k;
-            let num_tgs = (num_rows as u64).div_ceil(q6k::ROWS_PER_TG);
-            enc.set_compute_pipeline_state(pipes.q6k_matvec);
+            let kh = pipes.q6k_matvec;
+            let num_tgs = (num_rows as u64).div_ceil(kh.rows_per_tg);
+            enc.set_compute_pipeline_state(&kh.state);
             enc.set_buffer(0, Some(w_buf), 0);
             enc.set_buffer(1, Some(f32_in), f32_in_off);
             enc.set_buffer(2, Some(out_buf), out_off);
@@ -127,7 +121,7 @@ pub fn encode(
             enc.set_bytes(4, 4, &k as *const u32 as *const c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(num_tgs, 1, 1),
-                MTLSize::new(q6k::THREADS_PER_TG, 1, 1),
+                MTLSize::new(kh.threads_per_tg, 1, 1),
             );
         }
         crate::QuantFormat::Q4_0 | crate::QuantFormat::Q8_0 => {

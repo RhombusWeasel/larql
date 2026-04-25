@@ -364,3 +364,88 @@ fn qk_norm_in_place_matches_separate_buffers() {
         );
     }
 }
+
+// ── qk_norm_qk: fused Q+K norm in one dispatch ──────────────────────────────
+
+/// Drive the Metal `qk_norm_qk` kernel (fused Q+K heads in one dispatch)
+/// and compare against two separate `qk_norm` calls.
+fn assert_qk_norm_qk_matches_separate(
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    offset: f32,
+) {
+    let metal = get_metal();
+
+    let seed_q = (num_q_heads * head_dim) as f32 * 0.03;
+    let seed_k = (num_kv_heads * head_dim) as f32 * 0.05;
+    let q_in: Vec<f32> = (0..num_q_heads * head_dim)
+        .map(|i| ((seed_q + i as f32 * 0.011).sin() + 0.1) * 0.5)
+        .collect();
+    let k_in: Vec<f32> = (0..num_kv_heads * head_dim)
+        .map(|i| ((seed_k + i as f32 * 0.013).cos() + 0.1) * 0.5)
+        .collect();
+    let q_wt: Vec<f32> = (0..head_dim).map(|i| 0.9 + (i as f32) * 0.001).collect();
+    let k_wt: Vec<f32> = (0..head_dim).map(|i| 1.1 - (i as f32) * 0.001).collect();
+
+    // Reference: two separate qk_norm calls
+    let ref_q = cpu_qk_norm(&q_in, &q_wt, num_q_heads, head_dim, eps, offset);
+    let ref_k = cpu_qk_norm(&k_in, &k_wt, num_kv_heads, head_dim, eps, offset);
+
+    // Fused: qk_norm_qk
+    let q_buf = metal.bufs().transient_from_f32(&q_in);
+    let k_buf = metal.bufs().transient_from_f32(&k_in);
+    let q_wt_buf = metal.bufs().get_f32(&q_wt);
+    let k_wt_buf = metal.bufs().get_f32(&k_wt);
+
+    let hd = head_dim as u32;
+    let nq = num_q_heads as u32;
+    let total_heads = (num_q_heads + num_kv_heads) as u64;
+    let mut tg_w: usize = 1;
+    while tg_w < head_dim && tg_w < 512 { tg_w <<= 1; }
+
+    let cmd = metal.queue().new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&metal.qk_norm_qk_pipeline);
+    enc.set_buffer(0, Some(&q_buf), 0);
+    enc.set_buffer(1, Some(&k_buf), 0);
+    enc.set_buffer(2, Some(&q_wt_buf), 0);
+    enc.set_buffer(3, Some(&k_wt_buf), 0);
+    enc.set_bytes(4, 4, &hd as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &nq as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &offset as *const f32 as *const std::ffi::c_void);
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(total_heads, 1, 1),
+        metal::MTLSize::new(tg_w as u64, 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let got_q = larql_compute::metal::buffers::read_buffer_f32(&q_buf, num_q_heads * head_dim);
+    let got_k = larql_compute::metal::buffers::read_buffer_f32(&k_buf, num_kv_heads * head_dim);
+
+    let dq = max_diff(&ref_q, &got_q);
+    assert!(dq < 1e-5, "qk_norm_qk Q: max_diff {dq:.3e} (nq={num_q_heads} hd={head_dim})");
+    let dk = max_diff(&ref_k, &got_k);
+    assert!(dk < 1e-5, "qk_norm_qk K: max_diff {dk:.3e} (nkv={num_kv_heads} hd={head_dim})");
+}
+
+#[test]
+fn qk_norm_qk_smoke() {
+    assert_qk_norm_qk_matches_separate(4, 2, 16, 1e-6, 1.0);
+}
+
+#[test]
+fn qk_norm_qk_gemma3_4b() {
+    // Gemma 3 4B: 32 Q heads, 16 KV heads, head_dim=256, offset=1.0
+    assert_qk_norm_qk_matches_separate(32, 16, 256, 1e-6, 1.0);
+}
+
+#[test]
+fn qk_norm_qk_gemma4_global_offset0() {
+    // Gemma 4 global attention: offset=0.0
+    assert_qk_norm_qk_matches_separate(8, 4, 512, 1e-6, 0.0);
+}
