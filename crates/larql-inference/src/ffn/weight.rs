@@ -109,3 +109,82 @@ pub fn dense_ffn_forward_backend(
 
     (out, activation)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+    use crate::engines::test_utils::make_test_weights;
+
+    fn x(rows: usize, hidden: usize) -> Array2<f32> {
+        Array2::from_shape_vec((rows, hidden),
+            (0..rows * hidden).map(|i| (i as f32 + 1.0) * 0.05).collect()
+        ).unwrap()
+    }
+
+    #[test]
+    fn dense_ffn_forward_shape() {
+        let weights = make_test_weights();
+        let input = x(3, weights.hidden_size);
+        let (out, act) = dense_ffn_forward(&weights, 0, &input);
+        assert_eq!(out.shape(), &[3, weights.hidden_size]);
+        assert_eq!(act.shape(), &[3, weights.intermediate_size]);
+    }
+
+    #[test]
+    fn dense_ffn_forward_output_finite() {
+        let weights = make_test_weights();
+        let input = x(2, weights.hidden_size);
+        let (out, act) = dense_ffn_forward(&weights, 0, &input);
+        assert!(out.iter().all(|v| v.is_finite()), "FFN output has non-finite values");
+        assert!(act.iter().all(|v| v.is_finite()), "FFN activation has non-finite values");
+    }
+
+    #[test]
+    fn dense_ffn_forward_backend_matches_no_backend() {
+        // backend=None should produce the same result as dense_ffn_forward
+        let weights = make_test_weights();
+        let input = x(2, weights.hidden_size);
+        let (out1, act1) = dense_ffn_forward(&weights, 0, &input);
+        let (out2, act2) = dense_ffn_forward_backend(&weights, 0, &input, None);
+        assert_eq!(out1, out2, "output should match between dense_ffn_forward and backend(None)");
+        assert_eq!(act1, act2, "activation should match");
+    }
+
+    #[test]
+    fn dense_ffn_forward_all_layers() {
+        let weights = make_test_weights();
+        let input = x(1, weights.hidden_size);
+        for layer in 0..weights.num_layers {
+            let (out, _) = dense_ffn_forward(&weights, layer, &input);
+            assert_eq!(out.shape(), &[1, weights.hidden_size],
+                "layer {layer} wrong shape");
+            assert!(out.iter().all(|v| v.is_finite()), "layer {layer} non-finite");
+        }
+    }
+
+    #[test]
+    fn weight_ffn_implements_ffn_backend() {
+        use crate::ffn::FfnBackend;
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        assert_eq!(ffn.name(), "weights");
+        let input = x(2, weights.hidden_size);
+        let out = ffn.forward(0, &input);
+        assert_eq!(out.shape(), &[2, weights.hidden_size]);
+    }
+
+    #[test]
+    fn backend_ffn_matches_weight_ffn() {
+        use crate::ffn::FfnBackend;
+        let weights = make_test_weights();
+        let wffn = WeightFfn { weights: &weights };
+        let bffn = BackendFfn { weights: &weights, backend: &larql_compute::CpuBackend };
+        let input = x(2, weights.hidden_size);
+        let out_w = wffn.forward(0, &input);
+        let out_b = bffn.forward(0, &input);
+        for (w, b) in out_w.iter().zip(out_b.iter()) {
+            assert!((w - b).abs() < 1e-4, "WeightFfn and BackendFfn differ: {w} vs {b}");
+        }
+    }
+}

@@ -50,4 +50,7 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
     /// Default returns `false` for everything; backends override to
     /// enable. See [`Capability`] for the menu.
     fn supports(&self, _cap: Capability) -> bool { false }
+
+    /// Expose the concrete type for safe downcasting.
+    fn as_any(&self) -> &dyn std::any::Any;
 }

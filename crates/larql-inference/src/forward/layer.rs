@@ -186,3 +186,69 @@ pub(super) fn run_layer_with_capture(
     apply_layer_scalar(weights, &mut h_out, layer);
     Some((h_out, activation, attn_weights, kv_out))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+    use crate::engines::test_utils::make_test_weights;
+    use crate::ffn::WeightFfn;
+
+    fn h(rows: usize, hidden: usize) -> Array2<f32> {
+        Array2::from_shape_vec((rows, hidden),
+            (0..rows * hidden).map(|i| (i as f32 + 1.0) * 0.02).collect()
+        ).unwrap()
+    }
+
+    #[test]
+    fn run_ffn_shape() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let input = h(3, weights.hidden_size);
+        let (out, act) = run_ffn(&weights, &input, 0, &ffn, false);
+        assert_eq!(out.shape(), &[3, weights.hidden_size]);
+        assert!(act.is_none(), "capture_activation=false should return None");
+    }
+
+    #[test]
+    fn run_ffn_captures_activation() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let input = h(2, weights.hidden_size);
+        let (_, act) = run_ffn(&weights, &input, 0, &ffn, true);
+        let a = act.expect("activation should be captured");
+        assert_eq!(a.shape(), &[2, weights.intermediate_size]);
+    }
+
+    #[test]
+    fn run_ffn_output_finite() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let input = h(2, weights.hidden_size);
+        let (out, _) = run_ffn(&weights, &input, 0, &ffn, false);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn run_layer_with_ffn_shape() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let input = h(3, weights.hidden_size);
+        let (h_out, _act, _kv) = run_layer_with_ffn(&weights, &input, 0, &ffn, false, None, None)
+            .expect("run_layer_with_ffn failed");
+        assert_eq!(h_out.shape(), &[3, weights.hidden_size]);
+    }
+
+    #[test]
+    fn run_layer_with_ffn_all_layers() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let input = h(2, weights.hidden_size);
+        for layer in 0..weights.num_layers {
+            assert!(
+                run_layer_with_ffn(&weights, &input, layer, &ffn, false, None, None).is_some(),
+                "layer {layer} failed"
+            );
+        }
+    }
+}

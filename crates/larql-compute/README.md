@@ -32,30 +32,43 @@ Adding e.g. FP4 = one `QuantFormat` enum variant + one match arm in `QuantMatVec
 ## Performance vs Ollama
 
 Live `larql bench gemma3-4b-q4k-v2 --ollama gemma3:4b`
-on M3 Max (2026-04-25):
+on M3 Max (2026-04-26):
 
 ```
-  larql-metal  75–77 tok/s   13.0ms/tok   (GPU fwd 11.1ms, lm_head 2.3ms)
-  ollama       97–103 tok/s  10.0ms/tok
-  gap          1.26–1.34×    +3ms/tok
+  larql-metal  75–79 tok/s   ~13ms/tok    (GPU fwd ~11ms, lm_head ~2.3ms)
+  ollama       98–103 tok/s  10.0ms/tok
+  gap          1.27–1.34×    ~3ms/tok
 ```
 
 Reproduce: `larql bench <vindex> --backends metal --ollama <tag>`.
-See `PERFORMANCE.md` for full breakdown and gap analysis.
+See `PERFORMANCE.md` for full breakdown and per-kernel profiling.
 
-### Key optimisations (62 → 75 tok/s, 2026-04-25)
+### Key optimisations (62 → 77 tok/s, 2026-04-25/26)
 
 | Optimization | Savings | Technique |
 |---|---|---|
-| `q6k_matvec` 4-element batching | +7 tok/s | Compile-time hi2 shifts, 2-pass layout |
+| `q6k_matvec` ROWS_PER_TG 4→2 | +1-2 tok/s | 2× concurrent TGs → better DRAM latency hiding |
 | `q6k_matvec` inter-superblock interleaving | +3 tok/s | Adjacent lanes read alternate superblocks; X preloaded; deferred scaling |
+| `q6k_matvec` 4-element batching | +7 tok/s | Compile-time hi2 shifts, preloaded scales |
 | Fused QK-norm Q+K (`qk_norm_qk`) | −0.17ms | One dispatch instead of two per layer |
 | Fused RoPE Q+K (`rope_at_pos_batched_qk`) | −0.17ms | One dispatch instead of two |
-| Fused residual+norm (`residual_norm_store`) | −0.17ms | Writes both normed and raw sum |
-| Fused norm+QKV (`q4k_q6k_qkv_proj_normed`) | −0.17ms | Norm computed inline in QKV TGs |
+| Fused residual+norm (`residual_norm_store`) | −0.17ms | Writes both normed and raw sum in one pass |
+| Fused norm+QKV (`q4k_q6k_qkv_proj_normed`) | −0.17ms | Norm computed cooperatively inside QKV TGs |
 | Cooperative SIMD norms | −10ms | O(N²)→O(N) reads (2026-04-09) |
 | Q4_KF FFN routing | −8ms | llama.cpp-exact kernel (2026-04-09) |
 | Buffer pre-allocation | −2ms | Eliminated 550 allocs/decode (2026-04-08) |
+
+### Bottleneck analysis (from `diag_profile_kernels`)
+
+| Kernel | Batched GB/s | ms/tok | Bound by |
+|---|---|---|---|
+| q6k_matvec (FFN down, K=10240) | ~315 GB/s | 2.34ms | bandwidth (LPDDR5X) |
+| q4k_ffn_gate_up (gate+up, K=2560) | ~272 GB/s | 3.68ms | **compute** (Q4_K dequant at K=2560) |
+| f32_gemv (lm_head, 262K×2560) | ~370 GB/s | — | bandwidth (near peak) |
+
+Gate+up is compute-bound because Q4_K at K=2560 has the lowest bytes/element
+(0.5625 B/elem) — the GPU spends more cycles on nibble dequant than waiting for
+LPDDR5X. These two kernels account for ~6ms of the ~11ms GPU fwd.
 
 ### Architecture
 

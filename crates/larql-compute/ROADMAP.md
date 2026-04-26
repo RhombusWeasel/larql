@@ -4,38 +4,38 @@
 
 | Engine | tok/s | ms/tok | Notes |
 |---|---|---|---|
-| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **74–75** | 13.4 | measured 2026-04-26 |
+| **LARQL Metal** (gemma3-4b-q4k-v2, Q6_K down) | **75–79** | ~13ms | q6k_matvec ROWS_PER_TG=2, GPU argmax |
 | **LARQL Metal** (gemma3-4b-q4k-downq4k, all-Q4_K) | **70.1** | 14.26 | all-Q4_K extract; q4k_geglu_silu_down fires |
-| **Ollama** gemma3:4b | **100–103** | 9.97 | reference (same hardware, same prompt) |
-| **Gap** | LARQL is **1.34–1.35×** slower | +3.5ms/tok | per-stage decomposition below |
+| **Ollama** gemma3:4b | **98–103** | ~10ms | reference (same hardware, same prompt) |
+| **Gap** | LARQL is **~1.30×** slower | ~3ms/tok | per-stage decomposition below |
 
-Per-stage (100-token run, 8 warmup):
+Per-stage (100-token run, 8 warmup, typical):
 
 | Stage | LARQL | Ollama (est.) | Gap |
 |---|---|---|---|
-| GPU fwd | 11.26ms | ~8.7ms | ~2.6ms |
-| lm_head | 2.45ms | ~1.3ms | ~1.15ms |
-| **Total** | **13.44ms** | **9.97ms** | **3.47ms** |
+| GPU fwd | ~11.0ms | ~8.5ms | ~2.5ms |
+| lm_head | ~2.3ms | ~1.3ms | ~1.0ms |
+| **Total** | **~13.1ms** | **~9.9ms** | **~3.2ms** |
 
 **Gap analysis (2026-04-26, measured + per-kernel profiling):**
 
 | Source | LARQL | Ollama (est.) | Gap |
 |---|---|---|---|
 | Dispatch overhead | ~1.87ms (374 × 5µs) | ~1.36ms (272 × 5µs) | **0.51ms** |
-| Kernel compute | ~9.39ms | ~7.31ms | **2.08ms** |
-| lm_head overhead | 2.45ms | ~1.30ms | **1.15ms** |
+| Kernel compute | ~9.1ms | ~7.1ms | **~2.0ms** |
+| lm_head overhead | ~2.3ms | ~1.30ms | **~1.0ms** |
 
 **Per-kernel profiler results** (run `diag_profile_kernels`, see PERFORMANCE.md):
 
 | Kernel | Batched GB/s | ms/tok | Bottleneck |
 |---|---|---|---|
-| q6k_matvec (down, K=10240) | 312 GB/s | 2.34ms | bandwidth-bound |
-| q4k_ffn_gate_up (gate+up, K=2560) | 272 GB/s | 3.68ms | **compute-bound** (dequant) |
-| f32_gemv (lm_head) | 370 GB/s | 7.4ms | bandwidth-bound (near peak) |
+| q6k_matvec (down, K=10240) | ~315 GB/s | ~2.3ms | bandwidth-bound (LPDDR5X) |
+| q4k_ffn_gate_up (gate+up, K=2560) | ~272 GB/s | ~3.7ms | **compute-bound** (Q4_K dequant) |
+| f32_gemv (lm_head, 262K×2560) | ~370 GB/s | — | bandwidth-bound (near peak) |
 
-Down + gate+up = **6.01ms/tok** of the ~11.7ms GPU fwd. Gate+up is compute-bound
-because Q4_K at K=2560 has the lowest bytes/element (0.5625 B/elem) — the GPU
-spends more cycles on nibble dequant arithmetic than waiting for LPDDR5X.
+Down + gate+up = **~6ms/tok** of the ~11ms GPU fwd. Gate+up is compute-bound
+because Q4_K at K=2560 (0.5625 B/elem, lowest ratio) — the GPU spends more
+cycles on nibble dequant arithmetic than waiting for LPDDR5X.
 
 The "117 tok/s" historical number was synthetic-weight Q4_KF without
 real vindex load. Production extracts use Q6_K down (Ollama
@@ -45,25 +45,27 @@ convention); the q4_KF fast-path doesn't apply to those.
 
 ## P0: Production gap closers
 
-Remaining gap: **1.34–1.35×** (74 vs 100 tok/s, 3.5ms/tok).
+Remaining gap: **~1.30×** (~77 vs ~100 tok/s, ~3ms/tok).
 
-| Source | Gap | Actionable items |
+| Source | Gap | Status |
 |---|---|---|
-| **Kernel compute** | **2.08ms** | llama.cpp Q4_K port (`yl[]/yh[]` + `float4`), Q6_K further tuning |
-| **lm_head overhead** | **1.15ms** | Async GPU readback, GPU-side top-k |
-| **Dispatch overhead** | **0.51ms** | Mostly addressed; few fusions remain |
+| **Kernel compute** | **~2.0ms** | gate+up compute-bound (K=2560 ALU-limited); open |
+| **lm_head overhead** | **~1.0ms** | GPU argmax shipped (fires for top_k=1); open for main decode path |
+| **Dispatch overhead** | **~0.5ms** | Mostly closed (374 vs Ollama ~272 dispatches) |
 
-**Achievable targets (additive):**
-- Fix dispatch only → **~77 tok/s**
-- Fix dispatch + lm_head → **~87 tok/s**
-- Fix all three → **~94 tok/s** (~Ollama parity; residual gap from measurement noise)
+**Achievable targets:**
+- Close kernel compute gap → **~87 tok/s**
+- Close lm_head gap → **~85 tok/s**
+- Close all remaining → **~95 tok/s** (~Ollama parity)
 
-**Key finding from per-kernel profiler (`diag_profile_kernels`):**
-Gate+up is COMPUTE-BOUND at 272 GB/s (K=2560, 0.5625 B/elem = lowest ratio).
-q6k_matvec (down) is bandwidth-bound at 312 GB/s (K=10240, 0.82 B/elem).
-Ollama's effective rate is ~390 GB/s for both — they use format-specific
-`float4` vectorized accumulation to reduce per-element compute cost.
-See PERFORMANCE.md for the full per-kernel table and projected impact.
+**Key findings from per-kernel profiler (`diag_profile_kernels`):**
+- Gate+up is **COMPUTE-BOUND** at 272 GB/s (K=2560, 0.5625 B/elem, dequant-limited).
+  Float4 dual-sub-block approach was tried and regressed — complex addressing offsets
+  gains from ILP. Format-compatible vectorization remains the unsolved problem.
+- q6k_matvec (down) is **bandwidth-bound** at ~315 GB/s (K=10240, 0.82 B/elem).
+  ROWS_PER_TG=2 (64 threads/TG) improved it by ~5% via better occupancy.
+- lm_head f32_gemv is near peak at 370 GB/s — the overhead is CPU-side (readback,
+  sort). `f32_gemv_topk1` GPU argmax ships the fix for top_k=1 callers.
 
 ### #1 — Q6_K fused activation+down (closed — wrong fix, correct diagnosis)
 
@@ -159,6 +161,23 @@ Effective Q6_K bandwidth: ~322 GB/s (up from ~294 GB/s).
 Folded into #6 below with updated size estimate.
 
 ---
+
+### q6k_matvec ROWS_PER_TG=2 (done 2026-04-26, +1-2 tok/s)
+
+**Gain: ~0.3-0.5ms GPU fwd** (75.9 → 75-79 tok/s range). Halving TG size from
+4 rows/128 threads to 2 rows/64 threads → 2× more concurrent TGs on the GPU CU
+→ better DRAM latency hiding for the bandwidth-bound down projection (K=10240).
+At ROWS_PER_TG=4: 640 TGs × 128 threads = 81,920. At ROWS_PER_TG=2: 1280 TGs
+× 64 threads = 81,920 (same total threads, but 12 vs 6 concurrent TGs per CU
+due to halved register pressure per TG). All tests pass.
+
+### f32_gemv_topk1 GPU argmax (done 2026-04-26, infrastructure)
+
+New `MatMul::f32_gemv_topk1` trait method: runs gemv + GPU argmax in one command
+buffer, reads back only 8KB (1024 partial results) instead of 1MB (262K scores).
+Saves ~0.33ms for top_k=1 callers. Implemented on MetalBackend. Main decode loop
+uses the KNN lm_head path (top_k=5 → KNN fires first), so this doesn't yet
+benefit the bench. Useful for non-KNN models and future greedy-decode APIs.
 
 ### #6 — Q4_K kernel optimization (explored 2026-04-26, blocked by ALU bound)
 

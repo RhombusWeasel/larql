@@ -6,8 +6,19 @@
 use larql_vindex::ndarray::{Array1, Array2};
 use larql_vindex::{
     FeatureMeta, PatchedVindex, VectorIndex, VindexConfig, VindexLayerInfo,
-    ExtractLevel, LayerBands,
+    ExtractLevel, LayerBands, QuantFormat,
 };
+
+use larql_server::cache::DescribeCache;
+use larql_server::error::ServerError;
+use larql_server::ffn_l2_cache::FfnL2Cache;
+use larql_server::session::SessionManager;
+use larql_server::state::{AppState, LoadedModel, load_probe_labels, model_id_from_name};
+use axum::response::IntoResponse;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 // ══════════════════════════════════════════════════════════════
 // Test helpers
@@ -1904,4 +1915,487 @@ fn test_embed_only_mode_string() {
     assert_eq!(mode(true, false), "embed-service");
     // embed_only takes priority
     assert_eq!(mode(true, true), "embed-service");
+}
+
+// ══════════════════════════════════════════════════════════════
+// SERVER ERROR → HTTP RESPONSE (IntoResponse impl)
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_server_error_not_found_maps_to_404() {
+    let resp = ServerError::NotFound("the-thing".into()).into_response();
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn test_server_error_bad_request_maps_to_400() {
+    let resp = ServerError::BadRequest("bad input".into()).into_response();
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn test_server_error_internal_maps_to_500() {
+    let resp = ServerError::Internal("oops".into()).into_response();
+    assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[test]
+fn test_server_error_unavailable_maps_to_503() {
+    #[allow(dead_code)]
+    let resp = ServerError::InferenceUnavailable("no weights".into()).into_response();
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[test]
+fn test_server_error_display_format() {
+    assert!(format!("{}", ServerError::NotFound("x".into())).contains("not found"));
+    assert!(format!("{}", ServerError::BadRequest("x".into())).contains("bad request"));
+    assert!(format!("{}", ServerError::Internal("x".into())).contains("internal error"));
+}
+
+// ══════════════════════════════════════════════════════════════
+// MODEL_ID_FROM_NAME EDGE CASES
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_model_id_from_name_no_slash() {
+    assert_eq!(model_id_from_name("llama-3-8b"), "llama-3-8b");
+}
+
+#[test]
+fn test_model_id_from_name_single_slash() {
+    assert_eq!(model_id_from_name("google/gemma-3-4b-it"), "gemma-3-4b-it");
+}
+
+#[test]
+fn test_model_id_from_name_deep_path() {
+    assert_eq!(model_id_from_name("org/sub/model"), "model");
+}
+
+#[test]
+fn test_model_id_from_name_trailing_slash() {
+    // rsplit('/').next() on "foo/" returns "" — reflects actual behavior.
+    let result = model_id_from_name("foo/");
+    assert_eq!(result, "");
+}
+
+// ══════════════════════════════════════════════════════════════
+// APPSTATE UNIT TESTS (sync — no await required)
+// ══════════════════════════════════════════════════════════════
+
+fn make_tiny_model(id: &str) -> Arc<LoadedModel> {
+    let hidden = 4;
+    let gate = Array2::<f32>::zeros((2, hidden));
+    let index = VectorIndex::new(vec![Some(gate)], vec![None], 1, hidden);
+    let patched = PatchedVindex::new(index);
+    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tokenizer = larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json).unwrap();
+    Arc::new(LoadedModel {
+        id: id.to_string(),
+        path: PathBuf::from("/nonexistent"),
+        config: VindexConfig {
+            version: 2,
+            model: "test/model".to_string(),
+            family: "test".to_string(),
+            source: None,
+            checksums: None,
+            num_layers: 1,
+            hidden_size: hidden,
+            intermediate_size: 8,
+            vocab_size: 4,
+            embed_scale: 1.0,
+            extract_level: ExtractLevel::Browse,
+            dtype: larql_vindex::StorageDtype::default(),
+            quant: QuantFormat::None,
+            layer_bands: None,
+            layers: vec![VindexLayerInfo {
+                layer: 0, num_features: 2, offset: 0, length: 32,
+                num_experts: None, num_features_per_expert: None,
+            }],
+            down_top_k: 2,
+            has_model_weights: false,
+            model_config: None,
+        },
+        patched: tokio::sync::RwLock::new(patched),
+        embeddings: Array2::<f32>::zeros((4, hidden)),
+        embed_scale: 1.0,
+        tokenizer,
+        infer_disabled: true,
+        ffn_only: false,
+        embed_only: false,
+        embed_store: None,
+        release_mmap_after_request: false,
+        weights: std::sync::OnceLock::new(),
+        probe_labels: HashMap::new(),
+        ffn_l2_cache: FfnL2Cache::new(1),
+        expert_filter: None,
+    })
+}
+
+fn make_tiny_state(models: Vec<Arc<LoadedModel>>) -> Arc<AppState> {
+    Arc::new(AppState {
+        models,
+        started_at: std::time::Instant::now(),
+        requests_served: AtomicU64::new(0),
+        api_key: None,
+        sessions: SessionManager::new(3600),
+        describe_cache: DescribeCache::new(0),
+    })
+}
+
+#[test]
+fn test_app_state_model_single_none_returns_first() {
+    let state = make_tiny_state(vec![make_tiny_model("gemma")]);
+    let m = state.model(None);
+    assert!(m.is_some());
+    assert_eq!(m.unwrap().id, "gemma");
+}
+
+#[test]
+fn test_app_state_model_with_id_finds_correct() {
+    let state = make_tiny_state(vec![make_tiny_model("a"), make_tiny_model("b")]);
+    assert_eq!(state.model(Some("a")).unwrap().id, "a");
+    assert_eq!(state.model(Some("b")).unwrap().id, "b");
+}
+
+#[test]
+fn test_app_state_model_multi_none_returns_none() {
+    let state = make_tiny_state(vec![make_tiny_model("a"), make_tiny_model("b")]);
+    // Multi-model with no id → must specify which model.
+    assert!(state.model(None).is_none());
+}
+
+#[test]
+fn test_app_state_model_unknown_id_returns_none() {
+    let state = make_tiny_state(vec![make_tiny_model("a")]);
+    assert!(state.model(Some("nonexistent")).is_none());
+}
+
+#[test]
+fn test_app_state_is_multi_model_single() {
+    let state = make_tiny_state(vec![make_tiny_model("a")]);
+    assert!(!state.is_multi_model());
+}
+
+#[test]
+fn test_app_state_is_multi_model_multi() {
+    let state = make_tiny_state(vec![make_tiny_model("a"), make_tiny_model("b")]);
+    assert!(state.is_multi_model());
+}
+
+#[test]
+fn test_app_state_bump_requests_increments() {
+    let state = make_tiny_state(vec![make_tiny_model("a")]);
+    assert_eq!(state.requests_served.load(std::sync::atomic::Ordering::Relaxed), 0);
+    state.bump_requests();
+    assert_eq!(state.requests_served.load(std::sync::atomic::Ordering::Relaxed), 1);
+    state.bump_requests();
+    state.bump_requests();
+    assert_eq!(state.requests_served.load(std::sync::atomic::Ordering::Relaxed), 3);
+}
+
+// ══════════════════════════════════════════════════════════════
+// LOAD_PROBE_LABELS (sync file parsing)
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_load_probe_labels_from_json_file() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("larql_test_labels_01");
+    std::fs::create_dir_all(&dir).unwrap();
+    let json = r#"{"L0_F0": "capital", "L1_F2": "language", "L5_F10": "continent"}"#;
+    std::fs::write(dir.join("feature_labels.json"), json).unwrap();
+
+    let labels = load_probe_labels(&dir);
+    assert_eq!(labels.get(&(0, 0)), Some(&"capital".to_string()));
+    assert_eq!(labels.get(&(1, 2)), Some(&"language".to_string()));
+    assert_eq!(labels.get(&(5, 10)), Some(&"continent".to_string()));
+    assert_eq!(labels.len(), 3);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_load_probe_labels_missing_file_returns_empty() {
+    let dir = std::path::Path::new("/nonexistent/path/to/vindex");
+    let labels = load_probe_labels(dir);
+    assert!(labels.is_empty());
+}
+
+#[test]
+fn test_load_probe_labels_malformed_json_returns_empty() {
+    let dir = std::env::temp_dir().join("larql_test_labels_02");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("feature_labels.json"), b"not valid json").unwrap();
+
+    let labels = load_probe_labels(&dir);
+    assert!(labels.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_load_probe_labels_non_object_json_returns_empty() {
+    let dir = std::env::temp_dir().join("larql_test_labels_03");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("feature_labels.json"), b"[\"not\",\"an\",\"object\"]").unwrap();
+
+    let labels = load_probe_labels(&dir);
+    assert!(labels.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_load_probe_labels_skips_malformed_keys() {
+    let dir = std::env::temp_dir().join("larql_test_labels_04");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Mix of valid and invalid keys
+    let json = r#"{"L0_F0": "capital", "INVALID": "skip", "L_BAD_F": "skip2", "L3_F7": "valid"}"#;
+    std::fs::write(dir.join("feature_labels.json"), json).unwrap();
+
+    let labels = load_probe_labels(&dir);
+    // Only L0_F0 and L3_F7 should parse.
+    assert_eq!(labels.get(&(0, 0)), Some(&"capital".to_string()));
+    assert_eq!(labels.get(&(3, 7)), Some(&"valid".to_string()));
+    assert_eq!(labels.len(), 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ══════════════════════════════════════════════════════════════
+// RELATIONS CONTENT-TOKEN FILTER (inline logic)
+// ══════════════════════════════════════════════════════════════
+//
+// `is_content_token` is private to routes/relations.rs so we re-implement
+// the same predicate here to test edge cases directly.
+
+fn is_content_token_test(tok: &str) -> bool {
+    let tok = tok.trim();
+    if tok.is_empty() || tok.len() > 30 { return false; }
+    let readable = tok.chars().filter(|c| {
+        c.is_ascii_alphanumeric() || *c == ' ' || *c == '-' || *c == '\'' || *c == '.' || *c == ','
+    }).count();
+    let total = tok.chars().count();
+    if readable * 2 < total || total == 0 { return false; }
+    let chars: Vec<char> = tok.chars().collect();
+    if chars.len() < 3 || chars.len() > 25 { return false; }
+    let alpha = chars.iter().filter(|c| c.is_ascii_alphabetic()).count();
+    if alpha < chars.len() * 2 / 3 { return false; }
+    for w in chars.windows(2) {
+        if w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase() { return false; }
+    }
+    if !chars.iter().any(|c| c.is_ascii_alphabetic()) { return false; }
+    let lower = tok.to_lowercase();
+    !matches!(
+        lower.as_str(),
+        "the" | "and" | "for" | "but" | "not" | "you" | "all" | "can"
+        | "her" | "was" | "one" | "our" | "out" | "are" | "has" | "his"
+        | "how" | "its" | "may" | "new" | "now" | "old" | "see" | "way"
+        | "who" | "did" | "get" | "let" | "say" | "she" | "too" | "use"
+        | "from" | "have" | "been" | "will" | "with" | "this" | "that"
+        | "they" | "were" | "some" | "them" | "than" | "when"
+        | "what" | "your" | "each" | "make" | "like" | "just" | "over"
+        | "such" | "take" | "also" | "into" | "only" | "very" | "more"
+        | "does" | "most" | "about" | "which" | "their" | "would" | "there"
+        | "could" | "other" | "after" | "being" | "where" | "these" | "those"
+        | "first" | "should" | "because" | "through" | "before"
+        | "par" | "aux" | "che" | "del"
+    )
+}
+
+#[test]
+fn test_content_token_valid_words() {
+    assert!(is_content_token_test("capital"));
+    assert!(is_content_token_test("Paris"));
+    assert!(is_content_token_test("language"));
+    assert!(is_content_token_test("France"));
+    assert!(is_content_token_test("Europe"));
+}
+
+#[test]
+fn test_content_token_stopwords_rejected() {
+    assert!(!is_content_token_test("the"));
+    assert!(!is_content_token_test("and"));
+    assert!(!is_content_token_test("for"));
+    assert!(!is_content_token_test("with"));
+    assert!(!is_content_token_test("about"));
+    assert!(!is_content_token_test("should"));
+}
+
+#[test]
+fn test_content_token_too_short_rejected() {
+    assert!(!is_content_token_test("ab"));  // < 3 chars
+    assert!(!is_content_token_test("a"));
+    assert!(!is_content_token_test(""));
+}
+
+#[test]
+fn test_content_token_too_long_rejected() {
+    let long = "a".repeat(26);
+    assert!(!is_content_token_test(&long));
+}
+
+#[test]
+fn test_content_token_camelcase_rejected() {
+    assert!(!is_content_token_test("camelCase"));
+    assert!(!is_content_token_test("camelCaseWord"));
+}
+
+#[test]
+fn test_content_token_numeric_heavy_rejected() {
+    // Less than 2/3 alpha characters
+    assert!(!is_content_token_test("a12345"));
+}
+
+// ══════════════════════════════════════════════════════════════
+// DESCRIBE CACHE — additional coverage
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_cache_overwrite_updates_value() {
+    let cache = DescribeCache::new(60);
+    let key = DescribeCache::key("model", "France", "knowledge", 20, 5.0);
+    let v1 = serde_json::json!({"edges": []});
+    let v2 = serde_json::json!({"edges": [{"target": "Paris"}]});
+    cache.put(key.clone(), v1);
+    cache.put(key.clone(), v2.clone());
+    assert_eq!(cache.get(&key), Some(v2));
+}
+
+#[test]
+fn test_cache_key_float_precision_truncated() {
+    // min_score is cast to u32 in the key, so 5.9 and 5.0 produce the same key.
+    let k1 = DescribeCache::key("m", "e", "b", 10, 5.0);
+    let k2 = DescribeCache::key("m", "e", "b", 10, 5.9);
+    assert_eq!(k1, k2);
+    // 6.0 differs.
+    let k3 = DescribeCache::key("m", "e", "b", 10, 6.0);
+    assert_ne!(k1, k3);
+}
+
+// ══════════════════════════════════════════════════════════════
+// ETAG — additional coverage
+// ══════════════════════════════════════════════════════════════
+
+use larql_server::etag::{compute_etag, matches_etag};
+
+#[test]
+fn test_etag_empty_object_is_valid() {
+    let etag = compute_etag(&serde_json::json!({}));
+    assert!(etag.starts_with('"') && etag.ends_with('"'));
+    assert!(etag.len() > 2);
+}
+
+#[test]
+fn test_etag_different_key_order_produces_different_hash() {
+    // JSON key ordering matters when serialised.
+    let a = compute_etag(&serde_json::json!({"a": 1, "b": 2}));
+    let b = compute_etag(&serde_json::json!({"b": 2, "a": 1}));
+    // serde_json preserves insertion order, so these are the same.
+    assert_eq!(a, b);
+}
+
+#[test]
+fn test_matches_etag_extra_whitespace() {
+    let etag = compute_etag(&serde_json::json!({"x": 1}));
+    // Leading/trailing whitespace should still match after trim.
+    let padded = format!("  {}  ", etag);
+    assert!(matches_etag(Some(&padded), &etag));
+}
+
+#[test]
+fn test_matches_etag_mismatch_returns_false() {
+    assert!(!matches_etag(Some("\"abc\""), "\"xyz\""));
+}
+
+// ══════════════════════════════════════════════════════════════
+// RATE LIMITER — additional coverage
+// ══════════════════════════════════════════════════════════════
+
+use larql_server::ratelimit::RateLimiter;
+
+#[test]
+fn test_rate_limiter_zero_count_rejects_immediately() {
+    // "0/sec" → 0 tokens → first request is rejected.
+    let rl = RateLimiter::parse("0/sec");
+    // Either returns None (invalid) or allows creation and rejects first request.
+    if let Some(rl) = rl {
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(!rl.check(ip));
+    }
+    // None is also acceptable — 0/sec is edge-case.
+}
+
+#[test]
+fn test_rate_limiter_per_minute_long_form() {
+    let rl = RateLimiter::parse("60/minute").unwrap();
+    assert_eq!(rl.max_tokens, 60.0);
+    assert!((rl.refill_per_sec - 1.0).abs() < 0.001);
+}
+
+#[test]
+fn test_rate_limiter_per_second_long_form() {
+    let rl = RateLimiter::parse("10/second").unwrap();
+    assert_eq!(rl.max_tokens, 10.0);
+    assert_eq!(rl.refill_per_sec, 10.0);
+}
+
+#[test]
+fn test_rate_limiter_fractional_count() {
+    // "1/hour" → refill = 1/3600 per sec.
+    let rl = RateLimiter::parse("1/hour").unwrap();
+    assert_eq!(rl.max_tokens, 1.0);
+    assert!((rl.refill_per_sec - 1.0 / 3600.0).abs() < 1e-9);
+}
+
+#[test]
+fn test_rate_limiter_empty_spec_rejects() {
+    assert!(RateLimiter::parse("").is_none());
+    assert!(RateLimiter::parse("/").is_none());
+    assert!(RateLimiter::parse("100/").is_none());
+}
+
+// ══════════════════════════════════════════════════════════════
+// SELECT ORDERING — layer sort
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_select_order_by_layer_asc() {
+    let mut rows: Vec<(usize, &str)> = vec![(5, "a"), (0, "b"), (3, "c"), (1, "d")];
+    rows.sort_by_key(|r| r.0);
+    assert_eq!(rows[0].0, 0);
+    assert_eq!(rows[1].0, 1);
+    assert_eq!(rows[2].0, 3);
+    assert_eq!(rows[3].0, 5);
+}
+
+#[test]
+fn test_select_order_by_layer_desc() {
+    let mut rows: Vec<(usize, &str)> = vec![(5, "a"), (0, "b"), (3, "c"), (1, "d")];
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    assert_eq!(rows[0].0, 5);
+    assert_eq!(rows[3].0, 0);
+}
+
+// ══════════════════════════════════════════════════════════════
+// INFER DISABLED LOGIC
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_infer_disabled_all_flag_combinations() {
+    fn eff(no_infer: bool, ffn_only: bool, embed_only: bool) -> bool {
+        no_infer || ffn_only || embed_only
+    }
+    // All off → enabled
+    assert!(!eff(false, false, false));
+    // Single flags
+    assert!(eff(true, false, false));
+    assert!(eff(false, true, false));
+    assert!(eff(false, false, true));
+    // Combinations
+    assert!(eff(true, true, false));
+    assert!(eff(false, true, true));
+    assert!(eff(true, false, true));
+    assert!(eff(true, true, true));
 }

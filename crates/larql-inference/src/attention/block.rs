@@ -212,3 +212,68 @@ fn run_attention_block_core(
 
     Some((h_post_attn, attn_projected, attn_weights, k_rope, v_final, attn_out))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+    use crate::engines::test_utils::make_test_weights;
+
+    fn hidden(rows: usize, hidden: usize) -> Array2<f32> {
+        Array2::from_shape_vec((rows, hidden),
+            (0..rows * hidden).map(|i| (i as f32 + 1.0) * 0.01).collect()
+        ).unwrap()
+    }
+
+    // run_attention_block returns (h_post_attn, attn_proj, attn_weights)
+    // — the second element is the projected attention output, not K/V.
+
+    #[test]
+    fn attention_block_output_shape() {
+        let weights = make_test_weights();
+        let h = hidden(3, weights.hidden_size);
+        let (h_out, attn_proj, _) = run_attention_block(&weights, &h, 0, false)
+            .expect("run_attention_block failed");
+        assert_eq!(h_out.shape(), &[3, weights.hidden_size]);
+        assert_eq!(attn_proj.shape()[0], 3);
+    }
+
+    #[test]
+    fn attention_block_output_finite() {
+        let weights = make_test_weights();
+        let h = hidden(2, weights.hidden_size);
+        let (h_out, _, _) = run_attention_block(&weights, &h, 0, false).unwrap();
+        assert!(h_out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn attention_block_single_token() {
+        let weights = make_test_weights();
+        let h = hidden(1, weights.hidden_size);
+        let (h_out, attn_proj, _) = run_attention_block(&weights, &h, 0, false).unwrap();
+        assert_eq!(h_out.shape(), &[1, weights.hidden_size]);
+        assert_eq!(attn_proj.shape()[0], 1);
+    }
+
+    #[test]
+    fn attention_block_all_layers() {
+        let weights = make_test_weights();
+        let h = hidden(2, weights.hidden_size);
+        for layer in 0..weights.num_layers {
+            assert!(run_attention_block(&weights, &h, layer, false).is_some(),
+                "layer {layer} failed");
+        }
+    }
+
+    #[test]
+    fn attention_block_with_kv_out_returns_kv() {
+        let weights = make_test_weights();
+        let h = hidden(3, weights.hidden_size);
+        let result = run_attention_block_with_kv_out(&weights, &h, 0, false, None);
+        // Returns (h_post, attn_proj, attn_w, k_rope, v_final) — 5 elements
+        let (h_out, _attn_proj, _attn_w, k_rope, v_final) = result.unwrap();
+        assert_eq!(h_out.shape(), &[3, weights.hidden_size]);
+        assert_eq!(k_rope.shape()[0], 3);
+        assert_eq!(v_final.shape()[0], 3);
+    }
+}

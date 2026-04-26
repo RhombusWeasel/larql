@@ -18,6 +18,8 @@ impl ComputeBackend for MetalBackend {
         format!("Metal GPU, FLOP threshold: {}", self.flop_threshold())
     }
 
+    fn as_any(&self) -> &dyn std::any::Any { self }
+
     fn supports(&self, cap: Capability) -> bool {
         // Metal accelerates everything in the menu.
         matches!(

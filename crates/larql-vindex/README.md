@@ -371,14 +371,58 @@ optional — leave it off unless you're going to interpret-walk.
 
 ### Multi-shard grid (`larql-router` + per-layer-range `larql-server`)
 
+Two topology options:
+
+**Option A — static grid (`--shards`)**: simpler ops, router needs
+all shards' URLs at boot.
+
 ```bash
 larql extract-index <model> -o <vindex> --quant q4k --feature-major-down
+# (or, for an existing q4k vindex without W2:)
+larql convert add-feature-major-down --input <vindex>
+
+# Per shard — same vindex path, distinct port, distinct layer range.
+larql-server <vindex> --port 9181 --layers 0-14 --no-infer \
+    --max-q4k-cache-layers 1 --warmup-walk-ffn
+larql-server <vindex> --port 9182 --layers 15-29 --no-infer \
+    --max-q4k-cache-layers 1 --warmup-walk-ffn
+
+# Router with static map.
+larql-router --shards 0-14=http://127.0.0.1:9181,15-29=http://127.0.0.1:9182 \
+             --port 9090
 ```
 
-Each shard `larql-server` mmaps its layer range. Adding
-`--feature-major-down` (W2, see ADR-009) emits `down_features_q4k.bin`,
-which lets each shard skip the ~840 MB heap cache ceiling on its
-slice. Recommended when:
+**Option B — self-assembling grid (`--grid-port` + `--join`)**:
+shards register dynamically over gRPC; the router tracks coverage
+live and reports `total_layers_covered` as shards join/leave.
+Recommended for production where shards may be added or restarted
+without bouncing the router.
+
+```bash
+# Router exposes HTTP on 9090 + grid gRPC on 50052.
+larql-router --grid-port 50052 --grid-key <secret> --port 9090
+
+# Shards register themselves via --join. They need --public-url so
+# the router knows where to send clients.
+larql-server <vindex> --port 9181 --layers 0-14 --no-infer \
+    --max-q4k-cache-layers 1 --warmup-walk-ffn \
+    --join http://127.0.0.1:50052 --grid-key <secret> \
+    --public-url http://host-a:9181
+
+larql-server <vindex> --port 9182 --layers 15-29 --no-infer \
+    --max-q4k-cache-layers 1 --warmup-walk-ffn \
+    --join http://127.0.0.1:50052 --grid-key <secret> \
+    --public-url http://host-b:9182
+```
+
+Live-validated (2026-04-26): auto-join, coverage tracking, graceful
+failure (router returns HTTP 400 `"layer N has no owning shard"`
+when a covering shard is gone), auto-recovery on rejoin.
+
+Either way, each shard `larql-server` mmaps its layer range. Adding
+`--feature-major-down` at extract time (W2, see ADR-009) emits
+`down_features_q4k.bin`, which lets each shard skip the ~840 MB
+heap cache ceiling on its slice. Recommended when:
 
 - shard count is high (per-shard RSS budget is tight),
 - the model is large enough that 14 MB / layer of disk overhead is
@@ -392,6 +436,12 @@ its layer range:
 index.enable_hnsw(200);
 index.warmup_hnsw_all_layers();   // 3.6× speedup on 8L Gemma; ~700 ms for 34L
 ```
+
+Live perf snapshot (Gemma 26B, 2-shard grid, M3 Max): full-30-layer
+fan-out **5.9 ms warm** via either router topology; cold first
+request **12.6 ms** with `--warmup-walk-ffn`, **1247 ms** without.
+8-way concurrent × 15-layer fan-out: **112 ms wall, ~1070
+layer-evals/sec**.
 
 ### MoE expert hosts (Kimi K-series, DeepSeek-V3+)
 
@@ -451,6 +501,15 @@ larql-server <vindex.path> --port 9180 --hnsw --hnsw-ef-search 200 --warmup-hnsw
 
 `--warmup-hnsw` triggers `warmup_hnsw_all_layers()` at boot (3.6×
 speedup vs lazy build); requires `--hnsw`.
+
+**For `walk-ffn` traffic** (any model that serves `/v1/walk-ffn`),
+add `--warmup-walk-ffn` to pay the ~1.3 s lazy `get_or_load_weights`
+cost at boot instead of on the first request. Measured on a Gemma
+26B vindex: first walk-ffn drops from **1247 ms** (cold) to **12.6 ms**
+(warm) — a **99× speedup**. The cost is +3.2 GB pre-allocated RSS
+and ~1.3 s of additional boot time. Operators can also fire `POST
+/v1/warmup` against a running server without a restart (request
+body is `{layers?, skip_weights?, warmup_hnsw?}`, all optional).
 
 ### Multi-shard grid (`larql-router` + N × `larql-server`)
 

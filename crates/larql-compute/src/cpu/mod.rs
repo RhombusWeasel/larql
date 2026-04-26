@@ -92,6 +92,8 @@ impl ComputeBackend for CpuBackend {
         { "CPU BLAS".to_string() }
     }
 
+    fn as_any(&self) -> &dyn std::any::Any { self }
+
     fn supports(&self, cap: Capability) -> bool {
         matches!(
             cap,

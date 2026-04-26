@@ -8,18 +8,26 @@ Vindex: `gemma3-4b-q4k-v2` (Q4_K attn/gate/up, Q6_K V/down — Ollama convention
 ## Current state (2026-04-26)
 
 ```
-larql-metal  gemma3-4b-q4k-v2   75–77 tok/s   13.0ms/tok
-Ollama       gemma3:4b          97–103 tok/s  10.0ms/tok
-Gap          1.26–1.34×         +3ms/tok
+larql-metal  gemma3-4b-q4k-v2   75–79 tok/s   ~13ms/tok
+Ollama       gemma3:4b          98–103 tok/s  ~10ms/tok
+Gap          ~1.30×             ~3ms/tok
 ```
 
-Per-stage breakdown (100-token run, 8 warmup):
+Per-stage (100-token run, 8 warmup):
 
 | Stage | ms/tok | % |
 |---|---|---|
-| GPU fwd | 11.7–11.9 | 83% |
-| lm_head | 2.35 | 17% |
-| embed + norm + detok | ~0.01 | ~0% |
+| GPU fwd | ~11.0ms | 83% |
+| lm_head | ~2.3ms | 17% |
+| embed + norm + detok | ~0.01ms | ~0% |
+
+**Recent changes (2026-04-26):**
+
+| Change | Effect | Notes |
+|---|---|---|
+| `q6k_matvec` ROWS_PER_TG 4→2 | +1-2 tok/s | 64 threads/TG → 2× concurrent TGs per CU |
+| `f32_gemv_topk1` GPU argmax | 0 in bench (KNN fires first) | Saves 0.33ms for top_k=1 non-KNN callers |
+| Q4_K float4 dual-sub-block | **REGRESSED** (reverted) | K=2560 ALU-limited; added addressing overhead |
 
 ---
 
@@ -146,6 +154,9 @@ improvements were adapted to the linear layout.
 | 2026-04-25 | Q6K inter-superblock interleaving + X preload + deferred scale | 13.7ms | 11.8ms | −1.9ms |
 | 2026-04-25 | lm_head min-heap top-k (avoids 2MB Vec allocation) | 2.40ms | 2.35ms | −0.05ms |
 | 2026-04-25 | Dispatch fusions (QK-norm Q+K, RoPE Q+K, residual_norm_store, normed QKV) | 72ms | ~13ms | +1–2 tok/s |
+| 2026-04-26 | `q6k_matvec` ROWS_PER_TG 4→2 (64 threads/TG, 2× concurrent TGs) | 75.9 tok/s | 75-79 tok/s | −0.2ms GPU fwd |
+| 2026-04-26 | `f32_gemv_topk1` GPU argmax (gemv + argmax, 8KB readback vs 1MB) | — | — | 0.33ms/tok for top_k=1 |
+| 2026-04-26 | Diagnostic: `diag_profile_kernels` (per-kernel GB/s, isolated+batched) | — | — | tooling |
 
 ---
 
@@ -170,11 +181,13 @@ improvements were adapted to the linear layout.
 
 ## Key data points for future work
 
-- M3 Max GPU practical bandwidth: ~300-350 GB/s (system-shared LPDDR5X)
-- Ollama reaches ~348 GB/s effective on weight reads
-- LARQL currently at ~322 GB/s — gap is dispatch overhead, not kernel quality
+- M3 Max GPU practical bandwidth: ~300-400 GB/s (system-shared LPDDR5X)
+- Ollama effective bandwidth: ~390 GB/s (measured, not estimated — inferred from kernel gap)
+- LARQL effective bandwidth: ~315-330 GB/s
 - Metal dispatch overhead: ~5µs per `dispatch_thread_groups` call
-- At 476 dispatches/tok: 2.4ms pure overhead (vs Ollama's ~1.4ms)
-- Reducing to 200 dispatches/tok would save ~1.4ms → ~83 tok/s
-- Q6_K linear-format kernel registers: ~20/thread × 128 threads = 2560/TG
-- Q6_K ROWS_PER_TG=4: 640 TGs for N=2560 (adequate GPU saturation)
+- Current: 374 dispatches/tok ≈ 1.9ms overhead (vs Ollama ~272 = 1.4ms → 0.5ms gap)
+- **Gate+up is ALU-limited at K=2560**: 272 GB/s despite L1-cached input; dequant ops dominate
+- **q6k_matvec is bandwidth-limited at K=10240**: 315 GB/s; ROWS_PER_TG=2 helped (1280 TGs vs 640)
+- Q6_K ROWS_PER_TG=2: 1280 TGs × 64 threads = 81,920 total threads (same as before, but 2× concurrent TGs per CU → better latency hiding)
+- `f32_gemv_topk1` GPU argmax: fires for top_k=1 callers; main decode uses KNN lm_head (top_k=5), so bench gain = 0. Value for non-KNN model paths.
+- To close the kernel compute gap: need format-compatible vectorized Q4_K dequant (no solved approach yet)

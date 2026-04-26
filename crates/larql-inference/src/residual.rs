@@ -203,18 +203,17 @@ mod tests {
         let x = Array2::from_shape_vec((2, 4), (0..8).map(|i| i as f32).collect()).unwrap();
         let w = vec![1.0f32; 4];
         let b = vec![0.0f32; 4];
-        let out = layer_norm(&x, &w, &b);
+        let out = layer_norm(&x, Some(&w), Some(&b));
         assert_eq!(out.shape(), x.shape());
         assert!(out.iter().all(|v| v.is_finite()));
     }
 
     #[test]
     fn layer_norm_zero_mean_unit_var() {
-        // After layer norm (no scale/shift), each row should have ~0 mean and ~1 std.
         let x = Array2::from_shape_vec((1, 8), (0..8).map(|i| i as f32).collect()).unwrap();
         let w = vec![1.0f32; 8];
         let b = vec![0.0f32; 8];
-        let out = layer_norm(&x, &w, &b);
+        let out = layer_norm(&x, Some(&w), Some(&b));
         let mean: f32 = out.row(0).iter().sum::<f32>() / 8.0;
         let var: f32 = out.row(0).iter().map(|v| (v - mean).powi(2)).sum::<f32>() / 8.0;
         assert!(mean.abs() < 1e-5, "mean should be ~0, got {mean}");

@@ -511,15 +511,21 @@ async fn main() -> Result<(), BoxError> {
     // `--warmup-walk-ffn` — pre-load inference weights + prefetch every
     // owned layer's Q4K mmap so the first `/v1/walk-ffn` doesn't pay
     // the ~1.3 s lazy weight load + ~17 ms / cold layer (see
-    // ROADMAP G1 / G2). Same code path as `POST /v1/warmup`.
+    // ROADMAP G1 / G2). Same code path as `POST /v1/warmup`. Goes
+    // through `warmup_model_async` (which uses `spawn_blocking`)
+    // because we're inside the tokio runtime here and the patched
+    // RwLock is async — `blocking_read` would panic.
     if cli.warmup_walk_ffn {
         for m in &state.models {
+            // walk-ffn needs the inference weights (gate-f32 cache,
+            // norms, lm_head) regardless of `--no-infer` (which only
+            // disables the `/v1/infer` route). Always load.
             let req = routes::warmup::WarmupRequest {
-                layers: None, // every owned layer
-                skip_weights: cli.no_infer,
-                warmup_hnsw: false, // already handled by --warmup-hnsw
+                layers: None,
+                skip_weights: false,
+                warmup_hnsw: false,
             };
-            let r = routes::warmup::warmup_model(m, &req);
+            let r = routes::warmup::warmup_model_async(Arc::clone(m), req).await;
             info!(
                 "  Warmup walk-ffn[{}]: weights={} ({}ms), prefetched {} layers ({}ms), total {}ms",
                 r.model, r.weights_loaded, r.weights_load_ms,

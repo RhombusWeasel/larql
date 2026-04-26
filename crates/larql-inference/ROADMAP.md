@@ -69,6 +69,98 @@ and bring MarkovRS close to UnlimitedContext for CPU decode.
 
 ---
 
+## P1: Code quality — modularity & magic strings
+
+### High priority
+
+**Centralise env-var names**
+Inline string literals `"LARQL_CPU_STAGE_DUMP"` (`forward/layer.rs:63`),
+`"LARQL_WALK_TRACE"` (`vindex/walk_ffn/mod.rs:131`), and others scattered
+across modules. A typo is a silent no-op. Create an `env_config` module with
+typed accessors (`fn stage_dump_dir() -> Option<PathBuf>`, etc.) as the single
+source of truth.
+
+**Deduplicate `current_date()`**
+Identical implementation in `capture.rs:288` and `walker/utils.rs:55`, both
+using the same approximate `days/365` arithmetic. Delete one, expose from a
+shared utility.
+
+**Magic batch size in `graph_ffn.rs`**
+`let batch_size = 8192` appears at lines 82 and 166 with the memory rationale
+only in an inline comment. Promote to `const GATE_INDEX_BATCH_SIZE: usize = 8192`
+at module level with the doc.
+
+**GELU approximation coefficients**
+`ffn/mod.rs:86-87` has bare `0.797_884_6` and `0.044715`. Name them
+`GELU_TANH_COEFF` / `GELU_TANH_CUBIC` with a source citation.
+
+**Embedding layer −1 sentinel**
+`trace/store.rs:43,150` and `trace/types.rs:10` special-case layer −1 inline.
+`const EMBEDDING_LAYER: i32 = -1` plus a `fn is_embedding_layer(layer: i32) -> bool` helper.
+
+---
+
+### Medium priority — modularity
+
+**Engine dispatch on string literals**
+`engines/mod.rs:156-175` matches `"markov-rs"`, `"unlimited-context"`,
+`"turbo-quant"`, `"apollo"` as bare strings. `EngineInfo.backend: String`
+exposes the same problem in the public API. Define `BackendKind { Cpu, Metal }`
+and `EngineKind { MarkovRs, UnlimitedContext, TurboQuant, Apollo }` enums as
+the source of truth; derive `Display` to keep the string interface externally.
+
+**Forward-pass loop duplicated 4+ times**
+`predict_with_temperature`, `predict_with_ffn`, `predict_with_router`, and
+`predict_with_strategy` all repeat the embed→loop-layers→lm_head shell with
+minor per-layer variation. Extract a `predict_impl(weights, tokenizer, tokens,
+layer_fn: impl Fn) -> PredictResult` that owns the shell; callers pass a
+closure for per-layer logic.
+
+**KV cache loop duplicated across engines**
+`MarkovResidualEngine`, `UnlimitedContextEngine`, `TurboQuantEngine` each
+re-implement the prefill→token→extend loop. Define a `KVCacheStrategy` trait
+(or shared loop helper) to consolidate the common structure.
+
+**`infer_patched.rs` hard-wires `WalkFfn` internals**
+`forward/infer_patched.rs:67-91` calls `WalkFfn::new_unlimited_with_trace`
+directly then extracts residuals, coupling the INFER pipeline to WalkFfn
+internals. Expose residual capture via a callback/trait on `FfnBackend` instead.
+
+**Chat template family-matching duplicated**
+`"gemma"`, `"mistral"`, `"llama"` family strings matched independently in
+`chat/fallback.rs:30` and `chat/source.rs`. Extract a single `FamilyMatcher`
+type reused by both the HF-file path and the hardcoded fallback.
+
+**Trace capture re-implements forward pass**
+`trace/capture.rs` duplicates the embedding and layer computation from
+`forward/embed.rs` / `forward/layer.rs` to intercept residuals, creating two
+parallel implementations that drift on any attention/FFN change. Add a
+`capture_residual` callback to the main forward loop instead.
+
+---
+
+### Low priority
+
+**RoPE base constant in tests**
+`attention/rope.rs` hard-codes `10000.0` in 7 test methods. Define
+`const DEFAULT_ROPE_BASE: f64 = 10000.0` at module level and use it uniformly.
+
+**Walker threshold table**
+`walker/utils.rs:30-52` has 7 sequential `if` statements for threshold buckets
+(0.01, 0.05, 0.10, …). Replace with a `const THRESHOLD_BUCKETS: &[(f64, &str)]`
+slice iterated once.
+
+**`head_dim` inferred from `kv_dim` in TurboQuant**
+`engines/kv_engines/turbo_quant/mod.rs:99` guesses `head_dim` from `kv_dim`
+instead of reading it from arch. Pass `head_dim` as a parameter from engine
+init.
+
+**`L1_DEFAULT_MAX_ENTRIES` unused at call sites**
+`vindex/l1_cache.rs:12` defines the constant but call sites hard-code the same
+value independently. Audit and use the constant everywhere.
+
+---
+
 ## P2: Research
 
 ### Hybrid head caching (RS+CA)

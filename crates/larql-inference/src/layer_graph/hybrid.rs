@@ -61,7 +61,7 @@ fn predict_hybrid_metal(
     layer_range: &std::ops::Range<usize>,
 ) -> Option<crate::forward::PredictResult> {
     // Check: Metal backend?
-    if backend.name() != "metal" { return None; }
+    let metal = backend.as_any().downcast_ref::<larql_compute::metal::MetalBackend>()?;
 
     // Check: walk data available?
     let gate_index: &dyn larql_vindex::GateIndex = index;
@@ -89,12 +89,6 @@ fn predict_hybrid_metal(
                 weights, layer, wq, wk, wv, wo, dummy, dummy, dummy,
             )
         }).collect();
-
-    // Downcast backend to MetalBackend
-    // Safety: we verified name == "metal" above
-    let metal: &larql_compute::metal::MetalBackend = unsafe {
-        &*(backend as *const dyn ComputeBackend as *const larql_compute::metal::MetalBackend)
-    };
 
     // ── Phase 0: Cached layers (template-fixed) ──
     let mut h = crate::forward::embed_tokens_pub(weights, token_ids);

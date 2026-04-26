@@ -269,7 +269,7 @@ larql-models      Model config, architecture traits, weight loading, quant/dequa
 larql-vindex      Vindex lifecycle: extract, load, query, mutate, patch, save
     ↓
 larql-core        Graph algorithms, merge, diff
-larql-inference   Forward pass, BLAS-fused attention, Metal GPU, WalkFfn
+larql-inference   Forward pass, BLAS-fused attention, Metal GPU (macOS), WalkFfn
     ↓
 larql-lql         LQL parser, executor, REPL, USE REMOTE client
     ↓
@@ -544,12 +544,21 @@ See [docs/residual-trace.md](docs/residual-trace.md) for the full writeup.
 | [docs/residual-trace.md](docs/residual-trace.md) | Residual stream trace — decomposition, storage, tiered context |
 | [docs/specs/trace-format-spec.md](docs/specs/trace-format-spec.md) | Trace file format specification (.bin, .bndx, .ctxt) |
 
+## Platform Support
+
+| Platform | Compiles | GPU | BLAS |
+|----------|----------|-----|------|
+| macOS arm64 (M-series) | ✓ | Metal (`--features metal`) | Accelerate |
+| Linux arm64 / x86_64 | ✓ | — (CPU fallback) | OpenBLAS |
+| Windows arm64 / x86_64 | ✓ | — (CPU fallback) | OpenBLAS |
+
+macOS gets Metal GPU acceleration. Linux and Windows run the same CPU path (BLAS-fused attention + mmap walk FFN). All platforms require OpenBLAS on Linux/Windows — install via your system package manager (`apt install libopenblas-dev`, `vcpkg install openblas`).
+
 ## Building & Testing
 
-(Needs Openblas under Linux)
 ```bash
 cargo build --release                    # optimised build
-cargo build --release --features metal   # with Metal GPU backend
+cargo build --release --features metal   # with Metal GPU backend (macOS only)
 cargo test                               # all tests across all crates
 cargo test -p larql-inference            # inference engine tests (109 tests)
 cargo test -p larql-inference --features metal  # + Metal GPU tests (115 tests)

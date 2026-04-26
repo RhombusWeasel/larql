@@ -64,6 +64,10 @@ openblas-src = { version = "0.10", features = ["system"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 blas-src = { version = "0.10", features = ["accelerate"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+blas-src = { version = "0.10", features = ["openblas"], default-features = false }
+openblas-src = { version = "0.10", features = ["system"] }
+
 [features]
 default = []
 metal = ["larql-compute/metal"]
