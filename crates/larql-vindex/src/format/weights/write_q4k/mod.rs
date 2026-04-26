@@ -36,7 +36,7 @@ pub enum QuantBlockFormat {
 // it directly instead of poking `serde_json::Value` with string keys.
 use super::manifest::Q4kManifestEntry as Q4kAttnEntry;
 
-mod feature_major_down;
+pub mod feature_major_down;
 use feature_major_down::FeatureMajorDownState;
 
 /// Pad a row-major f32 buffer to the next multiple of 256 with zeros

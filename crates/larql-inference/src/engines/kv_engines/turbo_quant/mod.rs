@@ -564,3 +564,59 @@ mod tests {
     }
 }
 
+
+// ─── Integration tests with synthetic weights ─────────────────────────────────
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::engines::test_utils::make_test_weights;
+    use crate::forward::hidden_to_raw_logits;
+
+    #[test]
+    fn prefill_compresses_kv_for_all_layers() {
+        let weights = make_test_weights();
+        let mut engine = TurboQuantEngine::new(4);
+        assert_eq!(engine.memory_bytes(), 0);
+        let h = engine.prefill(&weights, &[0u32, 1, 2]).expect("prefill failed");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert_eq!(engine.layers.len(), weights.num_layers, "one CompressedLayer per model layer");
+        assert!(engine.memory_bytes() > 0);
+    }
+
+    #[test]
+    fn decode_step_grows_compressed_cache() {
+        let weights = make_test_weights();
+        let mut engine = TurboQuantEngine::new(4);
+        engine.prefill(&weights, &[0u32]).expect("prefill");
+        let mem_before = engine.memory_bytes();
+
+        engine.decode_step(&weights, 1).expect("decode_step");
+        // After decode: K/V cache has one more entry per layer → more compressed bytes
+        assert!(engine.memory_bytes() > mem_before,
+            "compressed cache should grow after each decode step");
+    }
+
+    #[test]
+    fn logits_finite_after_prefill_and_decode() {
+        let weights = make_test_weights();
+        let mut engine = TurboQuantEngine::new(4);
+        let h_pre = engine.prefill(&weights, &[0u32, 1]).expect("prefill");
+        assert!(hidden_to_raw_logits(&weights, &h_pre).iter().all(|v| v.is_finite()));
+        let h_dec = engine.decode_step(&weights, 2).expect("decode");
+        assert!(hidden_to_raw_logits(&weights, &h_dec).iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn three_bit_engine_also_works() {
+        let weights = make_test_weights();
+        let mut engine = TurboQuantEngine::new(3);
+        let h = engine.prefill(&weights, &[0u32]).expect("3-bit prefill");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        // 3-bit uses fewer bytes per compressed vector
+        let mem3 = engine.memory_bytes();
+        let mut engine4 = TurboQuantEngine::new(4);
+        engine4.prefill(&weights, &[0u32]).expect("4-bit prefill");
+        assert!(mem3 < engine4.memory_bytes(), "3-bit should use less memory than 4-bit");
+    }
+}

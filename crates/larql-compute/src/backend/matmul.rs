@@ -42,6 +42,12 @@ pub trait MatMul {
     /// the 32×32 tiled sgemm wastes 31/32 threads at `M = 1`.
     fn f32_gemv(&self, _w: ArrayView2<f32>, _x: &[f32]) -> Option<Vec<f32>> { None }
 
+    /// GPU gemv + GPU argmax without materialising the full output Vec.
+    /// Returns `(token_id, score)` for the top-1 element.
+    /// Saves ~0.33ms on Metal by reading back only 8 KB partial results
+    /// instead of 1 MB (262K × f32). Returns `None` if not specialised.
+    fn f32_gemv_topk1(&self, _w: ArrayView2<f32>, _x: &[f32]) -> Option<(u32, f32)> { None }
+
     /// Like [`Self::f32_gemv`] but skips the internal CPU-vs-GPU flop
     /// threshold. Use when the caller has already decided the work is
     /// worth a GPU dispatch — e.g. the per-layer gate matmul that fires

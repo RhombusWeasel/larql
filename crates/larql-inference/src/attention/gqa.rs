@@ -108,3 +108,86 @@ pub fn gqa_attention_with_weights(
 
     (out, weights)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    fn zeros(rows: usize, cols: usize) -> Array2<f32> { Array2::zeros((rows, cols)) }
+    fn ones(rows: usize, cols: usize) -> Array2<f32> { Array2::ones((rows, cols)) }
+
+    fn small(rows: usize, cols: usize, scale: f32) -> Array2<f32> {
+        let data: Vec<f32> = (0..rows * cols).map(|i| (i as f32 + 1.0) * scale).collect();
+        Array2::from_shape_vec((rows, cols), data).unwrap()
+    }
+
+    // seq=4, num_q=2, head_dim=4, num_kv=1, reps=2
+    fn run(seq: usize) -> Array2<f32> {
+        let hd = 4usize;
+        let nq = 2usize;
+        let nkv = 1usize;
+        let q = small(seq, nq * hd, 0.01);
+        let k = small(seq, nkv * hd, 0.01);
+        let v = small(seq, nkv * hd, 0.01);
+        gqa_attention(&q, &k, &v, nq, hd, nq / nkv, 1.0 / (hd as f64).sqrt(), seq)
+    }
+
+    #[test]
+    fn gqa_output_shape() {
+        let out = run(3);
+        assert_eq!(out.shape(), &[3, 2 * 4]); // [seq, num_q * head_dim]
+    }
+
+    #[test]
+    fn gqa_output_finite() {
+        let out = run(4);
+        assert!(out.iter().all(|v| v.is_finite()), "gqa output has non-finite values");
+    }
+
+    #[test]
+    fn gqa_single_token() {
+        let out = run(1);
+        assert_eq!(out.shape(), &[1, 8]);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn gqa_causal_last_token_attends_all() {
+        // Last token can attend to all positions.
+        // With uniform Q/K, attention should be distributed (not focused).
+        let seq = 4usize;
+        let hd = 4usize;
+        let nq = 1usize;
+        let q = ones(seq, hd);
+        let k = ones(seq, hd);
+        let v = small(seq, hd, 1.0); // distinct values
+        let out = gqa_attention(&q, &k, &v, nq, hd, 1, 1.0 / (hd as f64).sqrt(), seq);
+        // Last row should be a weighted average of V rows (all weights equal → mean)
+        let expected_last: Vec<f32> = v.rows().into_iter()
+            .fold(vec![0.0f32; hd], |mut acc, row| {
+                for (a, v) in acc.iter_mut().zip(row.iter()) { *a += v / seq as f32; }
+                acc
+            });
+        let got_last: Vec<f32> = out.row(seq - 1).to_vec();
+        for (e, g) in expected_last.iter().zip(got_last.iter()) {
+            assert!((e - g).abs() < 0.01, "last token mean-attn mismatch: {e} vs {g}");
+        }
+    }
+
+    #[test]
+    fn gqa_with_weights_captures_softmax() {
+        let seq = 3usize;
+        let hd = 4usize;
+        let q = small(seq, hd, 0.1);
+        let k = small(seq, hd, 0.1);
+        let v = small(seq, hd, 0.1);
+        let (out, weights) = gqa_attention_with_weights(&q, &k, &v, 1, hd, 1,
+            1.0 / (hd as f64).sqrt(), seq, true, None);
+        assert!(out.iter().all(|v| v.is_finite()));
+        let w = weights.expect("weights should be captured");
+        // Attention weights for last position should sum to ~1
+        let sum: f32 = w.heads[0].iter().sum();
+        assert!((sum - 1.0).abs() < 0.01, "attention weights should sum to 1, got {sum}");
+    }
+}

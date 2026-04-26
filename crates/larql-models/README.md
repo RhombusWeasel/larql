@@ -70,14 +70,24 @@ let weights = load_model_dir("/path/to/model")?;
 
 // Access tensors
 let q_proj = &weights.tensors["layers.0.self_attn.q_proj.weight"];
-let embed = &weights.embed;  // Embedding matrix
+let embed = &weights.embed;  // Embedding matrix [vocab, hidden]
 let lm_head = &weights.lm_head;  // Output projection (may be tied to embed)
 
 // Architecture is attached
 println!("{}", weights.arch.family());
 
+// Unsupported dtypes (I64 attention masks etc.) are recorded, not fatal
+for (key, dtype) in &weights.skipped_tensors {
+    println!("skipped {key} ({dtype})");
+}
+
 // Walk-only mode: drop FFN weights to save ~13GB
 let freed = weights.drop_ffn_weights();
+// Server-side split: drop attention weights (~1GB for 4B)
+let freed = weights.drop_attn_weights();
+// Drop output heads when not needed
+weights.drop_lm_head();
+weights.drop_embed();
 ```
 
 ### Supported Formats
@@ -96,7 +106,9 @@ let freed = weights.drop_ffn_weights();
 | Module | Formats | Purpose |
 |--------|---------|---------|
 | `quant::half` | f16, bf16 | IEEE 754 half-precision encode/decode |
-| `quant::ggml` | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 | GGML block quantization (32-element blocks) |
+| `quant::ggml::legacy` | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 | GGML legacy block quantization (32-element blocks) |
+| `quant::ggml::q4_k` | Q4_K | 256-element K-quant: fused row-dot + scaled-add + dequant |
+| `quant::ggml::q6_k` | Q6_K | 256-element K-quant: fused row-dot + scaled-add + dequant |
 | `quant::mxfp4` | MXFP4 + e8m0 | Microscaling 4-bit (GPT-OSS/OpenAI packed experts) |
 
 These handle data format encoding/decoding only. Compute operations (GPU matvec, shader dispatch) are in `larql-compute`.
@@ -149,11 +161,20 @@ src/
   quant/
     mod.rs            Module declarations
     half.rs           f16/bf16 encode/decode
-    ggml.rs           Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 block quantization
-    mxfp4.rs          MXFP4 + e8m0 scale dequantization
+    ggml/
+      mod.rs          Dispatch (dequantize), type constants, shared validator
+      legacy.rs       Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 (32-element blocks)
+      q4_k.rs         Q4_K (256-element K-quant): row-dot, scaled-add, dequant
+      q6_k.rs         Q6_K (256-element K-quant): row-dot, scaled-add, dequant
+      quantize.rs     Q4_0/Q8_0 encoder (for vindex build)
+    fp4.rs            FP4 nibble packing
+    fp4_block.rs      Block-wise FP4/FP8
+    fp8.rs            FP8 (e4m3)
+    mxfp4.rs          MXFP4 + e8m0 + split_gate_up_experts (GPT-OSS)
 
 tests/
-  test_architectures.rs  Integration tests (58): all 12 architectures, MoE, MLA, bias, scaling, quant
+  test_architectures.rs  Integration tests (65): all 12 architectures, MoE, MLA, bias, scaling, quant, ModelWeights drop methods
+  test_loading.rs        Loading tests (16): synthetic safetensors + GGUF, dtype conversion, error paths
 
 examples/
   architecture_demo.rs   Guided tour: detection, keys, sliding window, MoE, quant formats
@@ -164,10 +185,14 @@ examples/
 ## Tests
 
 ```bash
-cargo test -p larql-models
+cargo test -p larql-models           # 259 tests
+cargo llvm-cov --package larql-models --summary-only  # 81.8% line coverage
 ```
 
-169 tests (111 unit + 58 integration) covering all 12 architectures: detection, tensor key patterns, MoE expert formats (PerExpert vs PackedMxfp4), MLA compression keys, Gemma 2 softcapping + QK norm offsets, Gemma 3 sliding window + dual RoPE, Gemma 4 per-layer geometry (head_dim, KV heads, partial RoPE, KV sharing, PLE, V-norm, K=V), Qwen attention bias, StarCoder2 bias + LayerNorm + non-gated FFN, DeepSeek shared experts + MLA, Granite scaling multipliers, generic fallback defaults, quantization round-trips (Q4_0, Q8_0), malformed-input rejection across every GGML dequantizer + MXFP4 + truncated GGUF files, and `drop_ffn_weights`.
+259 tests (178 unit + 65 architecture integration + 16 loading integration) covering:
+- All 12 architectures: detection, tensor key patterns, MoE expert formats (PerExpert / PackedMxfp4 / PackedBF16), MLA compression keys, Gemma 2 softcapping + QK norm offsets, Gemma 3 sliding window + dual RoPE, Gemma 4 per-layer geometry (head_dim, KV heads, partial RoPE, KV sharing, PLE, V-norm, K=V), Qwen attention bias, StarCoder2 bias + LayerNorm + non-gated FFN, DeepSeek shared experts + MLA, Granite scaling multipliers, generic fallback
+- Quantization: Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q6_K round-trips, NEON vs scalar parity, fused row-dot vs manual dot, scaled-add correctness, MXFP4 dequant + `split_gate_up_experts`, malformed-input rejection across all dequantizers
+- Loading: synthetic safetensors (F32/F16/BF16 dtype conversion, 1D vectors, walk-only, custom filter, unsupported dtype → `skipped_tensors`, missing embed error, MLX weights/ subdir), synthetic GGUF (metadata parsing, tensor loading, key normalisation, truncated-data rejection, `drop_attn_weights` / `drop_lm_head` / `drop_embed`, `get_packed_bytes`)
 
 ## Examples
 

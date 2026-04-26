@@ -411,7 +411,7 @@ pub fn forward_from_layer(
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+mod forward_from_layer_tests {
     use super::*;
     use crate::engines::test_utils::make_test_weights;
 

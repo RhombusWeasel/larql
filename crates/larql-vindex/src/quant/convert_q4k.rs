@@ -275,6 +275,127 @@ fn link_or_copy(src: &Path, dst: &Path) -> Result<(), VindexError> {
     }
 }
 
+/// Report from [`add_feature_major_down`].
+#[derive(Debug, Clone)]
+pub struct AddFeatureMajorDownReport {
+    pub vindex: PathBuf,
+    /// `true` when the file was already present and we left it alone.
+    pub skipped: bool,
+    pub num_layers: usize,
+    /// Bytes written to `down_features_q4k.bin` (0 when skipped).
+    pub bytes_written: u64,
+    pub wall_time: Duration,
+}
+
+/// Retrofit `down_features_q4k.bin` into an existing Q4K vindex
+/// without re-quantising the rest of the weights. Reads the down
+/// portion of `interleaved_q4k.bin` per layer, transposes to
+/// `[intermediate, hidden]`, re-quantises at the same precision the
+/// source used, and writes the W2 file + manifest in place.
+///
+/// Idempotent: if `down_features_q4k.bin` already exists, returns
+/// `Ok` with `skipped: true` and doesn't touch the directory.
+///
+/// Precondition: the vindex must have `interleaved_q4k.bin` +
+/// `interleaved_q4k_manifest.json` (i.e. `quant: q4k` in
+/// `index.json`). Browse-only / f32-only vindexes don't.
+pub fn add_feature_major_down(vindex_dir: &Path) -> Result<AddFeatureMajorDownReport, VindexError> {
+    use crate::format::weights::write_q4k::feature_major_down::FeatureMajorDownState;
+    use crate::format::weights::Q4kManifestEntry;
+
+    let started = Instant::now();
+    let dst = vindex_dir.join(DOWN_FEATURES_Q4K_BIN);
+    let dst_manifest = vindex_dir.join(DOWN_FEATURES_Q4K_MANIFEST_JSON);
+
+    if dst.exists() && dst_manifest.exists() {
+        let config = crate::format::load::load_vindex_config(vindex_dir)?;
+        return Ok(AddFeatureMajorDownReport {
+            vindex: vindex_dir.to_path_buf(),
+            skipped: true,
+            num_layers: config.num_layers,
+            bytes_written: 0,
+            wall_time: started.elapsed(),
+        });
+    }
+
+    // Source: interleaved_q4k.bin + manifest.
+    let interleaved_path = vindex_dir.join(INTERLEAVED_Q4K_BIN);
+    let interleaved_manifest_path = vindex_dir.join(INTERLEAVED_Q4K_MANIFEST_JSON);
+    if !interleaved_path.exists() || !interleaved_manifest_path.exists() {
+        return Err(VindexError::Parse(format!(
+            "{} expects {} + {} (run extract with --quant q4k first)",
+            vindex_dir.display(),
+            INTERLEAVED_Q4K_BIN,
+            INTERLEAVED_Q4K_MANIFEST_JSON,
+        )));
+    }
+    let manifest_text = std::fs::read_to_string(&interleaved_manifest_path)?;
+    let entries: Vec<Q4kManifestEntry> = serde_json::from_str(&manifest_text)
+        .map_err(|e| VindexError::Parse(format!(
+            "{INTERLEAVED_Q4K_MANIFEST_JSON}: {e}"
+        )))?;
+
+    let config = crate::format::load::load_vindex_config(vindex_dir)?;
+    let num_layers = config.num_layers;
+    if entries.len() < num_layers * 3 {
+        return Err(VindexError::Parse(format!(
+            "{INTERLEAVED_Q4K_MANIFEST_JSON} has {} entries, expected {} \
+             (3 per layer for {num_layers} layers)",
+            entries.len(),
+            num_layers * 3,
+        )));
+    }
+
+    let file = std::fs::File::open(&interleaved_path)?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| VindexError::Parse(format!("mmap {INTERLEAVED_Q4K_BIN}: {e}")))?;
+
+    let mut state = FeatureMajorDownState::new(&dst, num_layers)?;
+
+    // Down is the third entry per layer ([gate, up, down] in the writer).
+    for layer in 0..num_layers {
+        let down = &entries[layer * 3 + 2];
+        let format = down.format;
+        let info = crate::quant::registry::lookup(down.format_tag()).ok_or_else(|| {
+            VindexError::Parse(format!(
+                "unknown quant format {:?} in {INTERLEAVED_Q4K_MANIFEST_JSON} for layer {layer}",
+                down.format_tag(),
+            ))
+        })?;
+        let rows = down.shape.first().copied().ok_or_else(|| {
+            VindexError::Parse(format!(
+                "down shape missing rows in {INTERLEAVED_Q4K_MANIFEST_JSON} for layer {layer}"
+            ))
+        })?;
+        let cols = down.shape.get(1).copied().ok_or_else(|| {
+            VindexError::Parse(format!(
+                "down shape missing cols in {INTERLEAVED_Q4K_MANIFEST_JSON} for layer {layer}"
+            ))
+        })?;
+        // Source disk layout for down is `[hidden=rows, padded_intermediate=cols]`.
+        let n_padded = rows * cols;
+        let bytes = &mmap[down.offset as usize..(down.offset + down.length) as usize];
+        let dequant = (info.dequantize)(bytes, n_padded).map_err(|e| {
+            VindexError::Parse(format!("dequant down layer {layer}: {e}"))
+        })?;
+        // FeatureMajorDownState::append_layer expects the full
+        // `[rows × cols]` padded f32 buffer — exactly what the
+        // dequantiser produced.
+        state.append_layer(down.key.clone(), &dequant, rows, cols, format)?;
+    }
+
+    state.finalize(&dst_manifest)?;
+
+    let bytes_written = std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
+    Ok(AddFeatureMajorDownReport {
+        vindex: vindex_dir.to_path_buf(),
+        skipped: false,
+        num_layers,
+        bytes_written,
+        wall_time: started.elapsed(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

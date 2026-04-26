@@ -17,6 +17,11 @@
 
 use crate::config::{Activation, ExpertFormat, ModelArchitecture, ModelConfig};
 
+/// Layer type string used in Gemma 4 `layer_types` config field.
+const LAYER_TYPE_FULL: &str = "full_attention";
+/// Default sliding-window period when not explicit in config.
+const DEFAULT_SLIDING_WINDOW_PATTERN: usize = 6;
+
 pub struct Gemma4Arch {
     config: ModelConfig,
     /// Precomputed: which layer indices are full (global) attention.
@@ -32,10 +37,10 @@ impl Gemma4Arch {
         // Determine global layers from explicit layer_types or pattern
         let global_layers: Vec<bool> = if let Some(ref types) = config.layer_types {
             types.iter()
-                .map(|t| t == "full_attention")
+                .map(|t| t == LAYER_TYPE_FULL)
                 .collect()
         } else {
-            let pattern = config.sliding_window_pattern.unwrap_or(6);
+            let pattern = config.sliding_window_pattern.unwrap_or(DEFAULT_SLIDING_WINDOW_PATTERN);
             (0..num_layers)
                 .map(|layer| (layer + 1) % pattern == 0)
                 .collect()

@@ -7,10 +7,12 @@
 ## Entry Points
 
 ```
-load_model_dir(path)     → auto-detect format, load ModelWeights
-  ├── safetensors/       → safetensors::load_model_dir
-  ├── *.gguf             → gguf::load_gguf
-  └── error              → ModelError::NotADirectory
+load_model_dir(path)                   → auto-detect format, load all tensors
+load_model_dir_walk_only(path)         → skip FFN tensors at parse time (no heap spike)
+load_model_dir_filtered(path, skip_fn) → skip any tensors matching predicate
+  ├── *.safetensors/     → loading::safetensors
+  ├── *.gguf             → loading::gguf::load_gguf
+  └── error              → ModelError::{NotADirectory, NoSafetensors}
 
 resolve_model_path(name) → resolve HF cache path to model directory
 ```
@@ -60,7 +62,7 @@ For each shard:
       f32 → use directly
       f16 → quant::half::decode_f16
       bf16 → quant::half::decode_bf16
-      other → ModelError::UnsupportedDtype
+      other → collected into ModelWeights::skipped_tensors (not fatal)
     ↓
     Reshape to Array2<f32> (2D: [rows, cols])
     Convert to ArcArray2<f32> (shared ownership)
@@ -159,11 +161,15 @@ GGUF uses different key patterns than safetensors:
 
 ```rust
 pub struct ModelWeights {
-    pub tensors: HashMap<String, WeightArray>,  // 2D weight matrices
-    pub vectors: HashMap<String, Vec<f32>>,     // 1D vectors (norms, biases)
-    pub embed: WeightArray,                      // Embedding matrix
-    pub lm_head: WeightArray,                    // Output projection
-    pub arch: Box<dyn ModelArchitecture>,         // Detected architecture
+    pub tensors: HashMap<String, WeightArray>,   // 2D weight matrices
+    pub vectors: HashMap<String, Vec<f32>>,      // 1D vectors (norms, biases)
+    pub raw_bytes: HashMap<String, Vec<u8>>,     // Packed BF16 expert blocks (Gemma 4 A4B)
+    pub skipped_tensors: Vec<(String, String)>,  // (key, dtype) for unsupported dtypes
+    pub packed_mmaps: HashMap<String, Mmap>,     // Memory-mapped packed files
+    pub packed_byte_ranges: HashMap<String, (String, usize, usize)>, // key → (file, offset, len)
+    pub embed: WeightArray,                       // Embedding matrix [vocab, hidden]
+    pub lm_head: WeightArray,                     // Output projection (may be tied to embed)
+    pub arch: Box<dyn ModelArchitecture>,          // Detected architecture
     // Cached config values for hot-path access:
     pub num_layers: usize,
     pub hidden_size: usize,
@@ -176,12 +182,35 @@ pub struct ModelWeights {
 }
 ```
 
-### drop_ffn_weights
+### Memory management methods
 
-Removes FFN tensors from memory for walk-only mode. Matches patterns:
+| Method | Frees | Use case |
+|--------|-------|----------|
+| `drop_ffn_weights()` | gate/up/down projections, packed expert blocks | Walk-only inference (vindex-backed FFN) |
+| `drop_attn_weights()` | Q/K/V/O projections, QK norms | Server-side FFN-only deployment |
+| `drop_lm_head()` | Output projection matrix | Server that doesn't compute logits |
+| `drop_embed()` | Input embedding matrix | Server that receives residuals, not tokens |
+
+All return freed bytes. Typical savings for a 4B model:
+- `drop_ffn_weights`: ~13 GB (~80% of parameters)
+- `drop_attn_weights`: ~1 GB
+- `drop_lm_head` / `drop_embed`: ~2.7 GB each
+
+Pattern matching for `drop_ffn_weights`:
 - `gate_proj`, `up_proj`, `down_proj` (dense models)
 - `ffn_gate`, `ffn_up`, `ffn_down` (GGUF key format)
 - `mlp.experts`, `block_sparse_moe.experts` (MoE per-expert)
 - `packed_gate_up_blocks`, `packed_down_blocks` (GPT-OSS MXFP4)
 
-Typical savings: ~13GB for a 4B model (~80% of total weights are FFN).
+### skipped_tensors
+
+Tensors with unsupported dtypes (I64 attention masks, U8 token type IDs, etc.) are collected here rather than causing a load failure. Each entry is `(tensor_key, dtype_string)`. Check after loading to detect unexpected format gaps:
+
+```rust
+let weights = load_model_dir(path)?;
+for (key, dtype) in &weights.skipped_tensors {
+    if !["I64", "I32", "U8"].iter().any(|&d| dtype.contains(d)) {
+        eprintln!("unexpected skipped tensor: {key} ({dtype})");
+    }
+}
+```

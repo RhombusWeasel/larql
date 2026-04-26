@@ -55,6 +55,7 @@ pub fn all_shaders() -> String {
     src.push_str(sgemm::SHADER);
     src.push_str(sgemm_transb::SHADER);
     src.push_str(f32_gemv::SHADER);
+    src.push_str(f32_gemv::ARGMAX_SHADER);
     src.push_str(f16_gemv::SHADER);
     // Q4 dense matvec
     src.push_str(q4_matvec_v4::SHADER);

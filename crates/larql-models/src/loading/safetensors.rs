@@ -16,11 +16,7 @@ use crate::detect::ModelError;
 /// decoding these entirely — critical for large models where decoding them
 /// into f32 heap would blow RAM before they can be dropped.
 pub fn is_ffn_tensor(key: &str) -> bool {
-    let ffn_patterns = ["gate_proj", "up_proj", "down_proj",
-                       "ffn_gate", "ffn_up", "ffn_down",
-                       "mlp.experts", "block_sparse_moe.experts",
-                       "packed_gate_up_blocks", "packed_down_blocks"];
-    ffn_patterns.iter().any(|p| key.contains(p))
+    crate::weights::FFN_TENSOR_PATTERNS.iter().any(|p| key.contains(p))
 }
 
 /// Load model weights from a directory or file, never reading FFN tensors.
@@ -232,6 +228,26 @@ pub fn load_model_dir_filtered(
     })
 }
 
+/// Return the HuggingFace hub cache directory, respecting env-var overrides.
+///
+/// Priority (matches Python `huggingface_hub`):
+/// 1. `HF_HUB_CACHE` — exact cache dir
+/// 2. `HF_HOME` — HF home; hub cache = `$HF_HOME/hub`
+/// 3. `HOME` (Unix) / `USERPROFILE` (Windows) — `~/.cache/huggingface/hub`
+fn hf_hub_cache() -> PathBuf {
+    if let Ok(p) = std::env::var("HF_HUB_CACHE") {
+        return PathBuf::from(p);
+    }
+    if let Ok(hf_home) = std::env::var("HF_HOME") {
+        return PathBuf::from(hf_home).join("hub");
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    home.join(".cache").join("huggingface").join("hub")
+}
+
 /// Resolve a HuggingFace model ID or path to a local directory or GGUF file.
 pub fn resolve_model_path(model: &str) -> Result<PathBuf, ModelError> {
     let path = PathBuf::from(model);
@@ -243,12 +259,10 @@ pub fn resolve_model_path(model: &str) -> Result<PathBuf, ModelError> {
         return Ok(path);
     }
 
-    // Try HuggingFace cache
+    // Try HuggingFace cache — resolve location using the same env-var priority
+    // as the Python huggingface_hub library: HF_HUB_CACHE > HF_HOME > home dir.
     let cache_name = format!("models--{}", model.replace('/', "--"));
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    let hf_cache = home.join(format!(".cache/huggingface/hub/{cache_name}/snapshots"));
+    let hf_cache = hf_hub_cache().join(&cache_name).join("snapshots");
 
     if hf_cache.is_dir() {
         // Find the snapshot that has actual model files (safetensors or config.json+weights)
@@ -515,7 +529,12 @@ mod tests {
 
     #[test]
     fn resolve_model_path_nonexistent_returns_error() {
-        let result = resolve_model_path("/nonexistent/path/that/cannot/exist");
+        // Use a temp dir that we immediately drop, so the path is guaranteed
+        // not to exist on any OS — no hardcoded Unix-style paths.
+        let dir = TempDir::new().unwrap();
+        let gone = dir.path().join("subdir_that_was_never_created");
+        drop(dir);
+        let result = resolve_model_path(gone.to_str().unwrap());
         assert!(result.is_err());
     }
 
@@ -524,7 +543,8 @@ mod tests {
         let _lock = HOME_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
         let snapshot = home.path()
-            .join(".cache/huggingface/hub/models--org--name/snapshots/abc123");
+            .join(".cache").join("huggingface").join("hub")
+            .join("models--org--name").join("snapshots").join("abc123");
         fs::create_dir_all(&snapshot).unwrap();
         fs::write(snapshot.join("model.safetensors"), b"").unwrap();
         std::env::set_var("HOME", home.path().to_str().unwrap());
@@ -538,7 +558,8 @@ mod tests {
         let _lock = HOME_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
         let snapshot = home.path()
-            .join(".cache/huggingface/hub/models--org--model/snapshots/def456");
+            .join(".cache").join("huggingface").join("hub")
+            .join("models--org--model").join("snapshots").join("def456");
         fs::create_dir_all(&snapshot).unwrap();
         fs::write(snapshot.join("config.json"), b"{}").unwrap();
         std::env::set_var("HOME", home.path().to_str().unwrap());

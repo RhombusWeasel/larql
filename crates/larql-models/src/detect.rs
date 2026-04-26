@@ -84,6 +84,12 @@ pub fn detect_from_json(config: &serde_json::Value) -> Box<dyn ModelArchitecture
     }
 }
 
+// ── RoPE base defaults ───────────────────────────────────────────────────────
+/// Default RoPE theta for Gemma family models.
+const ROPE_BASE_GEMMA: f64 = 1_000_000.0;
+/// Default RoPE theta for all other model families.
+const ROPE_BASE_DEFAULT: f64 = 10_000.0;
+
 // ── Config field name aliases ────────────────────────────────────────────────
 // Different model families use different JSON keys for the same concept.
 // Ordering is priority: first match wins.
@@ -113,7 +119,7 @@ fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
 
     // Pick defaults based on model type.
     let is_gemma = model_type.starts_with("gemma");
-    let rope_default = if is_gemma { 1_000_000.0 } else { 10_000.0 };
+    let rope_default = if is_gemma { ROPE_BASE_GEMMA } else { ROPE_BASE_DEFAULT };
 
     let num_layers = text_config["num_hidden_layers"].as_u64().unwrap_or(32) as usize;
     let hidden_size = text_config["hidden_size"].as_u64().unwrap_or(2048) as usize;

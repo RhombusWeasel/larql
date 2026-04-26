@@ -2,19 +2,21 @@
 //!
 //! Dispatched as `2 × ceil(N/ROWS_PER_TG)` TGs: first half → gate, second → up.
 //!
-//! **Parallelism — 2-way inter-superblock interleaving (matches q4k_matvec/q6k_matvec):**
+//! **Parallelism — 2-way inter-superblock interleaving:**
 //!
 //! `ix = lane & 1` splits 32 lanes into two groups:
 //!   ix=0 → even superblocks  ix=1 → odd superblocks
 //! Adjacent lanes read from different 144-byte superblock regions simultaneously.
 //!
-//! `tid = lane >> 1` (0..15) assigns work within each superblock:
-//!   j  = tid >> 1 (0..7): which sub-block (32 elements)
-//!   sh = tid & 1  (0/1):  first or last 16 of those 32 elements
-//!
-//! X preloaded into `xl[16]` before weight reads for latency hiding.
-//! ROWS_PER_TG=4 (128 threads/TG): halves register pressure vs 256-thread
-//! design, doubling concurrent TG occupancy for better DRAM latency hiding.
+//! **Why float4 / dual-sub-block approaches were tried and reverted:**
+//! Q4_K gate+up is COMPUTE-BOUND at K=2560 (measured: 272 GB/s, profiler confirms).
+//! K=2560 = 10 superblocks × 144 bytes/row fits in GPU L1 cache — the bottleneck
+//! is ALU throughput for nibble dequant, not DRAM bandwidth.
+//! - 4-way SB interleaving (ix=lane>>3): creates 3 vs 2 SB load imbalance for 10 SBs
+//!   → simd_sum waits for slowest ix-group → regression.
+//! - float4 with uint16 correction factors: adds ALU complexity (inv16/inv256/inv4096
+//!   corrections) to an already ALU-limited kernel → regression.
+//! Current approach (simple, 128 threads/TG) is close to optimal for K=2560.
 
 pub const SHADER: &str = r#"
 constant uint Q4K_GU_ROWS_PER_TG = 4;

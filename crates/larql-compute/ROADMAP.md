@@ -160,7 +160,7 @@ Folded into #6 below with updated size estimate.
 
 ---
 
-### #6 — Q4_K kernel optimization (explored 2026-04-26, blocked)
+### #6 — Q4_K kernel optimization (explored 2026-04-26, blocked by ALU bound)
 
 **Tried:** (a) inter-superblock interleaving (ix=lane&1 stride-2, already applied).
 (b) 2 rows per simdgroup + 64 threads/TG (REGRESSED: halves total wavefronts,

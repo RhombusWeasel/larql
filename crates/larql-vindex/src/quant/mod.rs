@@ -31,5 +31,6 @@ pub use convert::{
     ProjectionAction, ProjectionOutcome,
 };
 pub use convert_q4k::{
-    vindex_to_q4k, Q4kConvertConfig, Q4kConvertReport,
+    add_feature_major_down, vindex_to_q4k, AddFeatureMajorDownReport,
+    Q4kConvertConfig, Q4kConvertReport,
 };

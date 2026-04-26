@@ -631,7 +631,7 @@ mod tests {
             metadata,
             tensor_infos: Vec::new(),
             data_offset: 0,
-            path: std::path::PathBuf::from("/dev/null"),
+            path: std::path::PathBuf::from("<no-file>"),
         };
         let cfg = gguf.to_config_json();
 

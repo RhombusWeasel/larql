@@ -290,3 +290,87 @@ pub fn run_attention_block_decode_step_backend(
 
     Some((h_post_attn, (k_concat, v_concat)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+    use crate::engines::test_utils::make_test_weights;
+
+    // ── KvCache ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn kv_cache_starts_empty() {
+        let cache = KvCache::with_layers(4);
+        assert_eq!(cache.cached_len(0), 0);
+        assert_eq!(cache.next_position, 0);
+    }
+
+    #[test]
+    fn kv_cache_with_window_clips() {
+        let kv_dim = 4usize;
+        let mut cache = KvCache::with_window(1, 2);
+        // Feed 3 entries into layer 0
+        for step in 0..3usize {
+            let k = Array2::from_elem((1, kv_dim), step as f32);
+            let v = Array2::from_elem((1, kv_dim), step as f32);
+            let prior = cache.layers[0].take();
+            let new_kv = if let Some((pk, pv)) = prior {
+                let mut nk = Array2::zeros((pk.shape()[0] + 1, kv_dim));
+                nk.slice_mut(ndarray::s![..pk.shape()[0], ..]).assign(&pk);
+                nk.slice_mut(ndarray::s![pk.shape()[0].., ..]).assign(&k);
+                let mut nv = Array2::zeros((pv.shape()[0] + 1, kv_dim));
+                nv.slice_mut(ndarray::s![..pv.shape()[0], ..]).assign(&pv);
+                nv.slice_mut(ndarray::s![pv.shape()[0].., ..]).assign(&v);
+                (nk, nv)
+            } else { (k, v) };
+            cache.layers[0] = Some(new_kv);
+            cache.clip_layer(0);
+        }
+        assert!(cache.cached_len(0) <= 2, "window=2 should cap at 2 entries");
+    }
+
+    // ── decode step ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_step_output_shape() {
+        let weights = make_test_weights();
+        let h = Array2::from_elem((1, weights.hidden_size), 0.1f32);
+        let (h_out, (k, v)) = run_attention_block_decode_step(&weights, &h, 0, None, 0)
+            .expect("decode_step failed");
+        assert_eq!(h_out.shape(), &[1, weights.hidden_size]);
+        assert_eq!(k.shape()[0], 1, "K should have 1 new row");
+        assert_eq!(v.shape()[0], 1, "V should have 1 new row");
+    }
+
+    #[test]
+    fn decode_step_output_finite() {
+        let weights = make_test_weights();
+        let h = Array2::from_elem((1, weights.hidden_size), 0.5f32);
+        let (h_out, _) = run_attention_block_decode_step(&weights, &h, 0, None, 0)
+            .expect("decode_step failed");
+        assert!(h_out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn decode_step_kv_grows_with_prior() {
+        let weights = make_test_weights();
+        let h = Array2::from_elem((1, weights.hidden_size), 0.1f32);
+        // Step 0: no prior
+        let (_, kv1) = run_attention_block_decode_step(&weights, &h, 0, None, 0).unwrap();
+        assert_eq!(kv1.0.shape()[0], 1);
+        // Step 1: prior has 1 entry → output K/V should have 2
+        let (_, kv2) = run_attention_block_decode_step(&weights, &h, 0, Some(&kv1), 1).unwrap();
+        assert_eq!(kv2.0.shape()[0], 2, "K should grow by 1 per step");
+    }
+
+    #[test]
+    fn decode_step_all_layers_succeed() {
+        let weights = make_test_weights();
+        let h = Array2::from_elem((1, weights.hidden_size), 0.3f32);
+        for layer in 0..weights.num_layers {
+            let result = run_attention_block_decode_step(&weights, &h, layer, None, 0);
+            assert!(result.is_some(), "layer {layer} decode step failed");
+        }
+    }
+}

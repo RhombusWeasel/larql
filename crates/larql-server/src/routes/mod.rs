@@ -15,6 +15,7 @@ pub mod stats;
 pub mod stream;
 pub mod walk;
 pub mod walk_ffn;
+pub mod warmup;
 
 use std::sync::Arc;
 
@@ -43,6 +44,7 @@ pub fn single_model_router(state: Arc<AppState>) -> Router {
         .route("/v1/stream", get(stream::handle_stream))
         .route("/v1/health", get(health::handle_health))
         .route("/v1/models", get(models::handle_models))
+        .route("/v1/warmup", post(warmup::handle_warmup))
         // Embed server endpoints (always available, required for --embed-only mode)
         .route("/v1/embed", post(embed::handle_embed))
         .route("/v1/embed/{token_id}", get(embed::handle_embed_single))

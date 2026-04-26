@@ -540,4 +540,111 @@ mod tests {
         assert_eq!(eng.window_tokens(), 0);
         assert_eq!(eng.cold_bytes(), 0);
     }
+
+    // ── prefill / decode cycle ─────────────────────────────────────────────────
+
+    #[test]
+    fn prefill_returns_hidden_state() {
+        use crate::engines::test_utils::make_test_weights;
+        let weights = make_test_weights();
+        let mut engine = UnlimitedContextEngine::new(512);
+        let h = engine.prefill(&weights, &[0u32, 1, 2]).expect("prefill failed");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert!(h.iter().all(|v| v.is_finite()), "hidden state should be finite");
+    }
+
+    #[test]
+    fn decode_step_returns_hidden_state() {
+        use crate::engines::test_utils::make_test_weights;
+        let weights = make_test_weights();
+        let mut engine = UnlimitedContextEngine::new(512);
+        engine.prefill(&weights, &[0u32]).expect("prefill");
+        let h = engine.decode_step(&weights, 1).expect("decode_step");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert!(h.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn window_auto_closes_when_full() {
+        use crate::engines::test_utils::make_test_weights;
+        let weights = make_test_weights();
+        let window_size = 3usize;
+        let mut engine = UnlimitedContextEngine::new(window_size);
+
+        // Feed exactly window_size tokens → triggers close
+        for tok in 0..window_size as u32 {
+            engine.process(&weights, &[tok]).expect("process failed");
+        }
+        assert_eq!(engine.archive.len(), 1, "one window should be archived");
+        assert_eq!(engine.current_window_tokens.len(), 0, "current window should be empty");
+        assert_eq!(engine.checkpoints.len(), 1, "one checkpoint should be saved");
+    }
+
+    #[test]
+    fn two_full_windows_archives_two() {
+        use crate::engines::test_utils::make_test_weights;
+        let weights = make_test_weights();
+        let mut engine = UnlimitedContextEngine::new(2);
+
+        // 4 tokens = 2 complete windows
+        for tok in 0u32..4 {
+            engine.process(&weights, &[tok]).expect("process");
+        }
+        assert_eq!(engine.archive.len(), 2);
+        assert_eq!(engine.checkpoints.len(), 2);
+    }
+
+    #[test]
+    fn partial_window_after_process() {
+        use crate::engines::test_utils::make_test_weights;
+        let weights = make_test_weights();
+        let mut engine = UnlimitedContextEngine::new(4);
+
+        // 3 tokens < window_size=4 → no close
+        engine.process(&weights, &[0u32, 1, 2]).expect("process");
+        assert_eq!(engine.archive.len(), 0, "no window closed yet");
+        assert_eq!(engine.window_tokens(), 3);
+    }
+
+    #[test]
+    fn flush_closes_partial_window() {
+        use crate::engines::test_utils::make_test_weights;
+        let weights = make_test_weights();
+        let mut engine = UnlimitedContextEngine::new(4);
+        engine.process(&weights, &[0u32, 1]).expect("process");
+        assert_eq!(engine.archive.len(), 0);
+        engine.flush();
+        assert_eq!(engine.archive.len(), 1, "flush should close partial window");
+    }
+
+    #[test]
+    fn cold_bytes_grow_after_window_close() {
+        use crate::engines::test_utils::make_test_weights;
+        let weights = make_test_weights();
+        let mut engine = UnlimitedContextEngine::new(2);
+        assert_eq!(engine.cold_bytes(), 0);
+        engine.process(&weights, &[0u32, 1]).expect("process"); // closes window
+        assert!(engine.cold_bytes() > 0, "cold tier should grow after window close");
+    }
+
+    #[test]
+    fn memory_bytes_nonzero_after_prefill() {
+        use crate::engines::test_utils::make_test_weights;
+        let weights = make_test_weights();
+        let mut engine = UnlimitedContextEngine::new(512);
+        assert_eq!(engine.memory_bytes(), 0);
+        engine.prefill(&weights, &[0u32, 1, 2]).expect("prefill");
+        assert!(engine.memory_bytes() > 0);
+    }
+
+    #[test]
+    fn logits_from_unlimited_context_are_finite() {
+        use crate::engines::test_utils::make_test_weights;
+        use crate::forward::hidden_to_raw_logits;
+        let weights = make_test_weights();
+        let mut engine = UnlimitedContextEngine::new(512);
+        let h = engine.prefill(&weights, &[0u32, 1]).expect("prefill");
+        let logits = hidden_to_raw_logits(&weights, &h);
+        assert!(logits.iter().all(|v| v.is_finite()), "logits should be finite");
+    }
 }

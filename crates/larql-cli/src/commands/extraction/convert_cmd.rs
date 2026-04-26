@@ -60,6 +60,25 @@ enum ConvertCommand {
     /// Q4K and future formats land as additional subcommands.
     #[command(subcommand)]
     Quantize(QuantizeCommand),
+
+    /// Retrofit `down_features_q4k.bin` (W2 feature-major down) into
+    /// an existing Q4K vindex without re-quantising. Reads the down
+    /// portion of `interleaved_q4k.bin` per layer, transposes to
+    /// `[intermediate, hidden]`, re-quantises at the same precision
+    /// the source used, and writes the W2 file + manifest in place.
+    /// Idempotent — silent no-op when the file is already present.
+    /// See ADR-009 for the architectural rationale.
+    AddFeatureMajorDown {
+        /// Vindex directory to retrofit. Must already have
+        /// `interleaved_q4k.bin` + manifest (i.e. `quant: q4k` in
+        /// `index.json`).
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Suppress the per-layer progress line printed during write.
+        #[arg(long)]
+        quiet: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -167,7 +186,43 @@ pub fn run(args: ConvertArgs) -> Result<(), Box<dyn std::error::Error>> {
             run_gguf_info(&input)
         }
         ConvertCommand::Quantize(cmd) => run_quantize(cmd),
+        ConvertCommand::AddFeatureMajorDown { input, quiet } => {
+            run_add_feature_major_down(&input, quiet)
+        }
     }
+}
+
+fn run_add_feature_major_down(
+    input: &std::path::Path,
+    quiet: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use larql_vindex::quant::add_feature_major_down;
+
+    if !quiet {
+        eprintln!("Retrofitting feature-major down → {}", input.display());
+    }
+    let report = add_feature_major_down(input)?;
+    if report.skipped {
+        if !quiet {
+            eprintln!(
+                "  down_features_q4k.bin already present — no-op (skipped {} layers)",
+                report.num_layers,
+            );
+        }
+        return Ok(());
+    }
+    if !quiet {
+        let mb = report.bytes_written as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "  wrote down_features_q4k.bin: {} layers, {:.1} MB, {:.2?}",
+            report.num_layers, mb, report.wall_time,
+        );
+        eprintln!(
+            "  per-feature down decode now skips q4k_ffn_layer cache \
+             (verify via GET /v1/stats → q4k_ffn.feature_major_down: true)"
+        );
+    }
+    Ok(())
 }
 
 fn run_quantize(cmd: QuantizeCommand) -> Result<(), Box<dyn std::error::Error>> {

@@ -54,14 +54,20 @@ fn backend_lm_head_topk(
     let hidden = lm.shape()[1];
     if hidden != query.len() { return Vec::new(); }
 
-    // Try the dedicated GPU gemv first (~3-5 ms on Metal for the Gemma
-    // 262K × 2560 tied LM head). Fall back to `matmul_transb` (which
-    // itself falls back to BLAS below the flop threshold) if the backend
-    // doesn't specialise gemv.
     let query_slice = match query.as_slice() {
         Some(s) => s,
         None => &query.to_vec(),
     };
+
+    // Fast path for top-1 (greedy decode): GPU gemv + GPU argmax
+    // reads back only 8 KB partial results instead of 1 MB, saving ~0.33ms.
+    if top_k == 1 {
+        if let Some((idx, score)) = backend.f32_gemv_topk1(lm.view(), query_slice) {
+            return vec![(idx, score)];
+        }
+    }
+
+    // General path: GPU gemv → full Vec<f32> → CPU top-k.
     let scores_vec: Vec<f32> = if let Some(s) = backend.f32_gemv(lm.view(), query_slice) {
         s
     } else {

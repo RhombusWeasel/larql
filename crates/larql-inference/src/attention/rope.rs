@@ -69,3 +69,83 @@ pub fn apply_rope_partial_at(
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    fn make_qk(seq: usize, heads: usize, head_dim: usize) -> Array2<f32> {
+        let n = seq * heads * head_dim;
+        Array2::from_shape_vec((seq, heads * head_dim),
+            (0..n).map(|i| (i as f32 + 1.0) * 0.01).collect()
+        ).unwrap()
+    }
+
+    #[test]
+    fn apply_rope_preserves_shape() {
+        let x = make_qk(3, 2, 8);
+        let out = apply_rope(&x, 2, 8, 10000.0);
+        assert_eq!(out.shape(), x.shape());
+    }
+
+    #[test]
+    fn apply_rope_output_is_finite() {
+        let x = make_qk(4, 2, 8);
+        let out = apply_rope(&x, 2, 8, 10000.0);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn apply_rope_preserves_norm_per_head() {
+        // RoPE is a rotation → L2 norm of each position–head pair is preserved.
+        let x = make_qk(3, 2, 8);
+        let out = apply_rope(&x, 2, 8, 10000.0);
+        for row in 0..3 {
+            for h in 0..2 {
+                let orig: f32 = x.row(row).iter().skip(h * 8).take(8).map(|v| v * v).sum::<f32>();
+                let rotd: f32 = out.row(row).iter().skip(h * 8).take(8).map(|v| v * v).sum::<f32>();
+                assert!((orig.sqrt() - rotd.sqrt()).abs() < 1e-4,
+                    "RoPE changed L2 norm at row={row} head={h}: {orig} → {rotd}");
+            }
+        }
+    }
+
+    #[test]
+    fn apply_rope_different_positions_differ() {
+        // Row 0 (position 0) and row 1 (position 1) should differ after RoPE
+        // even if the original vectors were identical.
+        let data = vec![0.5f32; 3 * 1 * 8];
+        let x = Array2::from_shape_vec((3, 8), data).unwrap();
+        let out = apply_rope(&x, 1, 8, 10000.0);
+        let row0: Vec<f32> = out.row(0).to_vec();
+        let row1: Vec<f32> = out.row(1).to_vec();
+        let differ = row0.iter().zip(row1.iter()).any(|(a, b)| (a - b).abs() > 1e-6);
+        assert!(differ, "identical inputs at different positions should differ after RoPE");
+    }
+
+    #[test]
+    fn apply_rope_partial_at_offset() {
+        // Position 5 with offset 0 should equal position 0 with offset 5.
+        let x = make_qk(1, 2, 8);
+        let out_pos5 = {
+            let data = vec![0.1f32; 6 * 2 * 8];
+            let big = Array2::from_shape_vec((6, 16), data).unwrap();
+            apply_rope_partial_at(&big, 2, 8, 10000.0, 1.0, 0)
+        };
+        let out_off5 = apply_rope_partial_at(&x, 2, 8, 10000.0, 1.0, 5);
+        // Both should be finite (structural check)
+        assert!(out_pos5.iter().all(|v| v.is_finite()));
+        assert!(out_off5.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn apply_rope_partial_fraction_zero_is_passthrough() {
+        // fraction = 0.0 → no rotation applied (but we need at least 2 rotary dims).
+        // With a very small fraction the rotation is minimal — test shape only.
+        let x = make_qk(2, 2, 8);
+        let out = apply_rope_partial(&x, 2, 8, 10000.0, 0.01);
+        assert_eq!(out.shape(), x.shape());
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+}

@@ -124,6 +124,16 @@ struct Cli {
     #[arg(long, requires = "hnsw")]
     warmup_hnsw: bool,
 
+    /// Pre-load inference weights and prefetch every owned layer's
+    /// Q4K mmap pages at boot. Cuts first-`walk-ffn` latency from
+    /// ~1.3 s + 17 ms / cold layer down to the warm baseline
+    /// (~0.3 ms / layer) at the cost of a ~1–2 s startup delay and
+    /// ~3 GB pre-allocated f32 gate cache. Recommended for grid
+    /// shards under a steady-state load — operators can also fire
+    /// `POST /v1/warmup` later without a restart.
+    #[arg(long)]
+    warmup_walk_ffn: bool,
+
     /// Ask the kernel to drop resident mmap pages after each walk-ffn
     /// request (calls `madvise(MADV_DONTNEED)` on every mapping). On
     /// Linux RSS drops immediately; on Darwin the kernel may defer.
@@ -497,6 +507,26 @@ async fn main() -> Result<(), BoxError> {
         info!("Single-model mode: {}", m.config.model);
         routes::single_model_router(Arc::clone(&state))
     };
+
+    // `--warmup-walk-ffn` — pre-load inference weights + prefetch every
+    // owned layer's Q4K mmap so the first `/v1/walk-ffn` doesn't pay
+    // the ~1.3 s lazy weight load + ~17 ms / cold layer (see
+    // ROADMAP G1 / G2). Same code path as `POST /v1/warmup`.
+    if cli.warmup_walk_ffn {
+        for m in &state.models {
+            let req = routes::warmup::WarmupRequest {
+                layers: None, // every owned layer
+                skip_weights: cli.no_infer,
+                warmup_hnsw: false, // already handled by --warmup-hnsw
+            };
+            let r = routes::warmup::warmup_model(m, &req);
+            info!(
+                "  Warmup walk-ffn[{}]: weights={} ({}ms), prefetched {} layers ({}ms), total {}ms",
+                r.model, r.weights_loaded, r.weights_load_ms,
+                r.layers_prefetched, r.prefetch_ms, r.total_ms,
+            );
+        }
+    }
 
     // Rate limiting middleware.
     if let Some(ref rl) = rate_limiter {
