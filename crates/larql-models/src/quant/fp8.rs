@@ -31,7 +31,7 @@ fn build_e4m3_table() -> [f32; 256] {
 
 fn e4m3_bits_to_f32_compute(byte: u8) -> f32 {
     let sign = (byte >> 7) & 1;
-    let exp  = (byte >> 3) & 0x0F;
+    let exp = (byte >> 3) & 0x0F;
     let mant = byte & 0x07;
 
     // NaN encoding: exp = 1111, mant = 111 (both signs).
@@ -48,7 +48,11 @@ fn e4m3_bits_to_f32_compute(byte: u8) -> f32 {
         frac * (2.0_f32).powi(exp as i32 - 7)
     };
 
-    if sign == 1 { -mag } else { mag }
+    if sign == 1 {
+        -mag
+    } else {
+        mag
+    }
 }
 
 /// Convert f32 to E4M3 byte with round-to-nearest-even.
@@ -109,8 +113,8 @@ pub fn f32_to_e4m3(value: f32) -> u8 {
     // f32 mantissa stored as 23 bits of fraction; E4M3 keeps 3 bits.
     // Shift right by 20, apply round-to-nearest-even on bits 19..0.
     let f32_mant_full = bits & 0x007F_FFFF;
-    let keep = f32_mant_full >> 20;              // 3 bits
-    let rem  = f32_mant_full & 0x000F_FFFF;      // 20 bits
+    let keep = f32_mant_full >> 20; // 3 bits
+    let rem = f32_mant_full & 0x000F_FFFF; // 20 bits
     let half = 0x0008_0000;
     let rounded_up = rem > half || (rem == half && (keep & 1) == 1);
 
@@ -188,7 +192,9 @@ mod tests {
         // Every representable E4M3 value should round-trip exactly.
         for byte in 0..=255u8 {
             let f = e4m3_to_f32(byte);
-            if f.is_nan() { continue; }
+            if f.is_nan() {
+                continue;
+            }
             let back = f32_to_e4m3(f);
             // ±0 ambiguity: both 0x00 and 0x80 map to 0.0.
             if f == 0.0 {
@@ -218,7 +224,7 @@ mod tests {
     fn e4m3_rounding_to_nearest() {
         // 1.0 is exactly representable.
         assert_eq!(f32_to_e4m3(1.0), 0x38); // exp=7, mant=0 → (1+0)×2^0 = 1
-        // Between 1.0 and 1.125 (next representable): expect rounding.
+                                            // Between 1.0 and 1.125 (next representable): expect rounding.
         let midpoint = 1.0625; // halfway
         let b = f32_to_e4m3(midpoint);
         let f_back = e4m3_to_f32(b);
@@ -257,8 +263,10 @@ mod tests {
     fn e4m3_subnormal_normal_boundary() {
         let largest_subnormal = e4m3_to_f32(0x07);
         let smallest_normal = e4m3_to_f32(0x08);
-        assert!(smallest_normal > largest_subnormal,
-                "normal must be larger than largest subnormal");
+        assert!(
+            smallest_normal > largest_subnormal,
+            "normal must be larger than largest subnormal"
+        );
         // Gap between 0x07 and 0x08 is 2⁻⁹ (same step as subnormals).
         let gap = smallest_normal - largest_subnormal;
         let expected_gap = (2.0_f32).powi(-9);
@@ -301,7 +309,9 @@ mod tests {
     /// be modest.
     #[test]
     fn e4m3_bulk_representable_round_trip() {
-        let values = [0.0, 0.01, 0.1, 0.5, 1.0, 2.5, 10.0, 100.0, 400.0, -0.1, -1.0, -100.0];
+        let values = [
+            0.0, 0.01, 0.1, 0.5, 1.0, 2.5, 10.0, 100.0, 400.0, -0.1, -1.0, -100.0,
+        ];
         for &v in &values {
             let back = e4m3_to_f32(f32_to_e4m3(v));
             let bound = v.abs().max(1.0 / 512.0) * 0.125; // 3-bit mantissa

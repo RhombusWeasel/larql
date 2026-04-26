@@ -8,10 +8,10 @@
 
 ```
 load_model_dir(path)                   → auto-detect format, load all tensors
-load_model_dir_walk_only(path)         → skip FFN tensors at parse time (no heap spike)
+load_model_dir_walk_only(path)         → skip FFN tensors at parse/dequant time (no heap spike)
 load_model_dir_filtered(path, skip_fn) → skip any tensors matching predicate
   ├── *.safetensors/     → loading::safetensors
-  ├── *.gguf             → loading::gguf::load_gguf
+  ├── *.gguf             → loading::gguf::load_gguf_filtered
   └── error              → ModelError::{NotADirectory, NoSafetensors}
 
 resolve_model_path(name) → resolve HF cache path to model directory
@@ -198,9 +198,15 @@ All return freed bytes. Typical savings for a 4B model:
 
 Pattern matching for `drop_ffn_weights`:
 - `gate_proj`, `up_proj`, `down_proj` (dense models)
+- `mlp.c_fc`, `mlp.c_proj` (StarCoder2)
 - `ffn_gate`, `ffn_up`, `ffn_down` (GGUF key format)
 - `mlp.experts`, `block_sparse_moe.experts` (MoE per-expert)
 - `packed_gate_up_blocks`, `packed_down_blocks` (GPT-OSS MXFP4)
+
+Loader string constants are centralized in code:
+- `weights.rs` owns shared FFN/attention classifiers and packed expert key fragments.
+- `loading/safetensors.rs` owns safetensors/GGUF extension names, HF cache path fragments, and GPT-OSS MXFP4 suffix/key helpers.
+- `loading/gguf.rs` owns GGUF metadata suffixes and the GGUF-to-HF key replacement table.
 
 ### skipped_tensors
 

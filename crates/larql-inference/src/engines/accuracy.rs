@@ -25,13 +25,7 @@ pub fn mse(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// Softmax of a logit vector. Numerically stable (subtract max).
-pub fn softmax(logits: &[f32]) -> Vec<f32> {
-    if logits.is_empty() { return vec![]; }
-    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
-    let sum: f32 = exps.iter().sum();
-    exps.iter().map(|&x| x / sum).collect()
-}
+pub use crate::forward::softmax;
 
 /// KL divergence D_KL(p || q). Returns 0.0 for identical distributions.
 /// `p` and `q` must be valid probability distributions (sum to ~1, all ≥ 0).

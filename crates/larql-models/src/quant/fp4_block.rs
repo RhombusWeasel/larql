@@ -25,7 +25,7 @@ pub const SUB_BLOCK_ELEMENTS: usize = 32;
 pub const SUB_BLOCKS_PER_BLOCK: usize = BLOCK_ELEMENTS / SUB_BLOCK_ELEMENTS; // = 8
 
 pub const FP4_BLOCK_BYTES: usize = 128 + SUB_BLOCKS_PER_BLOCK + 1; // 128 + 8 + 1 = 137
-pub const FP8_BLOCK_BYTES: usize = BLOCK_ELEMENTS + 1;             // 256 + 1 = 257
+pub const FP8_BLOCK_BYTES: usize = BLOCK_ELEMENTS + 1; // 256 + 1 = 257
 
 /// Encode one 256-element slice of f32 into a 137-byte FP4 block.
 ///
@@ -74,8 +74,8 @@ pub fn encode_fp4_block(values: &[f32]) -> [u8; FP4_BLOCK_BYTES] {
 
     for sb in 0..SUB_BLOCKS_PER_BLOCK {
         let start = sb * SUB_BLOCK_ELEMENTS;
-        let end   = start + SUB_BLOCK_ELEMENTS;
-        let sub   = &values[start..end];
+        let end = start + SUB_BLOCK_ELEMENTS;
+        let sub = &values[start..end];
 
         // Sub-block scale: local_max / block_scale. In [0, 1] for the
         // usual case; the largest sub-block has scale ≈ 1.0.
@@ -131,7 +131,7 @@ pub fn decode_fp4_block(block: &[u8], out: &mut [f32]) {
         for (pair_idx, &byte) in sub_bytes.iter().enumerate() {
             let code_a = byte & 0x0F;
             let code_b = (byte >> 4) & 0x0F;
-            out[start + 2 * pair_idx]     = fp4::e2m1_to_f32(code_a) * dequant_scale;
+            out[start + 2 * pair_idx] = fp4::e2m1_to_f32(code_a) * dequant_scale;
             out[start + 2 * pair_idx + 1] = fp4::e2m1_to_f32(code_b) * dequant_scale;
         }
     }
@@ -376,7 +376,10 @@ mod tests {
         let low_max: f32 = values[32..].iter().fold(0.0, |m, &v| m.max(v.abs()));
         for i in 32..256 {
             let err = (values[i] - decoded[i]).abs();
-            assert!(err <= low_max + 1e-3, "low sub-block elem {i}: err {err}, low_max {low_max}");
+            assert!(
+                err <= low_max + 1e-3,
+                "low sub-block elem {i}: err {err}, low_max {low_max}"
+            );
         }
     }
 
@@ -443,10 +446,12 @@ mod tests {
         // Synthetic distribution in the range of actual Gemma 3 4B down
         // features: block_max ≈ 0.04, typical values ≈ 0.01–0.04.
         use std::f32::consts::TAU;
-        let values: Vec<f32> = (0..256).map(|i| {
-            let t = (i as f32) / 256.0;
-            0.04 * (t * TAU * 3.0).sin()
-        }).collect();
+        let values: Vec<f32> = (0..256)
+            .map(|i| {
+                let t = (i as f32) / 256.0;
+                0.04 * (t * TAU * 3.0).sin()
+            })
+            .collect();
         let block_max = values.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
         assert!(block_max > 0.0 && block_max < 0.05);
         let block = encode_fp8_block(&values);
@@ -454,8 +459,11 @@ mod tests {
         decode_fp8_block(&block, &mut decoded);
         // Before the fix, max_err == block_max (100%); after, should be
         // bounded by E4M3's mantissa precision.
-        let max_err = values.iter().zip(decoded.iter())
-            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_err = values
+            .iter()
+            .zip(decoded.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         assert!(
             max_err < block_max * 0.10,
             "max_err {max_err} > 10% of block_max {block_max} — FP8 small-mag regression"
@@ -466,27 +474,39 @@ mod tests {
     fn fp4_feature_round_trip_2560() {
         // Gemma 3 4B hidden size — 10 blocks per feature.
         let hidden = 2560;
-        let values: Vec<f32> = (0..hidden).map(|i| ((i as f32 - 1280.0) / 400.0).sin()).collect();
+        let values: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32 - 1280.0) / 400.0).sin())
+            .collect();
         let bytes = encode_fp4_feature(&values);
         assert_eq!(bytes.len(), fp4_feature_bytes(hidden));
         assert_eq!(bytes.len(), 10 * 137);
         let mut decoded = vec![0.0f32; hidden];
         decode_fp4_feature(&bytes, &mut decoded);
-        let max_err = values.iter().zip(decoded.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_err = values
+            .iter()
+            .zip(decoded.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         assert!(max_err < 0.3, "max err {max_err}");
     }
 
     #[test]
     fn fp8_feature_round_trip_2560() {
         let hidden = 2560;
-        let values: Vec<f32> = (0..hidden).map(|i| ((i as f32 - 1280.0) / 400.0).sin()).collect();
+        let values: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32 - 1280.0) / 400.0).sin())
+            .collect();
         let bytes = encode_fp8_feature(&values);
         assert_eq!(bytes.len(), fp8_feature_bytes(hidden));
         assert_eq!(bytes.len(), 10 * 257);
         let mut decoded = vec![0.0f32; hidden];
         decode_fp8_feature(&bytes, &mut decoded);
         // FP8 is much tighter than FP4.
-        let max_err = values.iter().zip(decoded.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_err = values
+            .iter()
+            .zip(decoded.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         assert!(max_err < 0.05, "max err {max_err}");
     }
 
@@ -535,7 +555,8 @@ mod tests {
                     let err = (values[block_start + i] - decoded[block_start + i]).abs();
                     assert!(
                         err <= block_max * 0.15,
-                        "feat {f} block {b} elem {i}: err {err} > bound {}", block_max * 0.15
+                        "feat {f} block {b} elem {i}: err {err} > bound {}",
+                        block_max * 0.15
                     );
                 }
             }
@@ -566,10 +587,17 @@ mod tests {
         decode_fp4_block(&block, &mut decoded);
 
         // Median error bound: much tighter than the worst-case 1/3 × max.
-        let mut err: Vec<f32> = values.iter().zip(decoded.iter()).map(|(a, b)| (a - b).abs()).collect();
+        let mut err: Vec<f32> = values
+            .iter()
+            .zip(decoded.iter())
+            .map(|(a, b)| (a - b).abs())
+            .collect();
         err.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = err[err.len() / 2];
-        assert!(median < 0.06 * block_max, "median err {median} too large at block_max {block_max}");
+        assert!(
+            median < 0.06 * block_max,
+            "median err {median} too large at block_max {block_max}"
+        );
     }
 
     // ── Block edge cases ────────────────────────────────────────────────────
@@ -594,7 +622,9 @@ mod tests {
         }
         // Non-zero sub-blocks should decode to ~0.5.
         for (i, &v) in decoded.iter().enumerate() {
-            if (96..128).contains(&i) { continue; }
+            if (96..128).contains(&i) {
+                continue;
+            }
             assert!((v - 0.5).abs() <= 0.5 / 3.0, "elem {i}: {v}");
         }
     }
@@ -611,12 +641,17 @@ mod tests {
         // depends on order. We want to ensure no NaN reaches storage.
         // Pre-sanitise the input (this is what the extractor does).
         for v in values.iter_mut() {
-            if v.is_nan() { *v = 0.0; }
+            if v.is_nan() {
+                *v = 0.0;
+            }
         }
         let block = encode_fp4_block(&values);
         let mut decoded = [0.0f32; 256];
         decode_fp4_block(&block, &mut decoded);
-        assert!(!decoded.iter().any(|v| v.is_nan()), "no NaN in decoded block");
+        assert!(
+            !decoded.iter().any(|v| v.is_nan()),
+            "no NaN in decoded block"
+        );
         assert_eq!(decoded[42], 0.0);
     }
 
@@ -634,10 +669,16 @@ mod tests {
         decode_fp4_block(&block, &mut decoded);
 
         // Outlier reconstructs within FP4 bound at block scale.
-        assert!((decoded[128] - 1.0).abs() <= 1.0 / 3.0, "outlier got {}", decoded[128]);
+        assert!(
+            (decoded[128] - 1.0).abs() <= 1.0 / 3.0,
+            "outlier got {}",
+            decoded[128]
+        );
         // Most values around it should recover to near 0.1.
         for (i, &v) in decoded.iter().enumerate() {
-            if i == 128 { continue; }
+            if i == 128 {
+                continue;
+            }
             // Allow generous bound — small-magnitude sub-blocks lose
             // resolution when another sub-block sets the block scale.
             assert!(v.abs() <= 0.2, "elem {i}: unexpectedly large {v}");

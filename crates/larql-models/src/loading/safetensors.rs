@@ -8,15 +8,39 @@ use std::path::{Path, PathBuf};
 
 use ndarray::Array2;
 
-use crate::weights::ModelWeights;
 use crate::detect::ModelError;
+use crate::weights::{ModelWeights, PACKED_EXPERTS_DOWN_PROJ, PACKED_EXPERTS_GATE_UP_PROJ};
+
+const SAFETENSORS_EXT: &str = "safetensors";
+const GGUF_EXT: &str = "gguf";
+const CONFIG_JSON: &str = "config.json";
+const WEIGHTS_DIR: &str = "weights";
+const MODEL_PREFIX: &str = "models--";
+const SNAPSHOTS_DIR: &str = "snapshots";
+
+const MXFP4_GATE_UP_BLOCKS_SUFFIX: &str = ".gate_up_proj_blocks";
+const MXFP4_BLOCKS_SUFFIX: &str = "_blocks";
+const MXFP4_SCALES_SUFFIX: &str = "_scales";
+const MXFP4_GATE_UP_BLOCKS: &str = "gate_up_proj_blocks";
+const MXFP4_EXPERTS_GATE_UP_BLOCKS: &str = "experts.gate_up_proj_blocks";
+const MXFP4_DOWN_BLOCKS: &str = "down_proj_blocks";
+const MXFP4_DOWN_SCALES: &str = "down_proj_scales";
+const MXFP4_ROUTER_WEIGHT: &str = "router.weight";
+
+const BLOCK_SPARSE_EXPERTS_PREFIX: &str = "block_sparse_moe.experts";
+const BLOCK_SPARSE_ROUTER_WEIGHT: &str = "block_sparse_moe.gate.weight";
+const MIXTRAL_GATE_PROJ: &str = "w1";
+const MIXTRAL_DOWN_PROJ: &str = "w2";
+const MIXTRAL_UP_PROJ: &str = "w3";
 
 /// Returns true when `key` names a FFN weight tensor (gate/up/down projection
 /// or packed expert block). Used by `load_model_dir_walk_only` to skip
 /// decoding these entirely — critical for large models where decoding them
 /// into f32 heap would blow RAM before they can be dropped.
 pub fn is_ffn_tensor(key: &str) -> bool {
-    crate::weights::FFN_TENSOR_PATTERNS.iter().any(|p| key.contains(p))
+    crate::weights::FFN_TENSOR_PATTERNS
+        .iter()
+        .any(|p| key.contains(p))
 }
 
 /// Load model weights from a directory or file, never reading FFN tensors.
@@ -52,8 +76,8 @@ pub fn load_model_dir_filtered(
 
     // Single GGUF file
     if path.is_file() {
-        if path.extension().is_some_and(|ext| ext == "gguf") {
-            return super::gguf::load_gguf(path);
+        if path.extension().is_some_and(|ext| ext == GGUF_EXT) {
+            return super::gguf::load_gguf_filtered(path, &skip_key);
         }
         return Err(ModelError::NotADirectory(path.to_path_buf()));
     }
@@ -66,36 +90,36 @@ pub fn load_model_dir_filtered(
     let gguf_files: Vec<PathBuf> = std::fs::read_dir(path)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "gguf"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == GGUF_EXT))
         .collect();
 
     if !gguf_files.is_empty() {
         // Use the first (or largest) GGUF file
-        let gguf_path = gguf_files.into_iter()
+        let gguf_path = gguf_files
+            .into_iter()
             .max_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
             .unwrap();
-        return super::gguf::load_gguf(&gguf_path);
+        return super::gguf::load_gguf_filtered(&gguf_path, &skip_key);
     }
 
     // Safetensors loading (also handles MLX format — same files, sometimes in weights/ subdir)
-    let arch = crate::detect_architecture(path)
-        .map_err(|e| ModelError::Parse(e.to_string()))?;
+    let arch = crate::detect_architecture(path).map_err(|e| ModelError::Parse(e.to_string()))?;
     let prefixes = arch.key_prefixes_to_strip();
 
     let mut st_files: Vec<PathBuf> = std::fs::read_dir(path)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "safetensors"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == SAFETENSORS_EXT))
         .collect();
 
     // MLX models sometimes put weights in a weights/ subdirectory
     if st_files.is_empty() {
-        let weights_dir = path.join("weights");
+        let weights_dir = path.join(WEIGHTS_DIR);
         if weights_dir.is_dir() {
             st_files = std::fs::read_dir(&weights_dir)?
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|ext| ext == "safetensors"))
+                .filter(|p| p.extension().is_some_and(|ext| ext == SAFETENSORS_EXT))
                 .collect();
         }
     }
@@ -119,7 +143,8 @@ pub fn load_model_dir_filtered(
     // are 3D tensors [num_experts, out_dim, in_dim] in BF16. Converting them to f32
     // would double their memory footprint; the compute path dequantizes per-expert on demand.
     let should_keep_raw = |key: &str| -> bool {
-        is_packed_bf16 && (key.contains("experts.gate_up_proj") || key.contains("experts.down_proj"))
+        is_packed_bf16
+            && (key.contains(PACKED_EXPERTS_GATE_UP_PROJ) || key.contains(PACKED_EXPERTS_DOWN_PROJ))
     };
 
     for st_path in &st_files {
@@ -133,13 +158,17 @@ pub fn load_model_dir_filtered(
 
         if is_packed_mxfp4 {
             // MXFP4 path: dequantize packed expert blocks+scales into per-expert tensors
-            load_mxfp4_expert_tensors(&st, &tensor_names, prefixes, &mut tensors)?;
+            load_mxfp4_expert_tensors(&st, &tensor_names, prefixes, &skip_key, &mut tensors)?;
             // Also load normal float tensors (router, norms, attn, embeddings)
             for (name, view) in st.tensors() {
                 let key = normalize_key(&name, prefixes);
                 let shape = view.shape();
-                if name.ends_with("_blocks") || name.ends_with("_scales") { continue; }
-                if skip_key(&key) { continue; }
+                if name.ends_with(MXFP4_BLOCKS_SUFFIX) || name.ends_with(MXFP4_SCALES_SUFFIX) {
+                    continue;
+                }
+                if skip_key(&key) {
+                    continue;
+                }
                 let data = match tensor_to_f32(&view) {
                     Ok(d) => d,
                     Err(ModelError::UnsupportedDtype(ref dtype)) => {
@@ -154,7 +183,9 @@ pub fn load_model_dir_filtered(
                             .map_err(|e| ModelError::Parse(e.to_string()))?;
                         tensors.insert(key, arr.into_shared());
                     }
-                    1 => { vectors.insert(key, data); }
+                    1 => {
+                        vectors.insert(key, data);
+                    }
                     _ => {}
                 }
             }
@@ -162,7 +193,9 @@ pub fn load_model_dir_filtered(
             for (name, view) in st.tensors() {
                 let key = normalize_key(&name, prefixes);
                 let shape = view.shape();
-                if skip_key(&key) { continue; }
+                if skip_key(&key) {
+                    continue;
+                }
 
                 // PackedBF16 expert tensors: preserve raw bytes, skip f32 conversion
                 if should_keep_raw(&key) {
@@ -184,9 +217,13 @@ pub fn load_model_dir_filtered(
                             .map_err(|e| ModelError::Parse(e.to_string()))?;
                         tensors.insert(key, arr.into_shared());
                     }
-                    1 => { vectors.insert(key, data); }
+                    1 => {
+                        vectors.insert(key, data);
+                    }
                     // 0D scalar tensors (e.g., layer_scalar) → store as 1-element vector
-                    0 => { vectors.insert(key, data); }
+                    0 => {
+                        vectors.insert(key, data);
+                    }
                     _ => {}
                 }
             }
@@ -261,8 +298,8 @@ pub fn resolve_model_path(model: &str) -> Result<PathBuf, ModelError> {
 
     // Try HuggingFace cache — resolve location using the same env-var priority
     // as the Python huggingface_hub library: HF_HUB_CACHE > HF_HOME > home dir.
-    let cache_name = format!("models--{}", model.replace('/', "--"));
-    let hf_cache = hf_hub_cache().join(&cache_name).join("snapshots");
+    let cache_name = format!("{MODEL_PREFIX}{}", model.replace('/', "--"));
+    let hf_cache = hf_hub_cache().join(&cache_name).join(SNAPSHOTS_DIR);
 
     if hf_cache.is_dir() {
         // Find the snapshot that has actual model files (safetensors or config.json+weights)
@@ -270,16 +307,25 @@ pub fn resolve_model_path(model: &str) -> Result<PathBuf, ModelError> {
         if let Ok(entries) = std::fs::read_dir(&hf_cache) {
             for entry in entries.flatten() {
                 let p = entry.path();
-                if !p.is_dir() { continue; }
+                if !p.is_dir() {
+                    continue;
+                }
                 // Prefer snapshot with safetensors files
-                let has_st = std::fs::read_dir(&p).ok().map(|rd| {
-                    rd.flatten().any(|e| e.path().extension().is_some_and(|ext| ext == "safetensors"))
-                }).unwrap_or(false);
+                let has_st = std::fs::read_dir(&p)
+                    .ok()
+                    .map(|rd| {
+                        rd.flatten().any(|e| {
+                            e.path()
+                                .extension()
+                                .is_some_and(|ext| ext == SAFETENSORS_EXT)
+                        })
+                    })
+                    .unwrap_or(false);
                 if has_st {
                     return Ok(p);
                 }
                 // Fallback: any snapshot with config.json
-                if p.join("config.json").exists() {
+                if p.join(CONFIG_JSON).exists() {
                     best = Some(p);
                 }
             }
@@ -310,22 +356,29 @@ fn load_mxfp4_expert_tensors(
     st: &safetensors::SafeTensors,
     tensor_names: &[String],
     prefixes: &[&str],
+    skip_key: &impl Fn(&str) -> bool,
     tensors: &mut HashMap<String, crate::WeightArray>,
 ) -> Result<(), ModelError> {
     for name in tensor_names {
-        if !name.ends_with(".gate_up_proj_blocks") { continue; }
+        if !name.ends_with(MXFP4_GATE_UP_BLOCKS_SUFFIX) {
+            continue;
+        }
 
-        let scales_name = name.replace("_blocks", "_scales");
-        let down_blocks_name = name.replace("gate_up_proj_blocks", "down_proj_blocks");
-        let down_scales_name = name.replace("gate_up_proj_blocks", "down_proj_scales");
+        let scales_name = name.replace(MXFP4_BLOCKS_SUFFIX, MXFP4_SCALES_SUFFIX);
+        let down_blocks_name = name.replace(MXFP4_GATE_UP_BLOCKS, MXFP4_DOWN_BLOCKS);
+        let down_scales_name = name.replace(MXFP4_GATE_UP_BLOCKS, MXFP4_DOWN_SCALES);
 
-        let blocks_view = st.tensor(name)
+        let blocks_view = st
+            .tensor(name)
             .map_err(|e| ModelError::Parse(format!("MXFP4 blocks: {e}")))?;
-        let scales_view = st.tensor(&scales_name)
+        let scales_view = st
+            .tensor(&scales_name)
             .map_err(|e| ModelError::Parse(format!("MXFP4 scales: {e}")))?;
 
         let shape = blocks_view.shape();
-        if shape.len() != 4 { continue; }
+        if shape.len() != 4 {
+            continue;
+        }
 
         let num_experts = shape[0];
         let out_features = shape[1]; // = 2 * hidden (gate + up fused)
@@ -335,24 +388,41 @@ fn load_mxfp4_expert_tensors(
 
         let base_key = normalize_key(name, prefixes);
         let layer_prefix = base_key.split(".mlp.").next().unwrap_or("");
+        let should_load_gate_up = (0..num_experts).any(|e| {
+            !skip_key(&mxfp4_expert_key(layer_prefix, e, MIXTRAL_GATE_PROJ))
+                || !skip_key(&mxfp4_expert_key(layer_prefix, e, MIXTRAL_UP_PROJ))
+        });
 
         // Dequantize and split fused gate_up → separate gate (w1) and up (w3).
-        let (gate_experts, up_experts) = crate::quant::mxfp4::split_gate_up_experts(
-            blocks_view.data(), scales_view.data(),
-            num_experts, out_features, groups,
-        )?;
+        if should_load_gate_up {
+            let (gate_experts, up_experts) = crate::quant::mxfp4::split_gate_up_experts(
+                blocks_view.data(),
+                scales_view.data(),
+                num_experts,
+                out_features,
+                groups,
+            )?;
 
-        for (e, (gate_data, up_data)) in gate_experts.into_iter().zip(up_experts).enumerate() {
-            tensors.insert(
-                format!("{layer_prefix}.block_sparse_moe.experts.{e}.w1.weight"),
-                Array2::from_shape_vec((half, in_features), gate_data)
-                    .map_err(|e| ModelError::Parse(e.to_string()))?.into_shared(),
-            );
-            tensors.insert(
-                format!("{layer_prefix}.block_sparse_moe.experts.{e}.w3.weight"),
-                Array2::from_shape_vec((half, in_features), up_data)
-                    .map_err(|e| ModelError::Parse(e.to_string()))?.into_shared(),
-            );
+            for (e, (gate_data, up_data)) in gate_experts.into_iter().zip(up_experts).enumerate() {
+                let gate_key = mxfp4_expert_key(layer_prefix, e, MIXTRAL_GATE_PROJ);
+                if !skip_key(&gate_key) {
+                    tensors.insert(
+                        gate_key,
+                        Array2::from_shape_vec((half, in_features), gate_data)
+                            .map_err(|e| ModelError::Parse(e.to_string()))?
+                            .into_shared(),
+                    );
+                }
+                let up_key = mxfp4_expert_key(layer_prefix, e, MIXTRAL_UP_PROJ);
+                if !skip_key(&up_key) {
+                    tensors.insert(
+                        up_key,
+                        Array2::from_shape_vec((half, in_features), up_data)
+                            .map_err(|e| ModelError::Parse(e.to_string()))?
+                            .into_shared(),
+                    );
+                }
+            }
         }
 
         // Dequantize down projection.
@@ -362,36 +432,56 @@ fn load_mxfp4_expert_tensors(
                 let down_out = down_shape[1];
                 let down_groups = down_shape[2];
                 let down_in = down_groups * 32;
-                let down_experts = crate::quant::mxfp4::dequantize_all_experts(
-                    db.data(), ds.data(), num_experts, down_out, down_groups,
-                )?;
-                for (e, data) in down_experts.into_iter().enumerate() {
-                    tensors.insert(
-                        format!("{layer_prefix}.block_sparse_moe.experts.{e}.w2.weight"),
-                        Array2::from_shape_vec((down_out, down_in), data)
-                            .map_err(|e| ModelError::Parse(e.to_string()))?.into_shared(),
-                    );
+                let should_load_down = (0..num_experts)
+                    .any(|e| !skip_key(&mxfp4_expert_key(layer_prefix, e, MIXTRAL_DOWN_PROJ)));
+                if should_load_down {
+                    let down_experts = crate::quant::mxfp4::dequantize_all_experts(
+                        db.data(),
+                        ds.data(),
+                        num_experts,
+                        down_out,
+                        down_groups,
+                    )?;
+                    for (e, data) in down_experts.into_iter().enumerate() {
+                        let down_key = mxfp4_expert_key(layer_prefix, e, MIXTRAL_DOWN_PROJ);
+                        if !skip_key(&down_key) {
+                            tensors.insert(
+                                down_key,
+                                Array2::from_shape_vec((down_out, down_in), data)
+                                    .map_err(|e| ModelError::Parse(e.to_string()))?
+                                    .into_shared(),
+                            );
+                        }
+                    }
                 }
             }
         }
 
         // Remap router: mlp.router.weight → block_sparse_moe.gate.weight
-        let router_name = name.replace("experts.gate_up_proj_blocks", "router.weight");
+        let router_name = name.replace(MXFP4_EXPERTS_GATE_UP_BLOCKS, MXFP4_ROUTER_WEIGHT);
         if let Ok(router_view) = st.tensor(&router_name) {
             if let Ok(data) = tensor_to_f32(&router_view) {
                 let s = router_view.shape();
                 if s.len() == 2 {
-                    tensors.insert(
-                        format!("{layer_prefix}.block_sparse_moe.gate.weight"),
-                        Array2::from_shape_vec((s[0], s[1]), data)
-                            .map_err(|e| ModelError::Parse(e.to_string()))?.into_shared(),
-                    );
+                    let router_key = format!("{layer_prefix}.{BLOCK_SPARSE_ROUTER_WEIGHT}");
+                    if !skip_key(&router_key) {
+                        tensors.insert(
+                            router_key,
+                            Array2::from_shape_vec((s[0], s[1]), data)
+                                .map_err(|e| ModelError::Parse(e.to_string()))?
+                                .into_shared(),
+                        );
+                    }
                 }
             }
         }
     }
 
     Ok(())
+}
+
+fn mxfp4_expert_key(layer_prefix: &str, expert_id: usize, projection: &str) -> String {
+    format!("{layer_prefix}.{BLOCK_SPARSE_EXPERTS_PREFIX}.{expert_id}.{projection}.weight")
 }
 
 pub(crate) fn normalize_key(key: &str, prefixes: &[&str]) -> String {
@@ -448,7 +538,9 @@ mod tests {
     #[test]
     fn is_ffn_tensor_moe_experts() {
         assert!(is_ffn_tensor("layers.0.mlp.experts.0.gate_proj.weight"));
-        assert!(is_ffn_tensor("layers.0.block_sparse_moe.experts.1.w1.weight"));
+        assert!(is_ffn_tensor(
+            "layers.0.block_sparse_moe.experts.1.w1.weight"
+        ));
     }
 
     #[test]
@@ -478,7 +570,10 @@ mod tests {
         let prefixes = &["model.language_model.", "model."];
         // Longer prefix matches first
         assert_eq!(
-            normalize_key("model.language_model.layers.0.mlp.gate_proj.weight", prefixes),
+            normalize_key(
+                "model.language_model.layers.0.mlp.gate_proj.weight",
+                prefixes
+            ),
             "layers.0.mlp.gate_proj.weight"
         );
     }
@@ -486,10 +581,7 @@ mod tests {
     #[test]
     fn normalize_key_falls_through_to_shorter_prefix() {
         let prefixes = &["model.language_model.", "model."];
-        assert_eq!(
-            normalize_key("model.norm.weight", prefixes),
-            "norm.weight"
-        );
+        assert_eq!(normalize_key("model.norm.weight", prefixes), "norm.weight");
     }
 
     #[test]
@@ -503,10 +595,7 @@ mod tests {
 
     #[test]
     fn normalize_key_empty_prefixes() {
-        assert_eq!(
-            normalize_key("layers.0.weight", &[]),
-            "layers.0.weight"
-        );
+        assert_eq!(normalize_key("layers.0.weight", &[]), "layers.0.weight");
     }
 
     // ── resolve_model_path ─────────────────────────────────────────────────
@@ -542,9 +631,14 @@ mod tests {
     fn resolve_model_path_hf_cache_with_safetensors() {
         let _lock = HOME_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        let snapshot = home.path()
-            .join(".cache").join("huggingface").join("hub")
-            .join("models--org--name").join("snapshots").join("abc123");
+        let snapshot = home
+            .path()
+            .join(".cache")
+            .join("huggingface")
+            .join("hub")
+            .join("models--org--name")
+            .join("snapshots")
+            .join("abc123");
         fs::create_dir_all(&snapshot).unwrap();
         fs::write(snapshot.join("model.safetensors"), b"").unwrap();
         std::env::set_var("HOME", home.path().to_str().unwrap());
@@ -557,9 +651,14 @@ mod tests {
     fn resolve_model_path_hf_cache_fallback_config_json() {
         let _lock = HOME_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        let snapshot = home.path()
-            .join(".cache").join("huggingface").join("hub")
-            .join("models--org--model").join("snapshots").join("def456");
+        let snapshot = home
+            .path()
+            .join(".cache")
+            .join("huggingface")
+            .join("hub")
+            .join("models--org--model")
+            .join("snapshots")
+            .join("def456");
         fs::create_dir_all(&snapshot).unwrap();
         fs::write(snapshot.join("config.json"), b"{}").unwrap();
         std::env::set_var("HOME", home.path().to_str().unwrap());

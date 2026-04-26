@@ -31,11 +31,7 @@ pub fn project_to_logits(weights: &ModelWeights, vec: &[f32]) -> Vec<f32> {
     logits
 }
 
-pub fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let exp_sum: f64 = logits.iter().map(|&l| ((l - max) as f64).exp()).sum();
-    logits.iter().map(|&l| (((l - max) as f64).exp() / exp_sum) as f32).collect()
-}
+pub use crate::forward::softmax;
 
 pub fn top_k_from_logits(logits: &[f32], tokenizer: &tokenizers::Tokenizer, k: usize) -> Vec<(String, f32)> {
     let probs = softmax(logits);

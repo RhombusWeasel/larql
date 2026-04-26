@@ -184,9 +184,30 @@ vs Metal fused pipeline). Add a clear doc comment on each explaining the differe
 
 ---
 
+## P1: Quality bugs (from 2026-04-26 review)
+
+### `grid.rs` — hardcoded `eos_id = 1` is a real bug ✅ Fixed 2026-04-26
+**File**: `layer_graph/grid.rs`  
+Replaced `eos_id: u32 = 1` with `is_end_of_turn(tok_str.trim())` on both the prefill-exit
+and decode-loop paths, matching all other generation code.
+
+### Softmax duplicated in 5 locations ✅ Fixed 2026-04-26 (2 of 5)
+**Files**: `trace/vocab.rs`, `engines/accuracy.rs` now use `pub use crate::forward::softmax`.  
+Canonical implementation lives in `forward/ops.rs`, exported via `forward/mod.rs`.  
+`ffn/moe_remote.rs` (in-place `&mut [f32]`), `logits.rs` (single-prob extractor),
+`target_delta.rs` (Array1) remain local — different enough to not unify.
+
+### `forward/ple.rs` hardcodes `1e-6` norm epsilon ✅ Fixed 2026-04-26
+`1e-6` replaced with `arch.norm_eps()` for consistency.
+
+### `grid.rs` undocumented `SKIP_MOE` env var ✅ Fixed 2026-04-26
+Added `# Diagnostics` section to module doc.
+
+---
+
 ## P1: Test coverage gaps
 
-From 2026-04-26 coverage review (49% line coverage overall).
+From 2026-04-26 coverage review (50.45% line coverage).
 
 ### Critical
 
@@ -202,10 +223,11 @@ From 2026-04-26 coverage review (49% line coverage overall).
 **`ffn/graph_backend.rs` — zero tests** ✅ Done 2026-04-26  
 Construction (layer count, empty layers), lookup_from_tokens (top-K limit, unknown layer, empty scores, out-of-range tokens), precompute_entity, save/load roundtrip.
 
-**`layer_graph/` — 7 of 17 files untested**  
-`dense.rs`, `walk.rs`, `prefill.rs`, `template.rs`, `grid.rs`,
-`pipeline_layer.rs`, `mod.rs` have zero coverage. Add synthetic tests using
-`make_test_weights()` + `make_test_vindex()`.
+**`layer_graph/` — 7 of 17 files untested** (3 done, 4 open)  
+`dense.rs` ✅ Done 2026-04-26 — DenseLayerGraph shape/finiteness/capture, PerLayerGraph bounds.  
+`walk.rs` ✅ Done 2026-04-26 — WalkLayerGraph all-layers, PipelinedLayerGraph in/out-of-range.  
+`mod.rs` ✅ Done 2026-04-26 — trait dispatch, name distinctness.  
+`prefill.rs`, `template.rs`, `grid.rs`, `pipeline_layer.rs` — need real vindex + Metal backend, defer.
 
 ### High priority
 
@@ -214,23 +236,23 @@ Construction (layer count, empty layers), lookup_from_tokens (top-K limit, unkno
 `add_bias`: all-rows updated, shorter-bias safe, zero-bias noop.  
 `apply_norm`: shape, finite output, offset produces different result.
 
-**`forward/ple.rs` — zero tests**  
-Per-layer embeddings (Gemma 4 E2B gating logic) are complex and untested.
+**`forward/ple.rs` — zero tests** ✅ Done 2026-04-26  
+precompute returns empty for non-PLE arch, apply_ple None/missing-weight guard paths,
+output shape. Softmax tests moved here as a side-effect of unification.
 
-**`engines/kv_engines/unlimited_context/extend.rs` — zero tests**  
-`rs_extend_from_checkpoint` and `rs_extend_from_checkpoint_q4k` are core
-UnlimitedContext compute paths with no direct tests.
+**`engines/kv_engines/unlimited_context/extend.rs` — zero tests** ✅ Done 2026-04-26  
+empty_prior shape, empty-tokens/wrong-prior-len → None, single/multi-token extend, kv_cache
+row count, checkpoint = last-row, abs_start shifts RoPE, finite logits, chained extends.
 
 ### Medium priority
 
-**GQA head grouping (`reps` parameter) not tested**  
-`gqa.rs` tests don't cover the case where `num_q > num_kv`
-(i.e. `reps > 1`). Add a test with 2 Q-heads per KV-head.
+**GQA head grouping (`reps` parameter) not tested** ✅ Done 2026-04-26  
+Three tests: output shape (4Q/2KV/reps=2), finiteness, and head-pair sharing — heads 0 & 1
+sharing KV-head 0 produce identical output rows.
 
-**RoPE missing property tests**  
-Add: reversibility (applying with negated position recovers original),
-frequency scaling (different `rope_base` produces different output),
-`partial_fraction` boundary at 0 and 1.
+**RoPE missing property tests** ✅ Done 2026-04-26  
+rope_base sensitivity, fraction=1.0 equals full-rope, offset=N matches sequential position N,
+partial fractions 0.25/0.5/0.75 all finite.
 
 **No synthetic end-to-end tests for `generate()`**  
 `generate()` (Metal GPU path) is only tested with `#[ignore]` real-model tests.
@@ -291,3 +313,14 @@ Full RS Graph Walk requires cracked attention (static head caching).
 | Tests: `ffn/graph_backend.rs` | 2026-04-26 | 0 → 10 tests; GateIndex build/lookup/save |
 | Tests: `forward/ops.rs` | 2026-04-26 | 0 → 8 tests; dot_proj/add_bias/apply_norm |
 | 457 unit tests total | 2026-04-26 | +~50 tests vs previous session |
+| Bug: `eos_id = 1` in grid.rs | 2026-04-26 | Correct EOS on all models, not just Gemma |
+| Softmax unified to `forward/ops.rs` | 2026-04-26 | 2 duplicate impls removed |
+| `forward/ple.rs` norm_eps fixed | 2026-04-26 | Uses `arch.norm_eps()` not hardcoded 1e-6 |
+| Tests: `unlimited_context/extend.rs` | 2026-04-26 | 0 → 8 tests; checkpoint, RoPE, chained extends |
+| Tests: `layer_graph/dense.rs` | 2026-04-26 | 0 → 8 tests; shape, capture, PerLayerGraph bounds |
+| Tests: `layer_graph/walk.rs` | 2026-04-26 | 0 → 7 tests; Walk + Pipelined layer range |
+| Tests: `layer_graph/mod.rs` | 2026-04-26 | 0 → 3 tests; trait dispatch, name distinctness |
+| Tests: `forward/ple.rs` | 2026-04-26 | 0 → 6 tests; guard paths + softmax |
+| Tests: GQA reps>1 | 2026-04-26 | 3 tests; shape, finiteness, KV-head sharing |
+| Tests: RoPE property tests | 2026-04-26 | 4 tests; base sensitivity, offset=position, fractions |
+| 499 unit tests total | 2026-04-26 | +42 tests; all passing |

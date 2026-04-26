@@ -77,3 +77,110 @@ impl<'a> LayerGraph for PipelinedLayerGraph<'a> {
 
     fn name(&self) -> &str { "pipelined" }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+    use std::sync::OnceLock;
+    use crate::engines::test_utils::make_test_weights;
+    use crate::ffn::WeightFfn;
+    use larql_models::ModelWeights;
+
+    fn weights() -> &'static ModelWeights {
+        static W: OnceLock<ModelWeights> = OnceLock::new();
+        W.get_or_init(make_test_weights)
+    }
+
+    fn input(seq: usize, hidden: usize) -> Array2<f32> {
+        let data: Vec<f32> = (0..seq * hidden).map(|i| (i as f32 + 1.0) * 0.01).collect();
+        Array2::from_shape_vec((seq, hidden), data).unwrap()
+    }
+
+    // ── WalkLayerGraph ────────────────────────────────────────────────────────
+
+    #[test]
+    fn walk_name() {
+        let w = weights();
+        let ffn = WeightFfn { weights: w };
+        let g = WalkLayerGraph { ffn: &ffn, backend: None };
+        assert_eq!(g.name(), "walk");
+    }
+
+    #[test]
+    fn walk_forward_shape_single_token() {
+        let w = weights();
+        let ffn = WeightFfn { weights: w };
+        let g = WalkLayerGraph { ffn: &ffn, backend: None };
+        let h = input(1, w.hidden_size);
+        let out = g.forward_layer(w, &h, 0).expect("layer 0");
+        assert_eq!(out.residual.shape(), &[1, w.hidden_size]);
+        assert!(out.residual.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn walk_forward_all_layers() {
+        let w = weights();
+        let ffn = WeightFfn { weights: w };
+        let g = WalkLayerGraph { ffn: &ffn, backend: None };
+        let h = input(1, w.hidden_size);
+        for layer in 0..w.num_layers {
+            let out = g.forward_layer(w, &h, layer).expect("layer {layer}");
+            assert_eq!(out.residual.shape(), &[1, w.hidden_size], "layer {layer}");
+        }
+    }
+
+    #[test]
+    fn walk_never_captures_activation_or_attention() {
+        let w = weights();
+        let ffn = WeightFfn { weights: w };
+        let g = WalkLayerGraph { ffn: &ffn, backend: None };
+        let out = g.forward_layer(w, &input(2, w.hidden_size), 0).unwrap();
+        assert!(out.activation.is_none());
+        assert!(out.attention.is_none());
+    }
+
+    // ── PipelinedLayerGraph ───────────────────────────────────────────────────
+
+    #[test]
+    fn pipelined_name() {
+        let w = weights();
+        let idx = crate::engines::test_utils::make_test_vindex(w);
+        let g = PipelinedLayerGraph {
+            index: &idx,
+            backend: &larql_compute::CpuBackend,
+            layer_range: 0..w.num_layers,
+        };
+        assert_eq!(g.name(), "pipelined");
+    }
+
+    #[test]
+    fn pipelined_out_of_range_returns_none() {
+        let w = weights();
+        let idx = crate::engines::test_utils::make_test_vindex(w);
+        let g = PipelinedLayerGraph {
+            index: &idx,
+            backend: &larql_compute::CpuBackend,
+            layer_range: 5..10, // range that excludes layer 0
+        };
+        let h = input(1, w.hidden_size);
+        // Layer 0 is outside range 5..10 → None
+        let out = g.forward_layer(w, &h, 0);
+        assert!(out.is_none(), "layer outside range should return None");
+    }
+
+    #[test]
+    fn pipelined_in_range_produces_output() {
+        let w = weights();
+        let idx = crate::engines::test_utils::make_test_vindex(w);
+        let g = PipelinedLayerGraph {
+            index: &idx,
+            backend: &larql_compute::CpuBackend,
+            layer_range: 0..w.num_layers,
+        };
+        let h = input(1, w.hidden_size);
+        let out = g.forward_layer(w, &h, 0);
+        assert!(out.is_some(), "layer in range should produce output");
+        assert_eq!(out.unwrap().residual.shape(), &[1, w.hidden_size]);
+    }
+}

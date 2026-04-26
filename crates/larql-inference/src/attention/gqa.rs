@@ -190,4 +190,68 @@ mod tests {
         let sum: f32 = w.heads[0].iter().sum();
         assert!((sum - 1.0).abs() < 0.01, "attention weights should sum to 1, got {sum}");
     }
+
+    // ── GQA reps > 1: multiple Q-heads per KV-head ───────────────────────────
+
+    #[test]
+    fn gqa_reps_2_output_shape() {
+        // num_q=4, num_kv=2, reps=2 — 2 Q-heads share each KV-head
+        let seq = 3usize;
+        let hd = 4usize;
+        let num_q = 4usize;
+        let num_kv = 2usize;
+        let reps = num_q / num_kv;
+        let q = small(seq, num_q * hd, 0.01);
+        let k = small(seq, num_kv * hd, 0.01);
+        let v = small(seq, num_kv * hd, 0.01);
+        let out = gqa_attention(&q, &k, &v, num_q, hd, reps, 1.0 / (hd as f64).sqrt(), seq);
+        assert_eq!(out.shape(), &[seq, num_q * hd],
+            "output should be [seq, num_q * head_dim]");
+    }
+
+    #[test]
+    fn gqa_reps_2_output_is_finite() {
+        let seq = 4usize;
+        let hd = 8usize;
+        let num_q = 4usize;
+        let num_kv = 2usize;
+        let q = small(seq, num_q * hd, 0.01);
+        let k = small(seq, num_kv * hd, 0.01);
+        let v = small(seq, num_kv * hd, 0.01);
+        let out = gqa_attention(&q, &k, &v, num_q, hd, num_q / num_kv,
+            1.0 / (hd as f64).sqrt(), seq);
+        assert!(out.iter().all(|v| v.is_finite()),
+            "reps=2 GQA output has non-finite values");
+    }
+
+    #[test]
+    fn gqa_reps_2_head_pairs_share_kv() {
+        // Q-heads 0,1 use KV-head 0; Q-heads 2,3 use KV-head 1.
+        // With Q equal to each other within a pair, output should also match.
+        let seq = 2usize;
+        let hd = 4usize;
+        let num_q = 4usize;
+        let num_kv = 2usize;
+        let reps = num_q / num_kv;
+        // Q rows: heads 0 and 1 are identical; heads 2 and 3 are identical but different from 0/1
+        let mut q_data = vec![0.0f32; seq * num_q * hd];
+        for s in 0..seq {
+            for d in 0..hd {
+                q_data[s * num_q * hd + 0 * hd + d] = 0.1;  // head 0
+                q_data[s * num_q * hd + 1 * hd + d] = 0.1;  // head 1 (same as 0)
+                q_data[s * num_q * hd + 2 * hd + d] = 0.5;  // head 2
+                q_data[s * num_q * hd + 3 * hd + d] = 0.5;  // head 3 (same as 2)
+            }
+        }
+        let q = Array2::from_shape_vec((seq, num_q * hd), q_data).unwrap();
+        let k = small(seq, num_kv * hd, 0.1);
+        let v = small(seq, num_kv * hd, 0.1);
+        let out = gqa_attention(&q, &k, &v, num_q, hd, reps, 1.0 / (hd as f64).sqrt(), seq);
+        // heads 0 and 1 should produce identical output rows (same Q, same KV)
+        let h0: Vec<f32> = out.row(0).iter().skip(0 * hd).take(hd).copied().collect();
+        let h1: Vec<f32> = out.row(0).iter().skip(1 * hd).take(hd).copied().collect();
+        for (a, b) in h0.iter().zip(h1.iter()) {
+            assert!((a - b).abs() < 1e-5, "heads 0 and 1 should produce same output: {a} vs {b}");
+        }
+    }
 }

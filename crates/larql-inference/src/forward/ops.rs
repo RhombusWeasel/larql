@@ -33,6 +33,15 @@ pub fn dot_proj(
     x.dot(&w.t())
 }
 
+/// Numerically-stable softmax. Returns an empty vec for empty input.
+pub fn softmax(logits: &[f32]) -> Vec<f32> {
+    if logits.is_empty() { return vec![]; }
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    exps.iter().map(|&x| x / sum).collect()
+}
+
 /// Add a 1D bias vector to each row of a 2D matrix.
 pub fn add_bias(x: &mut Array2<f32>, bias: &[f32]) {
     let cols = x.shape()[1];

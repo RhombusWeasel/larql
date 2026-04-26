@@ -64,3 +64,64 @@ pub trait LayerGraph {
     /// Human-readable name for logging.
     fn name(&self) -> &str;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+    use std::sync::OnceLock;
+    use crate::engines::test_utils::make_test_weights;
+    use crate::ffn::WeightFfn;
+    use larql_models::ModelWeights;
+
+    fn weights() -> &'static ModelWeights {
+        static W: OnceLock<ModelWeights> = OnceLock::new();
+        W.get_or_init(make_test_weights)
+    }
+
+    fn input(seq: usize, hidden: usize) -> Array2<f32> {
+        let data: Vec<f32> = (0..seq * hidden).map(|i| (i as f32 + 1.0) * 0.01).collect();
+        Array2::from_shape_vec((seq, hidden), data).unwrap()
+    }
+
+    // Verify that all three core LayerGraph implementations fulfil the trait
+    // contract — they accept the same input shape and return a consistent output.
+
+    #[test]
+    fn dense_and_walk_produce_same_output_shape() {
+        let w = weights();
+        let ffn = WeightFfn { weights: w };
+        let dense = DenseLayerGraph { ffn: &ffn, backend: None, capture_activation: false, capture_attention: false };
+        let walk  = WalkLayerGraph { ffn: &ffn, backend: None };
+        let h = input(1, w.hidden_size);
+        let out_d = dense.forward_layer(w, &h, 0).unwrap();
+        let out_wk = walk.forward_layer(w, &h, 0).unwrap();
+        assert_eq!(out_d.residual.shape(), out_wk.residual.shape());
+    }
+
+    #[test]
+    fn layer_output_residual_is_finite_for_all_impls() {
+        let w = weights();
+        let ffn = WeightFfn { weights: w };
+        let impls: Vec<(&str, Box<dyn LayerGraph>)> = vec![
+            ("dense", Box::new(DenseLayerGraph { ffn: &ffn, backend: None, capture_activation: false, capture_attention: false })),
+            ("walk",  Box::new(WalkLayerGraph  { ffn: &ffn, backend: None })),
+        ];
+        let h = input(1, w.hidden_size);
+        for (name, g) in &impls {
+            let out = g.forward_layer(w, &h, 0)
+                .unwrap_or_else(|| panic!("{name} layer 0 returned None"));
+            assert!(out.residual.iter().all(|v| v.is_finite()),
+                "{name}: residual has non-finite values");
+        }
+    }
+
+    #[test]
+    fn layer_graph_names_are_distinct() {
+        let w = weights();
+        let ffn = WeightFfn { weights: w };
+        let dense = DenseLayerGraph { ffn: &ffn, backend: None, capture_activation: false, capture_attention: false };
+        let walk  = WalkLayerGraph  { ffn: &ffn, backend: None };
+        assert_ne!(dense.name(), walk.name());
+    }
+}

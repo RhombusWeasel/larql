@@ -94,12 +94,13 @@ async fn grpc_describe_empty_tokenizer_returns_empty_edges() {
 #[tokio::test]
 async fn grpc_describe_functional_returns_edges() {
     // Functional tokenizer: France→0 → embedding[0]=[1,0,0,0] → hits feature 0 (Paris).
+    // Use min_score=0.1 (positive) so the gRPC handler doesn't fall back to default 5.0.
     let svc = svc_functional();
     let resp = svc.describe(Request::new(DescribeRequest {
         entity: "France".into(),
         band: String::new(),
         limit: 10,
-        min_score: 0.0,
+        min_score: 0.1,
         verbose: false,
     })).await.unwrap();
     assert_eq!(resp.get_ref().entity, "France");
@@ -111,7 +112,7 @@ async fn grpc_describe_top_edge_is_paris() {
     let svc = svc_functional();
     let resp = svc.describe(Request::new(DescribeRequest {
         entity: "France".into(), band: String::new(),
-        limit: 10, min_score: 0.0, verbose: false,
+        limit: 10, min_score: 0.1, verbose: false,
     })).await.unwrap();
     let edges = &resp.get_ref().edges;
     assert!(edges.iter().any(|e| e.target == "Paris"));
@@ -137,7 +138,7 @@ async fn grpc_walk_functional_returns_hits() {
     let resp = svc.walk(Request::new(WalkRequest {
         prompt: "France".into(),
         top: 5,
-        layers: vec![],
+        layers: String::new(),
     })).await.unwrap();
     assert_eq!(resp.get_ref().prompt, "France");
     assert!(!resp.get_ref().hits.is_empty());
@@ -147,7 +148,7 @@ async fn grpc_walk_functional_returns_hits() {
 async fn grpc_walk_top_hit_is_paris() {
     let svc = svc_functional();
     let resp = svc.walk(Request::new(WalkRequest {
-        prompt: "France".into(), top: 5, layers: vec![],
+        prompt: "France".into(), top: 5, layers: String::new(),
     })).await.unwrap();
     let hits = &resp.get_ref().hits;
     assert_eq!(hits[0].target, "Paris");
@@ -157,7 +158,7 @@ async fn grpc_walk_top_hit_is_paris() {
 async fn grpc_walk_empty_prompt_returns_invalid_arg() {
     let svc = svc_functional();
     let err = svc.walk(Request::new(WalkRequest {
-        prompt: String::new(), top: 5, layers: vec![],
+        prompt: String::new(), top: 5, layers: String::new(),
     })).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
@@ -166,7 +167,7 @@ async fn grpc_walk_empty_prompt_returns_invalid_arg() {
 async fn grpc_walk_no_model_returns_not_found() {
     let svc = svc(vec![]);
     let err = svc.walk(Request::new(WalkRequest {
-        prompt: "hello".into(), top: 5, layers: vec![],
+        prompt: "hello".into(), top: 5, layers: String::new(),
     })).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound);
 }
@@ -185,6 +186,7 @@ async fn grpc_select_all_returns_features() {
         min_confidence: 0.0,
         relation: String::new(),
         order_by: String::new(),
+        order: String::new(),
     })).await.unwrap();
     assert!(!resp.get_ref().edges.is_empty());
 }
@@ -195,7 +197,7 @@ async fn grpc_select_with_entity_filter() {
     let resp = svc.select(Request::new(SelectRequest {
         entity: "Paris".into(),
         layer: 0, limit: 20, min_confidence: 0.0,
-        relation: String::new(), order_by: String::new(),
+        relation: String::new(), order_by: String::new(), order: String::new(),
     })).await.unwrap();
     for edge in &resp.get_ref().edges {
         assert!(edge.target.to_lowercase().contains("paris"));
@@ -207,7 +209,7 @@ async fn grpc_select_no_model_returns_not_found() {
     let svc = svc(vec![]);
     let err = svc.select(Request::new(SelectRequest {
         entity: String::new(), layer: 0, limit: 20,
-        min_confidence: 0.0, relation: String::new(), order_by: String::new(),
+        min_confidence: 0.0, relation: String::new(), order_by: String::new(), order: String::new(),
     })).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound);
 }
@@ -242,7 +244,7 @@ async fn grpc_infer_no_model_returns_not_found() {
 #[tokio::test]
 async fn grpc_get_relations_returns_list() {
     let svc = svc_functional();
-    let resp = svc.get_relations(Request::new(RelationsRequest {})).await.unwrap();
+    let resp = svc.get_relations(Request::new(RelationsRequest { source: String::new() })).await.unwrap();
     // Relations are derived from feature meta top_tokens. The test index has 3 features.
     assert!(resp.get_ref().total > 0);
 }
@@ -250,7 +252,7 @@ async fn grpc_get_relations_returns_list() {
 #[tokio::test]
 async fn grpc_get_relations_no_model_returns_not_found() {
     let svc = svc(vec![]);
-    let err = svc.get_relations(Request::new(RelationsRequest {})).await.unwrap_err();
+    let err = svc.get_relations(Request::new(RelationsRequest { source: String::new() })).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound);
 }
 
@@ -319,7 +321,7 @@ async fn grpc_stream_describe_returns_stream() {
     let svc = svc_functional();
     let resp = svc.stream_describe(Request::new(DescribeRequest {
         entity: "France".into(), band: String::new(),
-        limit: 10, min_score: 0.0, verbose: false,
+        limit: 10, min_score: 0.1, verbose: false,
     })).await.unwrap();
     // Stream is returned immediately; consuming it is async.
     // Just verify we get a response with a stream.
@@ -331,7 +333,7 @@ async fn grpc_stream_describe_no_model_returns_not_found() {
     let svc = svc(vec![]);
     let err = svc.stream_describe(Request::new(DescribeRequest {
         entity: "France".into(), band: String::new(),
-        limit: 10, min_score: 0.0, verbose: false,
+        limit: 10, min_score: 0.1, verbose: false,
     })).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound);
 }
@@ -343,7 +345,7 @@ async fn grpc_stream_describe_collects_events() {
     let svc = svc_functional();
     let resp = svc.stream_describe(Request::new(DescribeRequest {
         entity: "France".into(), band: String::new(),
-        limit: 10, min_score: 0.0, verbose: false,
+        limit: 10, min_score: 0.1, verbose: false,
     })).await.unwrap();
 
     let mut stream = resp.into_inner();

@@ -5,14 +5,16 @@
 //! that consume them). This module covers Q4_0 and Q8_0, which the
 //! vindex write path uses for the lm_head and gate vector slices.
 
-
 // ── Quantizers (f32 → packed bytes) ──
 
 /// Quantize f32 values to Q4_0 format.
 /// Input must be a multiple of 32 elements.
 /// Output: 18 bytes per block (f16 scale + 16 bytes of packed 4-bit quants).
 pub fn quantize_q4_0(data: &[f32]) -> Vec<u8> {
-    assert!(data.len().is_multiple_of(32), "Q4_0: element count must be multiple of 32");
+    assert!(
+        data.len().is_multiple_of(32),
+        "Q4_0: element count must be multiple of 32"
+    );
     let n_blocks = data.len() / 32;
     let mut out = Vec::with_capacity(n_blocks * 18);
 
@@ -44,7 +46,10 @@ pub fn quantize_q4_0(data: &[f32]) -> Vec<u8> {
 /// Input must be a multiple of 32 elements.
 /// Output: 34 bytes per block (f16 scale + 32 signed int8 quants).
 pub fn quantize_q8_0(data: &[f32]) -> Vec<u8> {
-    assert!(data.len().is_multiple_of(32), "Q8_0: element count must be multiple of 32");
+    assert!(
+        data.len().is_multiple_of(32),
+        "Q8_0: element count must be multiple of 32"
+    );
     let n_blocks = data.len() / 32;
     let mut out = Vec::with_capacity(n_blocks * 34);
 
@@ -66,7 +71,5 @@ pub fn quantize_q8_0(data: &[f32]) -> Vec<u8> {
     out
 }
 
-
 // Compute operations (matvec, vecmat, NEON kernels) moved to larql-compute.
 // See: crates/larql-compute/src/cpu/ops/
-

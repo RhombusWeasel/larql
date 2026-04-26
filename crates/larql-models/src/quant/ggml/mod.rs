@@ -21,8 +21,8 @@
 //! dispatch, the shared `check_block_input` validator, and the test
 //! mod.
 
-use crate::detect::ModelError;
 use super::half::{decode_bf16, decode_f16};
+use crate::detect::ModelError;
 
 pub mod legacy;
 pub mod q4_k;
@@ -129,12 +129,16 @@ pub fn type_name(tensor_type: u32) -> &'static str {
 ///
 /// Returns `ModelError::Parse` if `data` is too short for the
 /// requested number of elements rather than panicking on a slice OOB.
-pub fn dequantize(data: &[u8], tensor_type: u32, n_elements: usize) -> Result<Vec<f32>, ModelError> {
+pub fn dequantize(
+    data: &[u8],
+    tensor_type: u32,
+    n_elements: usize,
+) -> Result<Vec<f32>, ModelError> {
     match tensor_type {
         TYPE_F32 => {
-            let need = n_elements.checked_mul(4).ok_or_else(|| {
-                ModelError::Parse(format!("F32: size overflow ({n_elements}×4)"))
-            })?;
+            let need = n_elements
+                .checked_mul(4)
+                .ok_or_else(|| ModelError::Parse(format!("F32: size overflow ({n_elements}×4)")))?;
             if data.len() < need {
                 return Err(ModelError::Parse(format!(
                     "F32: data too short: {} bytes < expected {need} ({n_elements} elements)",
@@ -168,9 +172,9 @@ fn decode_passthrough(
     name: &'static str,
     decoder: fn(&[u8]) -> Vec<f32>,
 ) -> Result<Vec<f32>, ModelError> {
-    let need = n_elements.checked_mul(2).ok_or_else(|| {
-        ModelError::Parse(format!("{name}: size overflow ({n_elements}×2)"))
-    })?;
+    let need = n_elements
+        .checked_mul(2)
+        .ok_or_else(|| ModelError::Parse(format!("{name}: size overflow ({n_elements}×2)")))?;
     if data.len() < need {
         return Err(ModelError::Parse(format!(
             "{name}: data too short: {} bytes < expected {need} ({n_elements} elements)",
@@ -182,10 +186,9 @@ fn decode_passthrough(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::legacy::{dequantize_q4_1, dequantize_q8_0};
     use super::q6_k::q6k_row_dot_scalar;
-
+    use super::*;
 
     // ── Q4_0 ──
 
@@ -248,7 +251,7 @@ mod tests {
     fn q8_0_basic() {
         let mut block = vec![0x00, 0x38]; // f16 scale = 0.5
         for _ in 0..16 {
-            block.push(2u8);    // +2 → 2*0.5 = 1.0
+            block.push(2u8); // +2 → 2*0.5 = 1.0
             block.push(0xFEu8); // -2 as i8 → -2*0.5 = -1.0
         }
         let result = dequantize_q8_0(&block, 32).unwrap();
@@ -299,7 +302,8 @@ mod tests {
 
     #[test]
     fn f32_passthrough() {
-        let data: Vec<u8> = [1.0f32, -2.0, 3.0].iter()
+        let data: Vec<u8> = [1.0f32, -2.0, 3.0]
+            .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
         let result = dequantize(&data, TYPE_F32, 3).unwrap();
@@ -460,7 +464,10 @@ mod tests {
                 );
             }
             Err(other) => panic!("expected Parse error for {fmt}, got {other:?}"),
-            Ok(v) => panic!("expected short-buffer error for {fmt}, got {} elements", v.len()),
+            Ok(v) => panic!(
+                "expected short-buffer error for {fmt}, got {} elements",
+                v.len()
+            ),
         }
     }
 
@@ -554,7 +561,9 @@ mod tests {
     #[test]
     fn empty_input_ok_when_zero_elements() {
         // Zero-element tensor should succeed with empty output across all block types.
-        for &ty in &[TYPE_Q4_0, TYPE_Q4_1, TYPE_Q8_0, TYPE_Q5_0, TYPE_Q5_1, TYPE_Q4_K, TYPE_Q6_K] {
+        for &ty in &[
+            TYPE_Q4_0, TYPE_Q4_1, TYPE_Q8_0, TYPE_Q5_0, TYPE_Q5_1, TYPE_Q4_K, TYPE_Q6_K,
+        ] {
             let out = dequantize(&[], ty, 0).unwrap_or_else(|e| panic!("type {ty} failed: {e:?}"));
             assert!(out.is_empty(), "type {ty} produced {} elements", out.len());
         }
@@ -575,8 +584,10 @@ mod tests {
         let scale = 0.1 * 31.5 / 7.0; // amax / 7 per block
         let max_step = scale * 0.5 + 1e-3;
         for (i, (v, r)) in vals.iter().zip(&round).enumerate() {
-            assert!((v - r).abs() <= max_step,
-                "idx {i}: v={v} r={r} max_step={max_step}");
+            assert!(
+                (v - r).abs() <= max_step,
+                "idx {i}: v={v} r={r} max_step={max_step}"
+            );
         }
     }
 
@@ -608,7 +619,10 @@ mod tests {
         // (11-bit mantissa), so allow ~1e-3 for the quantized representation
         // of ±1.0 after the f16-scale precision loss.
         let mut vals = Vec::with_capacity(32);
-        for _ in 0..16 { vals.push(1.0); vals.push(-1.0); }
+        for _ in 0..16 {
+            vals.push(1.0);
+            vals.push(-1.0);
+        }
         let packed = quantize_q8_0(&vals);
         let round = dequantize_q8_0(&packed, 32).unwrap();
         for (i, (v, r)) in vals.iter().zip(&round).enumerate() {
@@ -643,10 +657,14 @@ mod tests {
         // sub-mins=0, nibbles = low nibble index 0..7 repeated — check shape,
         // not exact values (the scale/min packing is lossy).
         let mut block = vec![0u8; 144];
-        block[0] = 0x00; block[1] = 0x3C; // d = 1.0 (f16)
-        block[2] = 0x00; block[3] = 0x00; // dmin = 0.0
-        // bytes 4..16: scales[0..4] = 1, mins[0..4] = 0 (low 6 bits only)
-        for s in &mut block[4..8] { *s = 0x01; }
+        block[0] = 0x00;
+        block[1] = 0x3C; // d = 1.0 (f16)
+        block[2] = 0x00;
+        block[3] = 0x00; // dmin = 0.0
+                         // bytes 4..16: scales[0..4] = 1, mins[0..4] = 0 (low 6 bits only)
+        for s in &mut block[4..8] {
+            *s = 0x01;
+        }
         for _m in &mut block[8..12] { /* mins lo = 0 */ }
         // Leave scales[4..8] = 0 (high nibble carrier) and quants zero.
         let out = dequantize(&block, TYPE_Q4_K, 256).unwrap();
@@ -690,8 +708,10 @@ mod tests {
             *b = (s >> 16) as u8;
         }
         // d = 0.0625 (f16 0x2C00), dmin = 0.0625 — small to keep values bounded.
-        block[0] = 0x00; block[1] = 0x2C;
-        block[2] = 0x00; block[3] = 0x2C;
+        block[0] = 0x00;
+        block[1] = 0x2C;
+        block[2] = 0x00;
+        block[3] = 0x2C;
         block
     }
 
@@ -755,21 +775,36 @@ mod tests {
         //         base_hi=96..128 → 10.0
         //   g=2/3: scales[4..8]=0  → 0.0
         let mut block = vec![0u8; 144];
-        block[0] = 0x00; block[1] = 0x3C; // d = 1.0 (f16)
-        block[2] = 0x00; block[3] = 0x00; // dmin = 0.0
-        // scales_bytes[0..4] = 0x02 → scales[0..4] = 2, mins[0..4] = 0
-        block[4] = 0x02; block[5] = 0x02; block[6] = 0x02; block[7] = 0x02;
+        block[0] = 0x00;
+        block[1] = 0x3C; // d = 1.0 (f16)
+        block[2] = 0x00;
+        block[3] = 0x00; // dmin = 0.0
+                         // scales_bytes[0..4] = 0x02 → scales[0..4] = 2, mins[0..4] = 0
+        block[4] = 0x02;
+        block[5] = 0x02;
+        block[6] = 0x02;
+        block[7] = 0x02;
         // scales_bytes[4..12] = 0x00 → mins[0..4] = 0, scales[4..8] = 0
         block[8..16].fill(0x00);
         block[16..144].fill(0x53);
 
         let out = dequantize_q4_k(&block, 256).unwrap();
         assert_eq!(out.len(), 256);
-        for (i, &v) in out.iter().enumerate().take(32)            { assert!((v -  6.0).abs() < 1e-6, "i={i} got {v}"); }
-        for (i, &v) in out.iter().enumerate().take(64).skip(32)   { assert!((v - 10.0).abs() < 1e-6, "i={i} got {v}"); }
-        for (i, &v) in out.iter().enumerate().take(96).skip(64)   { assert!((v -  6.0).abs() < 1e-6, "i={i} got {v}"); }
-        for (i, &v) in out.iter().enumerate().take(128).skip(96)  { assert!((v - 10.0).abs() < 1e-6, "i={i} got {v}"); }
-        for (i, &v) in out.iter().enumerate().skip(128)           { assert!((v -  0.0).abs() < 1e-6, "i={i} got {v}"); }
+        for (i, &v) in out.iter().enumerate().take(32) {
+            assert!((v - 6.0).abs() < 1e-6, "i={i} got {v}");
+        }
+        for (i, &v) in out.iter().enumerate().take(64).skip(32) {
+            assert!((v - 10.0).abs() < 1e-6, "i={i} got {v}");
+        }
+        for (i, &v) in out.iter().enumerate().take(96).skip(64) {
+            assert!((v - 6.0).abs() < 1e-6, "i={i} got {v}");
+        }
+        for (i, &v) in out.iter().enumerate().take(128).skip(96) {
+            assert!((v - 10.0).abs() < 1e-6, "i={i} got {v}");
+        }
+        for (i, &v) in out.iter().enumerate().skip(128) {
+            assert!((v - 0.0).abs() < 1e-6, "i={i} got {v}");
+        }
     }
 
     // ── scaled_add correctness (q4k and q6k) ──

@@ -17,8 +17,7 @@
 /// FP4 E2M1 value lookup. Index 0..15 maps the 4-bit encoding to f32.
 /// Must remain byte-identical to `mxfp4::MXFP4_TABLE`.
 pub const FP4_E2M1_TABLE: [f32; 16] = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
 /// The 8 positive representable magnitudes (not counting ±0).
@@ -37,7 +36,9 @@ pub fn e2m1_to_f32(code: u8) -> f32 {
 /// that NaNs should not appear in FP4 storage).
 #[inline]
 pub fn f32_to_e2m1(value: f32) -> u8 {
-    if value.is_nan() { return 0x00; }
+    if value.is_nan() {
+        return 0x00;
+    }
 
     let sign_bit: u8 = if value.is_sign_negative() { 0x08 } else { 0x00 };
     let mag = value.abs();
@@ -73,7 +74,10 @@ pub fn f32_to_e2m1(value: f32) -> u8 {
 /// Pack a slice of E2M1 codes (length must be even) into nibble-packed
 /// bytes. `byte[i] = (code[2i+1] << 4) | (code[2i] & 0x0F)`.
 pub fn pack_nibbles(codes: &[u8]) -> Vec<u8> {
-    assert!(codes.len().is_multiple_of(2), "nibble packing requires even length");
+    assert!(
+        codes.len().is_multiple_of(2),
+        "nibble packing requires even length"
+    );
     let mut out = Vec::with_capacity(codes.len() / 2);
     for pair in codes.chunks_exact(2) {
         out.push(((pair[1] & 0x0F) << 4) | (pair[0] & 0x0F));
@@ -97,7 +101,7 @@ pub fn unpack_nibbles(bytes: &[u8]) -> Vec<u8> {
 pub fn decode_fp4_into(bytes: &[u8], out: &mut [f32]) {
     debug_assert_eq!(out.len(), bytes.len() * 2);
     for (i, &b) in bytes.iter().enumerate() {
-        out[2 * i]     = FP4_E2M1_TABLE[(b & 0x0F) as usize];
+        out[2 * i] = FP4_E2M1_TABLE[(b & 0x0F) as usize];
         out[2 * i + 1] = FP4_E2M1_TABLE[((b >> 4) & 0x0F) as usize];
     }
 }
@@ -117,7 +121,11 @@ mod tests {
         use crate::quant::mxfp4;
         // Exported table must be byte-identical to the MXFP4 one; otherwise
         // downstream code that reuses MXFP4 would disagree with ours.
-        for (i, (&a, &b)) in FP4_E2M1_TABLE.iter().zip(mxfp4::MXFP4_TABLE.iter()).enumerate() {
+        for (i, (&a, &b)) in FP4_E2M1_TABLE
+            .iter()
+            .zip(mxfp4::MXFP4_TABLE.iter())
+            .enumerate()
+        {
             assert_eq!(a.to_bits(), b.to_bits(), "disagreement at index {i}");
         }
     }

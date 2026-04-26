@@ -1,30 +1,48 @@
 //! Model weight tensors — the loaded representation of a model's parameters.
 
-use std::collections::HashMap;
-use ndarray::ArcArray2;
 use crate::ModelArchitecture;
 use memmap2::Mmap;
+use ndarray::ArcArray2;
+use std::collections::HashMap;
 
 /// Type alias for weight tensors — ArcArray2 supports both owned and shared storage.
 /// Owned: from safetensors loading (heap). Shared: from mmap (zero-copy).
 pub type WeightArray = ArcArray2<f32>;
 
+pub(crate) const PACKED_EXPERTS_GATE_UP_PROJ: &str = "experts.gate_up_proj";
+pub(crate) const PACKED_EXPERTS_DOWN_PROJ: &str = "experts.down_proj";
+pub(crate) const PER_LAYER_FFN_PROBE_KEY: &str = "layers/0/0/gate_up";
+
 /// Tensor key substrings that identify FFN weight tensors.
 /// Shared between `drop_ffn_weights` and `loading::safetensors::is_ffn_tensor`
 /// so they always agree on what counts as FFN.
 pub(crate) const FFN_TENSOR_PATTERNS: &[&str] = &[
-    "gate_proj", "up_proj", "down_proj",
-    "ffn_gate", "ffn_up", "ffn_down",
-    "mlp.experts", "block_sparse_moe.experts",
-    "packed_gate_up_blocks", "packed_down_blocks",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "mlp.c_fc",
+    "mlp.c_proj",
+    "ffn_gate",
+    "ffn_up",
+    "ffn_down",
+    "mlp.experts",
+    "block_sparse_moe.experts",
+    "packed_gate_up_blocks",
+    "packed_down_blocks",
 ];
 
 /// Tensor key substrings that identify attention weight tensors.
 pub(crate) const ATTN_TENSOR_PATTERNS: &[&str] = &[
-    "self_attn.q_proj", "self_attn.k_proj",
-    "self_attn.v_proj", "self_attn.o_proj",
-    "attn_q", "attn_k", "attn_v", "attn_o",
-    "q_norm", "k_norm",
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "attn_q",
+    "attn_k",
+    "attn_v",
+    "attn_o",
+    "q_norm",
+    "k_norm",
 ];
 
 /// A loaded model's weight tensors, configuration, and architecture.
@@ -80,14 +98,15 @@ impl ModelWeights {
     /// populated by the per-layer loader. Returns `None` if the vindex uses
     /// the legacy flat-file layout or the entry is out of range.
     pub fn get_layer_entry_bytes(&self, layer: usize, entry: usize) -> Option<(&[u8], &[u8])> {
-        let gu = self.get_packed_bytes(&format!("layers/{layer}/{entry}/gate_up"))?;
-        let dn = self.get_packed_bytes(&format!("layers/{layer}/{entry}/down"))?;
+        let gu = self.get_packed_bytes(&per_layer_ffn_key(layer, entry, "gate_up"))?;
+        let dn = self.get_packed_bytes(&per_layer_ffn_key(layer, entry, "down"))?;
         Some((gu, dn))
     }
 
     /// Whether FFN weights are stored in the per-layer format (`layers/`).
     pub fn has_per_layer_ffn(&self) -> bool {
-        self.packed_byte_ranges.contains_key("layers/0/0/gate_up")
+        self.packed_byte_ranges
+            .contains_key(PER_LAYER_FFN_PROBE_KEY)
     }
 
     /// Drop FFN weight tensors (gate, up, down projections) from memory.
@@ -98,7 +117,9 @@ impl ModelWeights {
     /// Typical savings: ~13GB for a 4B model.
     pub fn drop_ffn_weights(&mut self) -> usize {
         let mut freed = 0usize;
-        let keys_to_remove: Vec<String> = self.tensors.keys()
+        let keys_to_remove: Vec<String> = self
+            .tensors
+            .keys()
             .filter(|k| FFN_TENSOR_PATTERNS.iter().any(|p| k.contains(p)))
             .cloned()
             .collect();
@@ -108,7 +129,9 @@ impl ModelWeights {
             }
         }
         // Also drop FFN bias vectors
-        let vec_keys: Vec<String> = self.vectors.keys()
+        let vec_keys: Vec<String> = self
+            .vectors
+            .keys()
             .filter(|k| FFN_TENSOR_PATTERNS.iter().any(|p| k.contains(p)))
             .cloned()
             .collect();
@@ -118,9 +141,14 @@ impl ModelWeights {
             }
         }
         // Drop packed expert byte tensors (Gemma 4 A4B experts.gate_up_proj / experts.down_proj)
-        let raw_keys: Vec<String> = self.raw_bytes.keys()
-            .filter(|k| FFN_TENSOR_PATTERNS.iter().any(|p| k.contains(p))
-                || k.contains("experts.gate_up_proj") || k.contains("experts.down_proj"))
+        let raw_keys: Vec<String> = self
+            .raw_bytes
+            .keys()
+            .filter(|k| {
+                FFN_TENSOR_PATTERNS.iter().any(|p| k.contains(p))
+                    || k.contains(PACKED_EXPERTS_GATE_UP_PROJ)
+                    || k.contains(PACKED_EXPERTS_DOWN_PROJ)
+            })
             .cloned()
             .collect();
         for key in &raw_keys {
@@ -145,7 +173,9 @@ impl ModelWeights {
     /// Typical savings: ~1 GB for 4B, ~8 GB for 31B.
     pub fn drop_attn_weights(&mut self) -> usize {
         let mut freed = 0usize;
-        let keys_to_remove: Vec<String> = self.tensors.keys()
+        let keys_to_remove: Vec<String> = self
+            .tensors
+            .keys()
             .filter(|k| ATTN_TENSOR_PATTERNS.iter().any(|p| k.contains(p)))
             .cloned()
             .collect();
@@ -154,7 +184,9 @@ impl ModelWeights {
                 freed += arr.len() * std::mem::size_of::<f32>();
             }
         }
-        let vec_keys: Vec<String> = self.vectors.keys()
+        let vec_keys: Vec<String> = self
+            .vectors
+            .keys()
             .filter(|k| ATTN_TENSOR_PATTERNS.iter().any(|p| k.contains(p)))
             .cloned()
             .collect();
@@ -193,4 +225,8 @@ impl ModelWeights {
             .expect("empty 0x0 array is always valid");
         freed
     }
+}
+
+fn per_layer_ffn_key(layer: usize, entry: usize, component: &str) -> String {
+    format!("layers/{layer}/{entry}/{component}")
 }

@@ -7,7 +7,6 @@ use crate::ModelError;
 use super::check_block_input;
 use crate::quant::half::f16_to_f32;
 
-
 /// Q4_K block layout (144 bytes per super-block of 256 elements), as
 /// written by llama.cpp / GGUF files:
 ///   bytes 0-1:   d    (f16 global scale)
@@ -42,12 +41,15 @@ pub fn q4k_row_dot(data: &[u8], x: &[f32]) -> Result<f32, ModelError> {
     if data.len() < n_blocks * BLOCK {
         return Err(ModelError::Parse(format!(
             "q4k_row_dot: data short: {} < {}",
-            data.len(), n_blocks * BLOCK,
+            data.len(),
+            n_blocks * BLOCK,
         )));
     }
 
     #[cfg(target_arch = "aarch64")]
-    unsafe { Ok(q4k_row_dot_neon(data, x, n_blocks))}
+    unsafe {
+        Ok(q4k_row_dot_neon(data, x, n_blocks))
+    }
     #[cfg(not(target_arch = "aarch64"))]
     Ok(q4k_row_dot_scalar(data, x, n_blocks))
 }
@@ -93,11 +95,11 @@ fn unpack_q4k_scales(scales_bytes: &[u8]) -> ([u8; 8], [u8; 8]) {
     let mut mins = [0u8; 8];
     for j in 0..4 {
         scales[j] = scales_bytes[j] & 0x3F;
-        mins[j]   = scales_bytes[j + 4] & 0x3F;
+        mins[j] = scales_bytes[j + 4] & 0x3F;
     }
     for j in 4..8 {
         scales[j] = (scales_bytes[j + 4] & 0x0F) | ((scales_bytes[j - 4] >> 6) << 4);
-        mins[j]   = (scales_bytes[j + 4] >> 4)    | ((scales_bytes[j]     >> 6) << 4);
+        mins[j] = (scales_bytes[j + 4] >> 4) | ((scales_bytes[j] >> 6) << 4);
     }
     (scales, mins)
 }
@@ -138,12 +140,16 @@ unsafe fn q4k_row_dot_neon(data: &[u8], x: &[f32], n_blocks: usize) -> f32 {
                 let b2 = *chunk.add(l4 * 4 + 2);
                 let b3 = *chunk.add(l4 * 4 + 3);
                 let lo_arr = [
-                    (b0 & 0x0F) as f32, (b1 & 0x0F) as f32,
-                    (b2 & 0x0F) as f32, (b3 & 0x0F) as f32,
+                    (b0 & 0x0F) as f32,
+                    (b1 & 0x0F) as f32,
+                    (b2 & 0x0F) as f32,
+                    (b3 & 0x0F) as f32,
                 ];
                 let hi_arr = [
-                    (b0 >> 4) as f32, (b1 >> 4) as f32,
-                    (b2 >> 4) as f32, (b3 >> 4) as f32,
+                    (b0 >> 4) as f32,
+                    (b1 >> 4) as f32,
+                    (b2 >> 4) as f32,
+                    (b3 >> 4) as f32,
                 ];
                 let lo = vld1q_f32(lo_arr.as_ptr());
                 let hi = vld1q_f32(hi_arr.as_ptr());
@@ -177,12 +183,15 @@ pub fn q4k_row_scaled_add(data: &[u8], alpha: f32, out: &mut [f32]) -> Result<()
     if data.len() < n_blocks * BLOCK {
         return Err(ModelError::Parse(format!(
             "q4k_row_scaled_add: data short: {} < {}",
-            data.len(), n_blocks * BLOCK,
+            data.len(),
+            n_blocks * BLOCK,
         )));
     }
 
     #[cfg(target_arch = "aarch64")]
-    unsafe { q4k_row_scaled_add_neon(data, alpha, out, n_blocks); }
+    unsafe {
+        q4k_row_scaled_add_neon(data, alpha, out, n_blocks);
+    }
     #[cfg(not(target_arch = "aarch64"))]
     q4k_row_scaled_add_scalar(data, alpha, out, n_blocks);
     Ok(())
@@ -249,12 +258,16 @@ unsafe fn q4k_row_scaled_add_neon(data: &[u8], alpha: f32, out: &mut [f32], n_bl
                 let b2 = *chunk.add(l4 * 4 + 2);
                 let b3 = *chunk.add(l4 * 4 + 3);
                 let lo_arr = [
-                    (b0 & 0x0F) as f32, (b1 & 0x0F) as f32,
-                    (b2 & 0x0F) as f32, (b3 & 0x0F) as f32,
+                    (b0 & 0x0F) as f32,
+                    (b1 & 0x0F) as f32,
+                    (b2 & 0x0F) as f32,
+                    (b3 & 0x0F) as f32,
                 ];
                 let hi_arr = [
-                    (b0 >> 4) as f32, (b1 >> 4) as f32,
-                    (b2 >> 4) as f32, (b3 >> 4) as f32,
+                    (b0 >> 4) as f32,
+                    (b1 >> 4) as f32,
+                    (b2 >> 4) as f32,
+                    (b3 >> 4) as f32,
                 ];
                 let lo = vld1q_f32(lo_arr.as_ptr());
                 let hi = vld1q_f32(hi_arr.as_ptr());
@@ -271,7 +284,7 @@ unsafe fn q4k_row_scaled_add_neon(data: &[u8], alpha: f32, out: &mut [f32], n_bl
 }
 
 pub fn dequantize_q4_k(data: &[u8], n_elements: usize) -> Result<Vec<f32>, ModelError> {
-    let block_size = 144;   // 2 + 2 + 12 + 128, llama.cpp GGUF layout.
+    let block_size = 144; // 2 + 2 + 12 + 128, llama.cpp GGUF layout.
     let super_block = 256;
     let n_blocks = check_block_input("Q4_K", data, n_elements, super_block, block_size)?;
     let mut out = vec![0.0f32; n_elements];
@@ -289,10 +302,10 @@ pub fn dequantize_q4_k(data: &[u8], n_elements: usize) -> Result<Vec<f32>, Model
         for j in 0..8 {
             if j < 4 {
                 scales[j] = scales_bytes[j] & 0x3F;
-                mins[j]   = scales_bytes[j + 4] & 0x3F;
+                mins[j] = scales_bytes[j + 4] & 0x3F;
             } else {
                 scales[j] = (scales_bytes[j + 4] & 0x0F) | ((scales_bytes[j - 4] >> 6) << 4);
-                mins[j]   = (scales_bytes[j + 4] >> 4)    | ((scales_bytes[j]     >> 6) << 4);
+                mins[j] = (scales_bytes[j + 4] >> 4) | ((scales_bytes[j] >> 6) << 4);
             }
         }
 

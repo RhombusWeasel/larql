@@ -3,7 +3,7 @@
 ## Current state (as of 2026-04-26)
 
 - Code quality pass complete: modularity refactor + magic string cleanup + test restructure (see Completed below).
-- Test coverage: **58.0% line / 65.3% function** (402 tests, 0 failures). Functional tokenizer unblocked describe/walk/walk-ffn paths.
+- Test coverage: **63.3% line / 73.2% function** (430 tests, 0 failures). gRPC handler tests unblocked grpc.rs (0%→65%). Magic strings eliminated across stream.rs, grpc.rs, describe.rs.
 - 2-shard local grid validated end-to-end on Gemma 4 26B-A4B (30 layers,
   inclusive layer ranges 0-14 + 15-29).
 - W2 feature-major down retrofittable in-place via
@@ -113,17 +113,24 @@ maps test words to embeddings with known KNN hits.
 | `embed_store.rs` | 25% | Reads real f16 embedding files |
 | `main.rs` | 0% | CLI entrypoint; skip |
 
-### T2. Test coverage — remaining reachable paths
+### T2. Test coverage — remaining reachable paths *(in progress)*
 
-**Current**: 58.0% line. Addressable without real weights:
+**Current**: 63.3% line / 73.2% function. 430 tests.
+
+**Completed this pass:**
+- `grpc.rs` 0% → **65%** — 28 direct gRPC handler tests (health, stats, describe, walk, select, relations, walk_ffn, infer, stream_describe)
+- Magic strings: `"probe"` → `PROBE_RELATION_SOURCE`; `"ok"` → `HEALTH_STATUS_OK`; infer mode strings in grpc.rs; WebSocket message types in stream.rs (`WS_TYPE_*`, `WS_CMD_*`)
+
+**Still addressable without real weights:**
 
 | File | Current | Gap | What to add |
 |---|---|---|---|
+| `routes/stream.rs` | 0% | 219 lines | WebSocket inner functions — needs `tokio-tungstenite` or direct `grpc_stream_describe`-style testing |
+| `routes/explain.rs` | 11% | 152 lines | Gated on `get_or_load_weights()`; only handler scaffold reachable |
 | `routes/infer.rs` | 31% | ~70 lines | `has_model_weights=false` + `infer_disabled=false` → 503 |
 | `routes/warmup.rs` | 80% | ~15 lines | `warmup_hnsw=true` warn path (HNSW not enabled) |
-| `routes/insert.rs` | 78% | ~40 lines | Constellation path (requires weights → skipped to embedding fallback detail) |
-| `session.rs` | 91% | ~12 lines | TTL eviction in `get_or_create` |
-| `routes/walk_ffn.rs` | 77% | ~118 lines | Full-output path (needs weights), binary path detail |
+| `embed_store.rs` | 25% | ~72 lines | Reads real f16 files; hard to test in-process |
+| `announce.rs` | 6% | ~98 lines | gRPC stream to real router — defer |
 
 ### G1. Cold-start profile ✅ done 2026-04-26
 **Findings**: walk-ffn cold cost decomposes into two distinct phases:
@@ -207,6 +214,18 @@ to add/remove a shard without restarting the router. Pair with
 ---
 
 ## Completed
+
+### 2026-04-26 — coverage round-3 (T2 partial) + magic strings round-2
+
+| Item | Outcome |
+|---|---|
+| `test_grpc.rs` — 28 new gRPC handler tests | Direct method calls on `VindexGrpcService` — no network socket; health, stats, describe, walk, select, relations, walk_ffn, infer, stream_describe |
+| `grpc.rs` coverage | 0% → **65%** (169 lines uncovered, all gated on real model weights or gRPC streaming) |
+| Magic strings — `"probe"` | `PROBE_RELATION_SOURCE` constant in `band_utils.rs`; used in describe.rs, grpc.rs, stream.rs |
+| Magic strings — `"ok"` | `HEALTH_STATUS_OK` constant; used in grpc.rs health handler |
+| Magic strings — gRPC modes | `INFER_MODE_WALK/DENSE/COMPARE` applied to grpc.rs (was using bare strings) |
+| Magic strings — WebSocket types | `WS_TYPE_ERROR/LAYER/DONE/PREDICTION/INFER_DONE` and `WS_CMD_DESCRIBE/INFER` in stream.rs |
+| Coverage | 57.2% → **63.3% line**, 65.3% → **73.2% function** (402 → 430 tests) |
 
 ### 2026-04-26 — coverage round-2 (T1)
 

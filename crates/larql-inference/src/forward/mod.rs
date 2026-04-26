@@ -28,7 +28,7 @@ pub mod target_delta;
 pub mod infer_patched;
 
 // ── Re-export ops so all `super::apply_norm` / `crate::forward::*` paths work ──
-pub use ops::{apply_norm, dot_proj, add_bias};
+pub use ops::{apply_norm, dot_proj, add_bias, softmax};
 
 // ── Re-export types from predict::types so `trace.rs` and other siblings
 //    can still `use super::{TraceResult, LayerAttentionCapture, ...}` ──

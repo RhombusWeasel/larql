@@ -20,12 +20,15 @@ pub fn q6k_row_dot(data: &[u8], x: &[f32]) -> Result<f32, ModelError> {
     if data.len() < n_blocks * BLOCK {
         return Err(ModelError::Parse(format!(
             "q6k_row_dot: data short: {} < {}",
-            data.len(), n_blocks * BLOCK,
+            data.len(),
+            n_blocks * BLOCK,
         )));
     }
 
     #[cfg(target_arch = "aarch64")]
-    unsafe { Ok(q6k_row_dot_neon(data, x, n_blocks))}
+    unsafe {
+        Ok(q6k_row_dot_neon(data, x, n_blocks))
+    }
     #[cfg(not(target_arch = "aarch64"))]
     Ok(q6k_row_dot_scalar(data, x, n_blocks))
 }
@@ -45,7 +48,11 @@ pub(super) fn q6k_row_dot_scalar(data: &[u8], x: &[f32], n_blocks: usize) -> f32
             let sc = d * (sc_byte as i8) as f32;
             for i in 0..16 {
                 let idx = j * 16 + i;
-                let lo4 = if idx % 2 == 0 { ql[idx / 2] & 0x0F } else { (ql[idx / 2] >> 4) & 0x0F };
+                let lo4 = if idx % 2 == 0 {
+                    ql[idx / 2] & 0x0F
+                } else {
+                    (ql[idx / 2] >> 4) & 0x0F
+                };
                 let hi2_byte = qh[idx / 4];
                 let hi2 = (hi2_byte >> ((idx % 4) * 2)) & 0x03;
                 let val = ((lo4 as i32) | ((hi2 as i32) << 4)) - 32;
@@ -142,7 +149,8 @@ pub fn q6k_row_scaled_add(data: &[u8], alpha: f32, out: &mut [f32]) -> Result<()
     if data.len() < n_blocks * block_size {
         return Err(ModelError::Parse(format!(
             "q6k_row_scaled_add: data short: {} < {}",
-            data.len(), n_blocks * block_size,
+            data.len(),
+            n_blocks * block_size,
         )));
     }
     for sb in 0..n_blocks {
@@ -155,7 +163,11 @@ pub fn q6k_row_scaled_add(data: &[u8], alpha: f32, out: &mut [f32]) -> Result<()
             let sc = d * (sc_byte as i8) as f32;
             for i in 0..16 {
                 let idx = j * 16 + i;
-                let lo4 = if idx % 2 == 0 { ql[idx / 2] & 0x0F } else { (ql[idx / 2] >> 4) & 0x0F };
+                let lo4 = if idx % 2 == 0 {
+                    ql[idx / 2] & 0x0F
+                } else {
+                    (ql[idx / 2] >> 4) & 0x0F
+                };
                 let hi2_byte = qh[idx / 4];
                 let hi2 = (hi2_byte >> ((idx % 4) * 2)) & 0x03;
                 let val = ((lo4 as i32) | ((hi2 as i32) << 4)) - 32;
@@ -176,8 +188,8 @@ pub fn dequantize_q6_k(data: &[u8], n_elements: usize) -> Result<Vec<f32>, Model
 
     for sb in 0..n_blocks {
         let block = &data[sb * block_size..(sb + 1) * block_size];
-        let ql = &block[0..128];    // lower 4 bits
-        let qh = &block[128..192];  // upper 2 bits
+        let ql = &block[0..128]; // lower 4 bits
+        let qh = &block[128..192]; // upper 2 bits
         let scales = &block[192..208]; // 16 int8 scales
         let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
 
@@ -185,7 +197,11 @@ pub fn dequantize_q6_k(data: &[u8], n_elements: usize) -> Result<Vec<f32>, Model
             let sc = d * (sc_byte as i8) as f32;
             for i in 0..16 {
                 let idx = j * 16 + i;
-                let lo4 = if idx % 2 == 0 { ql[idx / 2] & 0x0F } else { (ql[idx / 2] >> 4) & 0x0F };
+                let lo4 = if idx % 2 == 0 {
+                    ql[idx / 2] & 0x0F
+                } else {
+                    (ql[idx / 2] >> 4) & 0x0F
+                };
                 let hi2_byte = qh[idx / 4];
                 let hi2 = (hi2_byte >> ((idx % 4) * 2)) & 0x03;
                 let val = ((lo4 as i32) | ((hi2 as i32) << 4)) - 32;

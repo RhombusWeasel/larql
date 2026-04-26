@@ -7,10 +7,7 @@ use std::io::{Seek, Write};
 use std::path::Path;
 use tempfile::TempDir;
 
-use larql_models::{
-    load_model_dir, load_model_dir_filtered, load_model_dir_walk_only,
-    ModelError,
-};
+use larql_models::{load_model_dir, load_model_dir_filtered, load_model_dir_walk_only, ModelError};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Safetensors binary builder
@@ -86,15 +83,24 @@ fn write_model_dir(dir: &Path, entries: &[(&str, &str, &[usize], Vec<u8>)]) {
     std::fs::write(dir.join("model.safetensors"), make_safetensors(entries)).unwrap();
 }
 
+fn write_model_dir_with_config(
+    dir: &Path,
+    config: serde_json::Value,
+    entries: &[(&str, &str, &[usize], Vec<u8>)],
+) {
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    std::fs::write(dir.join("model.safetensors"), make_safetensors(entries)).unwrap();
+}
+
 /// Minimal embed + lm_head + norm for a successful Llama-like load (hidden=4, vocab=10).
 fn minimal_tensors() -> Vec<(&'static str, &'static str, &'static [usize], Vec<u8>)> {
     let embed_data = f32_bytes(&[1.0f32; 40]); // [10, 4]
-    let norm_data  = f32_bytes(&[1.0f32;  4]); // [4]
-    let head_data  = f32_bytes(&[1.0f32; 40]); // [10, 4]
+    let norm_data = f32_bytes(&[1.0f32; 4]); // [4]
+    let head_data = f32_bytes(&[1.0f32; 40]); // [10, 4]
     vec![
         ("embed_tokens.weight", "F32", &[10, 4], embed_data),
-        ("norm.weight",         "F32", &[4],     norm_data),
-        ("lm_head.weight",      "F32", &[10, 4], head_data),
+        ("norm.weight", "F32", &[4], norm_data),
+        ("lm_head.weight", "F32", &[10, 4], head_data),
     ]
 }
 
@@ -135,7 +141,9 @@ fn gguf_meta_f32(f: &mut impl Write, key: &str, val: f32) {
 fn gguf_tensor_info(f: &mut impl Write, name: &str, dims: &[u64], ty: u32, offset: u64) {
     gguf_str(f, name);
     f.write_all(&(dims.len() as u32).to_le_bytes()).unwrap();
-    for &d in dims { f.write_all(&d.to_le_bytes()).unwrap(); }
+    for &d in dims {
+        f.write_all(&d.to_le_bytes()).unwrap();
+    }
     f.write_all(&ty.to_le_bytes()).unwrap();
     f.write_all(&offset.to_le_bytes()).unwrap();
 }
@@ -153,10 +161,10 @@ fn write_minimal_gguf(path: &Path) {
     const VOCAB: u64 = 100;
     const HIDDEN: u64 = 4;
     let embed_elems = (HIDDEN * VOCAB) as usize;
-    let norm_elems  = HIDDEN as usize;
+    let norm_elems = HIDDEN as usize;
 
     let embed_bytes = (embed_elems * 4) as u64; // F32
-    let norm_bytes  = (norm_elems  * 4) as u64;
+    let norm_bytes = (norm_elems * 4) as u64;
 
     let mut f = std::fs::File::create(path).unwrap();
 
@@ -168,19 +176,31 @@ fn write_minimal_gguf(path: &Path) {
 
     // Metadata (8 entries)
     gguf_meta_str(&mut f, "general.architecture", "llama");
-    gguf_meta_u32(&mut f, "llama.embedding_length",       HIDDEN as u32);
-    gguf_meta_u32(&mut f, "llama.block_count",            1);
-    gguf_meta_u32(&mut f, "llama.feed_forward_length",    16);
-    gguf_meta_u32(&mut f, "llama.attention.head_count",   2);
+    gguf_meta_u32(&mut f, "llama.embedding_length", HIDDEN as u32);
+    gguf_meta_u32(&mut f, "llama.block_count", 1);
+    gguf_meta_u32(&mut f, "llama.feed_forward_length", 16);
+    gguf_meta_u32(&mut f, "llama.attention.head_count", 2);
     gguf_meta_u32(&mut f, "llama.attention.head_count_kv", 2);
-    gguf_meta_u32(&mut f, "llama.attention.key_length",   2);
-    gguf_meta_f32(&mut f, "llama.rope.freq_base",         10000.0);
+    gguf_meta_u32(&mut f, "llama.attention.key_length", 2);
+    gguf_meta_f32(&mut f, "llama.rope.freq_base", 10000.0);
     // note: no llama.vocab_size → will use default 262144
 
     // Tensor infos (offsets are relative to the data section start)
-    gguf_tensor_info(&mut f, "token_embd.weight",  &[HIDDEN, VOCAB], GGUF_F32, 0);
-    gguf_tensor_info(&mut f, "output.weight",      &[HIDDEN, VOCAB], GGUF_F32, embed_bytes);
-    gguf_tensor_info(&mut f, "output_norm.weight", &[HIDDEN],        GGUF_F32, embed_bytes * 2);
+    gguf_tensor_info(&mut f, "token_embd.weight", &[HIDDEN, VOCAB], GGUF_F32, 0);
+    gguf_tensor_info(
+        &mut f,
+        "output.weight",
+        &[HIDDEN, VOCAB],
+        GGUF_F32,
+        embed_bytes,
+    );
+    gguf_tensor_info(
+        &mut f,
+        "output_norm.weight",
+        &[HIDDEN],
+        GGUF_F32,
+        embed_bytes * 2,
+    );
 
     // Pad to 32-byte boundary (start of data section)
     let pos = f.stream_position().unwrap();
@@ -191,7 +211,71 @@ fn write_minimal_gguf(path: &Path) {
     // Write tensor data (all zeros — we just check shape loads correctly)
     f.write_all(&vec![0u8; embed_bytes as usize]).unwrap();
     f.write_all(&vec![0u8; embed_bytes as usize]).unwrap();
-    f.write_all(&vec![0u8; norm_bytes  as usize]).unwrap();
+    f.write_all(&vec![0u8; norm_bytes as usize]).unwrap();
+    f.flush().unwrap();
+}
+
+/// Write a minimal GGUF with one FFN tensor, used to prove walk-only filtering
+/// is applied before/at GGUF tensor loading.
+fn write_gguf_with_ffn(path: &Path) {
+    const VOCAB: u64 = 100;
+    const HIDDEN: u64 = 4;
+    const INTERMEDIATE: u64 = 16;
+    let embed_elems = (HIDDEN * VOCAB) as usize;
+    let norm_elems = HIDDEN as usize;
+    let ffn_elems = (HIDDEN * INTERMEDIATE) as usize;
+
+    let embed_bytes = (embed_elems * 4) as u64;
+    let norm_bytes = (norm_elems * 4) as u64;
+    let ffn_bytes = (ffn_elems * 4) as u64;
+
+    let mut f = std::fs::File::create(path).unwrap();
+
+    f.write_all(&GGUF_MAGIC.to_le_bytes()).unwrap();
+    f.write_all(&3u32.to_le_bytes()).unwrap();
+    f.write_all(&4u64.to_le_bytes()).unwrap();
+    f.write_all(&8u64.to_le_bytes()).unwrap();
+
+    gguf_meta_str(&mut f, "general.architecture", "llama");
+    gguf_meta_u32(&mut f, "llama.embedding_length", HIDDEN as u32);
+    gguf_meta_u32(&mut f, "llama.block_count", 1);
+    gguf_meta_u32(&mut f, "llama.feed_forward_length", INTERMEDIATE as u32);
+    gguf_meta_u32(&mut f, "llama.attention.head_count", 2);
+    gguf_meta_u32(&mut f, "llama.attention.head_count_kv", 2);
+    gguf_meta_u32(&mut f, "llama.attention.key_length", 2);
+    gguf_meta_f32(&mut f, "llama.rope.freq_base", 10000.0);
+
+    gguf_tensor_info(&mut f, "token_embd.weight", &[HIDDEN, VOCAB], GGUF_F32, 0);
+    gguf_tensor_info(
+        &mut f,
+        "output.weight",
+        &[HIDDEN, VOCAB],
+        GGUF_F32,
+        embed_bytes,
+    );
+    gguf_tensor_info(
+        &mut f,
+        "output_norm.weight",
+        &[HIDDEN],
+        GGUF_F32,
+        embed_bytes * 2,
+    );
+    gguf_tensor_info(
+        &mut f,
+        "blk.0.ffn_gate.weight",
+        &[HIDDEN, INTERMEDIATE],
+        GGUF_F32,
+        embed_bytes * 2 + norm_bytes,
+    );
+
+    let pos = f.stream_position().unwrap();
+    let aligned = pos.div_ceil(32) * 32;
+    f.write_all(&vec![0u8; (aligned - pos) as usize]).unwrap();
+
+    f.write_all(&vec![0u8; embed_bytes as usize]).unwrap();
+    f.write_all(&vec![0u8; embed_bytes as usize]).unwrap();
+    f.write_all(&vec![0u8; norm_bytes as usize]).unwrap();
+    f.write_all(&vec![0u8; ffn_bytes as usize]).unwrap();
     f.flush().unwrap();
 }
 
@@ -203,11 +287,14 @@ fn write_minimal_gguf(path: &Path) {
 fn load_f32_tensors_correct_values() {
     let dir = TempDir::new().unwrap();
     let known: Vec<f32> = (0..40).map(|i| i as f32 * 0.1).collect();
-    write_model_dir(dir.path(), &[
-        ("embed_tokens.weight", "F32", &[10, 4], f32_bytes(&known)),
-        ("norm.weight",         "F32", &[4],     f32_bytes(&[1.0f32; 4])),
-        ("lm_head.weight",      "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
-    ]);
+    write_model_dir(
+        dir.path(),
+        &[
+            ("embed_tokens.weight", "F32", &[10, 4], f32_bytes(&known)),
+            ("norm.weight", "F32", &[4], f32_bytes(&[1.0f32; 4])),
+            ("lm_head.weight", "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
+        ],
+    );
 
     let weights = load_model_dir(dir.path()).unwrap();
     assert_eq!(weights.embed.shape(), &[10, 4]);
@@ -220,11 +307,14 @@ fn load_f32_tensors_correct_values() {
 #[test]
 fn load_f16_tensors_converts_to_f32() {
     let dir = TempDir::new().unwrap();
-    write_model_dir(dir.path(), &[
-        ("embed_tokens.weight", "F16", &[10, 4], f16_ones(40)),
-        ("norm.weight",         "F16", &[4],     f16_ones(4)),
-        ("lm_head.weight",      "F16", &[10, 4], f16_ones(40)),
-    ]);
+    write_model_dir(
+        dir.path(),
+        &[
+            ("embed_tokens.weight", "F16", &[10, 4], f16_ones(40)),
+            ("norm.weight", "F16", &[4], f16_ones(4)),
+            ("lm_head.weight", "F16", &[10, 4], f16_ones(40)),
+        ],
+    );
 
     let weights = load_model_dir(dir.path()).unwrap();
     assert_eq!(weights.embed.shape(), &[10, 4]);
@@ -235,11 +325,14 @@ fn load_f16_tensors_converts_to_f32() {
 #[test]
 fn load_bf16_tensors_converts_to_f32() {
     let dir = TempDir::new().unwrap();
-    write_model_dir(dir.path(), &[
-        ("embed_tokens.weight", "BF16", &[10, 4], bf16_ones(40)),
-        ("norm.weight",         "BF16", &[4],     bf16_ones(4)),
-        ("lm_head.weight",      "BF16", &[10, 4], bf16_ones(40)),
-    ]);
+    write_model_dir(
+        dir.path(),
+        &[
+            ("embed_tokens.weight", "BF16", &[10, 4], bf16_ones(40)),
+            ("norm.weight", "BF16", &[4], bf16_ones(4)),
+            ("lm_head.weight", "BF16", &[10, 4], bf16_ones(40)),
+        ],
+    );
 
     let weights = load_model_dir(dir.path()).unwrap();
     assert_eq!(weights.embed.shape(), &[10, 4]);
@@ -249,54 +342,255 @@ fn load_bf16_tensors_converts_to_f32() {
 #[test]
 fn load_1d_norm_tensor_goes_into_vectors() {
     let dir = TempDir::new().unwrap();
-    write_model_dir(dir.path(), &[
-        ("embed_tokens.weight",           "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
-        ("norm.weight",                   "F32", &[4],     f32_bytes(&[2.0f32; 4])),
-        ("lm_head.weight",                "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
-        ("layers.0.input_layernorm.weight", "F32", &[4],   f32_bytes(&[3.0f32; 4])),
-    ]);
+    write_model_dir(
+        dir.path(),
+        &[
+            (
+                "embed_tokens.weight",
+                "F32",
+                &[10, 4],
+                f32_bytes(&[1.0f32; 40]),
+            ),
+            ("norm.weight", "F32", &[4], f32_bytes(&[2.0f32; 4])),
+            ("lm_head.weight", "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
+            (
+                "layers.0.input_layernorm.weight",
+                "F32",
+                &[4],
+                f32_bytes(&[3.0f32; 4]),
+            ),
+        ],
+    );
 
     let weights = load_model_dir(dir.path()).unwrap();
     let norm = weights.vectors.get("norm.weight").unwrap();
     assert_eq!(norm.len(), 4);
     assert!((norm[0] - 2.0).abs() < 1e-6);
 
-    let ln = weights.vectors.get("layers.0.input_layernorm.weight").unwrap();
+    let ln = weights
+        .vectors
+        .get("layers.0.input_layernorm.weight")
+        .unwrap();
     assert!((ln[0] - 3.0).abs() < 1e-6);
 }
 
 #[test]
 fn walk_only_excludes_ffn_tensors() {
     let dir = TempDir::new().unwrap();
-    write_model_dir(dir.path(), &[
-        ("embed_tokens.weight",           "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
-        ("norm.weight",                   "F32", &[4],     f32_bytes(&[1.0f32;  4])),
-        ("lm_head.weight",                "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
-        ("layers.0.self_attn.q_proj.weight", "F32", &[2, 4], f32_bytes(&[1.0f32; 8])),
-        ("layers.0.mlp.gate_proj.weight", "F32", &[4, 4], f32_bytes(&[1.0f32; 16])),
-        ("layers.0.mlp.up_proj.weight",   "F32", &[4, 4], f32_bytes(&[1.0f32; 16])),
-        ("layers.0.mlp.down_proj.weight", "F32", &[4, 4], f32_bytes(&[1.0f32; 16])),
-    ]);
+    write_model_dir(
+        dir.path(),
+        &[
+            (
+                "embed_tokens.weight",
+                "F32",
+                &[10, 4],
+                f32_bytes(&[1.0f32; 40]),
+            ),
+            ("norm.weight", "F32", &[4], f32_bytes(&[1.0f32; 4])),
+            ("lm_head.weight", "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
+            (
+                "layers.0.self_attn.q_proj.weight",
+                "F32",
+                &[2, 4],
+                f32_bytes(&[1.0f32; 8]),
+            ),
+            (
+                "layers.0.mlp.gate_proj.weight",
+                "F32",
+                &[4, 4],
+                f32_bytes(&[1.0f32; 16]),
+            ),
+            (
+                "layers.0.mlp.up_proj.weight",
+                "F32",
+                &[4, 4],
+                f32_bytes(&[1.0f32; 16]),
+            ),
+            (
+                "layers.0.mlp.down_proj.weight",
+                "F32",
+                &[4, 4],
+                f32_bytes(&[1.0f32; 16]),
+            ),
+        ],
+    );
 
     let weights = load_model_dir_walk_only(dir.path()).unwrap();
-    assert!(!weights.tensors.contains_key("layers.0.mlp.gate_proj.weight"));
+    assert!(!weights
+        .tensors
+        .contains_key("layers.0.mlp.gate_proj.weight"));
     assert!(!weights.tensors.contains_key("layers.0.mlp.up_proj.weight"));
-    assert!(!weights.tensors.contains_key("layers.0.mlp.down_proj.weight"));
-    assert!(weights.tensors.contains_key("layers.0.self_attn.q_proj.weight"));
+    assert!(!weights
+        .tensors
+        .contains_key("layers.0.mlp.down_proj.weight"));
+    assert!(weights
+        .tensors
+        .contains_key("layers.0.self_attn.q_proj.weight"));
+}
+
+#[test]
+fn walk_only_excludes_starcoder2_ffn_tensors() {
+    let dir = TempDir::new().unwrap();
+    let config = serde_json::json!({
+        "model_type": "starcoder2",
+        "hidden_size": 4,
+        "num_hidden_layers": 1,
+        "intermediate_size": 16,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 2,
+        "vocab_size": 10,
+    });
+    write_model_dir_with_config(
+        dir.path(),
+        config,
+        &[
+            (
+                "embed_tokens.weight",
+                "F32",
+                &[10, 4],
+                f32_bytes(&[1.0f32; 40]),
+            ),
+            ("norm.weight", "F32", &[4], f32_bytes(&[1.0f32; 4])),
+            ("lm_head.weight", "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
+            (
+                "layers.0.self_attn.q_proj.weight",
+                "F32",
+                &[2, 4],
+                f32_bytes(&[1.0f32; 8]),
+            ),
+            (
+                "layers.0.mlp.c_fc.weight",
+                "F32",
+                &[16, 4],
+                f32_bytes(&[1.0f32; 64]),
+            ),
+            (
+                "layers.0.mlp.c_proj.weight",
+                "F32",
+                &[4, 16],
+                f32_bytes(&[1.0f32; 64]),
+            ),
+            (
+                "layers.0.mlp.c_fc.bias",
+                "F32",
+                &[16],
+                f32_bytes(&[1.0f32; 16]),
+            ),
+            (
+                "layers.0.mlp.c_proj.bias",
+                "F32",
+                &[4],
+                f32_bytes(&[1.0f32; 4]),
+            ),
+        ],
+    );
+
+    let weights = load_model_dir_walk_only(dir.path()).unwrap();
+    assert!(!weights.tensors.contains_key("layers.0.mlp.c_fc.weight"));
+    assert!(!weights.tensors.contains_key("layers.0.mlp.c_proj.weight"));
+    assert!(!weights.vectors.contains_key("layers.0.mlp.c_fc.bias"));
+    assert!(!weights.vectors.contains_key("layers.0.mlp.c_proj.bias"));
+    assert!(weights
+        .tensors
+        .contains_key("layers.0.self_attn.q_proj.weight"));
+}
+
+#[test]
+fn walk_only_excludes_gpt_oss_packed_mxfp4_experts() {
+    let dir = TempDir::new().unwrap();
+    let config = serde_json::json!({
+        "model_type": "gpt_oss",
+        "hidden_size": 4,
+        "num_hidden_layers": 1,
+        "intermediate_size": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "num_local_experts": 1,
+        "num_experts_per_tok": 1,
+        "head_dim": 2,
+        "vocab_size": 10,
+    });
+    write_model_dir_with_config(
+        dir.path(),
+        config,
+        &[
+            (
+                "embed_tokens.weight",
+                "F32",
+                &[10, 4],
+                f32_bytes(&[1.0f32; 40]),
+            ),
+            ("norm.weight", "F32", &[4], f32_bytes(&[1.0f32; 4])),
+            ("lm_head.weight", "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
+            (
+                "layers.0.mlp.router.weight",
+                "F32",
+                &[1, 4],
+                f32_bytes(&[1.0f32; 4]),
+            ),
+            (
+                "layers.0.mlp.experts.gate_up_proj_blocks",
+                "U8",
+                &[1, 2, 1, 16],
+                vec![0x22; 32],
+            ),
+            (
+                "layers.0.mlp.experts.gate_up_proj_scales",
+                "U8",
+                &[1, 2, 1],
+                vec![127; 2],
+            ),
+            (
+                "layers.0.mlp.experts.down_proj_blocks",
+                "U8",
+                &[1, 1, 1, 16],
+                vec![0x22; 16],
+            ),
+            (
+                "layers.0.mlp.experts.down_proj_scales",
+                "U8",
+                &[1, 1, 1],
+                vec![127; 1],
+            ),
+        ],
+    );
+
+    let weights = load_model_dir_walk_only(dir.path()).unwrap();
+    assert!(!weights
+        .tensors
+        .keys()
+        .any(|key| key.contains("block_sparse_moe.experts")));
+    assert!(weights.tensors.contains_key("layers.0.mlp.router.weight"));
 }
 
 #[test]
 fn filtered_custom_predicate_skips_target() {
     let dir = TempDir::new().unwrap();
-    write_model_dir(dir.path(), &[
-        ("embed_tokens.weight",           "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
-        ("norm.weight",                   "F32", &[4],     f32_bytes(&[1.0f32;  4])),
-        ("lm_head.weight",                "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
-        ("layers.0.self_attn.q_proj.weight", "F32", &[2, 4], f32_bytes(&[1.0f32; 8])),
-    ]);
+    write_model_dir(
+        dir.path(),
+        &[
+            (
+                "embed_tokens.weight",
+                "F32",
+                &[10, 4],
+                f32_bytes(&[1.0f32; 40]),
+            ),
+            ("norm.weight", "F32", &[4], f32_bytes(&[1.0f32; 4])),
+            ("lm_head.weight", "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
+            (
+                "layers.0.self_attn.q_proj.weight",
+                "F32",
+                &[2, 4],
+                f32_bytes(&[1.0f32; 8]),
+            ),
+        ],
+    );
 
     let weights = load_model_dir_filtered(dir.path(), |k| k.contains("q_proj")).unwrap();
-    assert!(!weights.tensors.contains_key("layers.0.self_attn.q_proj.weight"));
+    assert!(!weights
+        .tensors
+        .contains_key("layers.0.self_attn.q_proj.weight"));
     // embed and lm_head are not filtered
     assert_eq!(weights.embed.shape(), &[10, 4]);
 }
@@ -304,34 +598,51 @@ fn filtered_custom_predicate_skips_target() {
 #[test]
 fn unsupported_dtype_goes_to_skipped_tensors() {
     let dir = TempDir::new().unwrap();
-    write_model_dir(dir.path(), &[
-        ("embed_tokens.weight", "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
-        ("norm.weight",         "F32", &[4],     f32_bytes(&[1.0f32;  4])),
-        ("lm_head.weight",      "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
-        // attention_mask is typically I64 — should be skipped, not crash
-        ("attention_mask",      "I64", &[1, 10], i64_bytes(10)),
-    ]);
+    write_model_dir(
+        dir.path(),
+        &[
+            (
+                "embed_tokens.weight",
+                "F32",
+                &[10, 4],
+                f32_bytes(&[1.0f32; 40]),
+            ),
+            ("norm.weight", "F32", &[4], f32_bytes(&[1.0f32; 4])),
+            ("lm_head.weight", "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
+            // attention_mask is typically I64 — should be skipped, not crash
+            ("attention_mask", "I64", &[1, 10], i64_bytes(10)),
+        ],
+    );
 
     let weights = load_model_dir(dir.path()).unwrap();
-    assert!(!weights.skipped_tensors.is_empty(), "I64 tensor should be in skipped_tensors");
+    assert!(
+        !weights.skipped_tensors.is_empty(),
+        "I64 tensor should be in skipped_tensors"
+    );
     let (key, dtype) = &weights.skipped_tensors[0];
     assert_eq!(key, "attention_mask");
-    assert!(dtype.contains("I64"), "dtype string should mention I64, got: {dtype}");
+    assert!(
+        dtype.contains("I64"),
+        "dtype string should mention I64, got: {dtype}"
+    );
 }
 
 #[test]
 fn missing_embed_returns_missing_tensor_error() {
     let dir = TempDir::new().unwrap();
-    write_model_dir(dir.path(), &[
-        // no embed_tokens.weight
-        ("norm.weight",    "F32", &[4],     f32_bytes(&[1.0f32; 4])),
-        ("lm_head.weight", "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
-    ]);
+    write_model_dir(
+        dir.path(),
+        &[
+            // no embed_tokens.weight
+            ("norm.weight", "F32", &[4], f32_bytes(&[1.0f32; 4])),
+            ("lm_head.weight", "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
+        ],
+    );
 
     match load_model_dir(dir.path()) {
         Err(ModelError::MissingTensor(k)) => assert_eq!(k, "embed_tokens.weight"),
         Err(e) => panic!("expected MissingTensor, got error: {e}"),
-        Ok(_)  => panic!("expected error, got Ok"),
+        Ok(_) => panic!("expected error, got Ok"),
     }
 }
 
@@ -339,10 +650,18 @@ fn missing_embed_returns_missing_tensor_error() {
 fn tied_lm_head_falls_back_to_embed() {
     // No lm_head.weight → falls back to embed clone.
     let dir = TempDir::new().unwrap();
-    write_model_dir(dir.path(), &[
-        ("embed_tokens.weight", "F32", &[10, 4], f32_bytes(&[2.0f32; 40])),
-        ("norm.weight",         "F32", &[4],     f32_bytes(&[1.0f32;  4])),
-    ]);
+    write_model_dir(
+        dir.path(),
+        &[
+            (
+                "embed_tokens.weight",
+                "F32",
+                &[10, 4],
+                f32_bytes(&[2.0f32; 40]),
+            ),
+            ("norm.weight", "F32", &[4], f32_bytes(&[1.0f32; 4])),
+        ],
+    );
 
     let weights = load_model_dir(dir.path()).unwrap();
     assert_eq!(weights.lm_head.shape(), &[10, 4]);
@@ -381,7 +700,7 @@ fn no_safetensors_files_returns_error() {
     match load_model_dir(dir.path()) {
         Err(ModelError::NoSafetensors(_)) => {}
         Err(e) => panic!("expected NoSafetensors, got error: {e}"),
-        Ok(_)  => panic!("expected error, got Ok"),
+        Ok(_) => panic!("expected error, got Ok"),
     }
 }
 
@@ -393,7 +712,7 @@ fn non_directory_non_gguf_file_returns_error() {
     match load_model_dir(&path) {
         Err(ModelError::NotADirectory(_)) => {}
         Err(e) => panic!("expected NotADirectory, got error: {e}"),
-        Ok(_)  => panic!("expected error, got Ok"),
+        Ok(_) => panic!("expected error, got Ok"),
     }
 }
 
@@ -423,6 +742,19 @@ fn load_gguf_single_file() {
     let weights = load_model_dir(&path).unwrap();
     assert_eq!(weights.embed.shape(), &[100, 4]);
     assert_eq!(weights.num_layers, 1);
+}
+
+#[test]
+fn load_gguf_walk_only_excludes_ffn_tensor() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("tiny-with-ffn.gguf");
+    write_gguf_with_ffn(&path);
+
+    let weights = load_model_dir_walk_only(&path).unwrap();
+    assert!(!weights
+        .tensors
+        .contains_key("layers.0.mlp.gate_proj.weight"));
+    assert_eq!(weights.embed.shape(), &[100, 4]);
 }
 
 #[test]

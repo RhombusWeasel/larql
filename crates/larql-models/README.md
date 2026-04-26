@@ -173,8 +173,8 @@ src/
     mxfp4.rs          MXFP4 + e8m0 + split_gate_up_experts (GPT-OSS)
 
 tests/
-  test_architectures.rs  Integration tests (65): all 12 architectures, MoE, MLA, bias, scaling, quant, ModelWeights drop methods
-  test_loading.rs        Loading tests (16): synthetic safetensors + GGUF, dtype conversion, error paths
+  test_architectures.rs  Integration tests (66): all 12 architectures, MoE, MLA, bias, scaling, quant, ModelWeights drop methods
+  test_loading.rs        Loading tests (19): synthetic safetensors + GGUF, dtype conversion, walk-only filtering, error paths
 
 examples/
   architecture_demo.rs   Guided tour: detection, keys, sliding window, MoE, quant formats
@@ -185,14 +185,14 @@ examples/
 ## Tests
 
 ```bash
-cargo test -p larql-models           # 259 tests
-cargo llvm-cov --package larql-models --summary-only  # 81.8% line coverage
+cargo test -p larql-models           # 263 tests
+cargo llvm-cov --package larql-models --summary-only  # 87.87% line coverage
 ```
 
-259 tests (178 unit + 65 architecture integration + 16 loading integration) covering:
+263 tests (178 unit + 66 architecture integration + 19 loading integration) covering:
 - All 12 architectures: detection, tensor key patterns, MoE expert formats (PerExpert / PackedMxfp4 / PackedBF16), MLA compression keys, Gemma 2 softcapping + QK norm offsets, Gemma 3 sliding window + dual RoPE, Gemma 4 per-layer geometry (head_dim, KV heads, partial RoPE, KV sharing, PLE, V-norm, K=V), Qwen attention bias, StarCoder2 bias + LayerNorm + non-gated FFN, DeepSeek shared experts + MLA, Granite scaling multipliers, generic fallback
 - Quantization: Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q6_K round-trips, NEON vs scalar parity, fused row-dot vs manual dot, scaled-add correctness, MXFP4 dequant + `split_gate_up_experts`, malformed-input rejection across all dequantizers
-- Loading: synthetic safetensors (F32/F16/BF16 dtype conversion, 1D vectors, walk-only, custom filter, unsupported dtype → `skipped_tensors`, missing embed error, MLX weights/ subdir), synthetic GGUF (metadata parsing, tensor loading, key normalisation, truncated-data rejection, `drop_attn_weights` / `drop_lm_head` / `drop_embed`, `get_packed_bytes`)
+- Loading: synthetic safetensors (F32/F16/BF16 dtype conversion, 1D vectors, walk-only, custom filter, unsupported dtype → `skipped_tensors`, missing embed error, MLX weights/ subdir), synthetic GGUF (metadata parsing, tensor loading, walk-only FFN filtering, key normalisation, truncated-data rejection), GPT-OSS packed MXFP4 walk-only filtering, StarCoder2 FFN filtering, `drop_attn_weights` / `drop_lm_head` / `drop_embed`, `get_packed_bytes`
 
 ## Examples
 
@@ -227,6 +227,7 @@ cargo run -p larql-models --example demo_tensor_keys
 4. **String components** — no domain-specific enums (component names are `&str`)
 5. **Format-agnostic** — safetensors and GGUF produce the same `ModelWeights`
 6. **Multimodal-aware** — config parsing handles nested `text_config` automatically
+7. **Centralized format strings** — loader suffixes, GGUF metadata keys, and key rewrites live in constants/helpers instead of scattered literals
 
 ## License
 

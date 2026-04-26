@@ -7,6 +7,11 @@
 //! The hook: `ComputeBackend::decode_token_with_moe(layers, x, ..., moe_fn)`
 //! where `moe_fn(layer, h_post_attn) -> Vec<f32>` calls
 //! `RemoteMoeBackend::forward_moe`.
+//!
+//! # Diagnostics
+//!
+//! Set `SKIP_MOE=1` to zero out the expert block on every decode step.
+//! This isolates whether errors come from remote dispatch vs. dense FFN.
 
 use larql_compute::prelude::*;
 use larql_models::ModelWeights;
@@ -42,8 +47,6 @@ pub fn generate_with_remote_moe(
     let eps = arch.norm_eps();
     let hidden = weights.hidden_size;
     let num_layers = weights.num_layers;
-
-    let eos_id: u32 = 1;
 
     // ── Build pipeline layers (same as generate()) ────────────────────────────
     let gate_index: &dyn larql_vindex::GateIndex = index;
@@ -123,7 +126,11 @@ pub fn generate_with_remote_moe(
         .unwrap_or_else(|| format!("<{first_id}>"));
     tokens.push(first_tok);
     current_ids.push(first_id);
-    if first_id == eos_id || tokens.len() >= max_tokens {
+    let first_is_eos = crate::vindex::is_end_of_turn(
+        crate::tokenizer::decode_token(tokenizer, first_id)
+            .unwrap_or_default().trim()
+    );
+    if first_is_eos || tokens.len() >= max_tokens {
         return Ok(GridGenerateResult { tokens, decode_ms: vec![0.0] });
     }
 
@@ -218,10 +225,10 @@ pub fn generate_with_remote_moe(
         decode_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         let tok_str = crate::tokenizer::decode_token(tokenizer, next_id)
             .unwrap_or_else(|| format!("<{next_id}>"));
+        let is_eos = crate::vindex::is_end_of_turn(tok_str.trim());
         tokens.push(tok_str);
         current_ids.push(next_id);
-
-        if next_id == eos_id { break; }
+        if is_eos { break; }
     }
 
     Ok(GridGenerateResult { tokens, decode_ms })

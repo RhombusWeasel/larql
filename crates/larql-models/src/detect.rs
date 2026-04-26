@@ -119,7 +119,11 @@ fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
 
     // Pick defaults based on model type.
     let is_gemma = model_type.starts_with("gemma");
-    let rope_default = if is_gemma { ROPE_BASE_GEMMA } else { ROPE_BASE_DEFAULT };
+    let rope_default = if is_gemma {
+        ROPE_BASE_GEMMA
+    } else {
+        ROPE_BASE_DEFAULT
+    };
 
     let num_layers = text_config["num_hidden_layers"].as_u64().unwrap_or(32) as usize;
     let hidden_size = text_config["hidden_size"].as_u64().unwrap_or(2048) as usize;
@@ -525,10 +529,7 @@ mod tests {
         assert_eq!(arch.num_experts(), 128);
         assert_eq!(arch.num_experts_per_token(), 8);
         assert_eq!(arch.moe_intermediate_size(), 768);
-        assert_eq!(
-            arch.moe_router_key(0).unwrap(),
-            "layers.0.mlp.gate.weight"
-        );
+        assert_eq!(arch.moe_router_key(0).unwrap(), "layers.0.mlp.gate.weight");
         assert_eq!(
             arch.expert_ffn_gate_key(0, 5).unwrap(),
             "layers.0.mlp.experts.5.gate_proj.weight"
@@ -1126,7 +1127,7 @@ mod tests {
         // sliding layers still ship v_proj in safetensors.
         assert!(arch.config().attention_k_eq_v);
         assert!(!arch.v_shares_k(0)); // sliding
-        assert!(arch.v_shares_k(5));  // global
+        assert!(arch.v_shares_k(5)); // global
 
         // V-norm (parameter-free RMSNorm on V states)
         assert!(arch.has_v_norm());

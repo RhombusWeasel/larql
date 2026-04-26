@@ -1,8 +1,22 @@
 # Roadmap — larql-models
 
-## Current: 12 architectures, 221 tests, safetensors + GGUF loading
+## Current: 12 architectures, 263 tests, safetensors + GGUF loading, 87.87% line / 85.53% function coverage
 
 ## P0: Code Quality (from 2026-04-26 review)
+
+### Fix walk-only filtering for GGUF loading
+**Impact**: `load_model_dir_walk_only` claims to skip FFN tensors before decode, but GGUF inputs call `load_gguf` directly and ignore the filter predicate. Walk-only GGUF loads/dequantizes all FFN tensors, defeating the peak-RSS protection used by vindex-backed FFN inference.
+**Effort**: Medium
+**Status**: Done 2026-04-26
+
+Threaded the `skip_key` predicate through the GGUF loader path, including both single-file GGUF and directory-with-GGUF detection. Added `load_gguf_walk_only_excludes_ffn_tensor`, a synthetic GGUF regression test proving `load_model_dir_walk_only` excludes an FFN tensor.
+
+### Fix GPT-OSS MXFP4 walk-only peak memory
+**Impact**: The packed MXFP4 branch dequantizes every expert into f32 before `skip_key` is consulted. GPT-OSS walk-only therefore still expands packed FFN experts and can hit the same memory spike the filtered loader is meant to avoid.
+**Effort**: Medium
+**Status**: Done 2026-04-26
+
+Made `load_mxfp4_expert_tensors` predicate-aware so packed expert dequantization is skipped when generated expert keys are filtered. Added `walk_only_excludes_gpt_oss_packed_mxfp4_experts` on a minimal GPT-OSS-style packed MXFP4 shard.
 
 ### Fix silent dtype skip in safetensors loader
 **Impact**: Unsupported dtypes drop silently — no warning, no error  
@@ -43,6 +57,13 @@ Tests added:
 **Decision**: `larql-models/quant/` is **format deserialization** (GGUF/safetensors → f32). `larql-compute` has **compute operations** (quantized matvec, Metal shaders). The split is correct. The `f16_to_f32` copies in `larql-compute/cpu/ops/q4k_matvec.rs` and `q6k_matvec.rs` are intentional — CPU reference impls for Metal shader testing, isolated by design. `larql-compute` is dev-only dep; don't flip that direction.
 
 ## P1: Architecture Coverage
+
+### StarCoder2 walk-only FFN classification
+**Impact**: StarCoder2 uses `mlp.c_fc` / `mlp.c_proj`, but `FFN_TENSOR_PATTERNS` only matches gate/up/down naming. `load_model_dir_walk_only` and `drop_ffn_weights` retain StarCoder2 FFN tensors.
+**Effort**: Low
+**Status**: Done 2026-04-26
+
+Extended the shared FFN classifier to include StarCoder2's FFN names. Added tests proving both safetensors walk-only filtering and `drop_ffn_weights` remove `mlp.c_fc` / `mlp.c_proj` weights and biases.
 
 ### Phi-3 / Phi-4
 **Effort**: Low  
@@ -127,6 +148,9 @@ Add a `validate()` method to `ModelArchitecture` that checks for inconsistencies
 | normalize_key_pub removed | 2026-04-26 | Dead wrapper gone; `normalize_key` is `pub(crate)` |
 | Config alias constants | 2026-04-26 | `NUM_EXPERTS_KEYS`, `NUM_EXPERTS_PER_TOK_KEYS`, `field_u64` helper in `detect.rs` |
 | MXFP4 consolidation | 2026-04-26 | `split_gate_up_experts` in `quant/mxfp4.rs`; loader thinned + renamed |
+| Walk-only loader fixes | 2026-04-26 | GGUF filtering, GPT-OSS MXFP4 predicate-aware expansion, StarCoder2 c_fc/c_proj classification |
+| Loader magic-string cleanup | 2026-04-26 | Centralized GGUF metadata/key rewrites, MXFP4 suffixes, HF cache path fragments, packed expert keys |
+| Coverage baseline refresh | 2026-04-26 | 263 tests; 87.87% line / 85.53% function coverage after `cargo llvm-cov clean --workspace` |
 | Clippy clean (zero warnings) | 2026-04-07 | lib + examples + tests all pass `-D warnings` |
 | Documentation suite | 2026-04-07 | README, ROADMAP, PERFORMANCE, 3 docs, 6 ADRs |
 | Example suite (3 demos) | 2026-04-07 | architecture_demo (all 12), demo_tensor_keys (all 12), demo_loading |
