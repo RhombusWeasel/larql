@@ -70,6 +70,10 @@ impl MatMul for MetalBackend {
         MetalBackend::f32_gemv_topk1(self, w, x)
     }
 
+    fn f16_gemv_topk1(&self, w_f16: &[u8], x: &[f32], n: usize, k: usize) -> Option<(u32, f32)> {
+        MetalBackend::f16_gemv_topk1(self, w_f16, x, n, k)
+    }
+
     fn matmul_batch(&self, ops: &[MatMulOp]) -> Vec<Array2<f32>> {
         ops.iter()
             .map(|op| {
@@ -151,22 +155,13 @@ impl MetalBackend {
         let x_buf = self.bufs.transient_from_f32(x);
         let scores = self.bufs.output((n * 4) as u64);
 
-        // Phase 1: f32_gemv
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+
         let kh = &self.f32_gemv_pipeline;
         let n_u32 = n as u32;
         let k_u32 = k as u32;
         let gemv_tgs = (n as u64).div_ceil(kh.rows_per_tg);
-
-        // Phase 2: f32_argmax_partial — TG size = 256, one TG per 256 scores.
-        const ARGMAX_TG_SZ: u64 = 256;
-        let argmax_tgs = (n as u64).div_ceil(ARGMAX_TG_SZ);
-        let partial_vals = self.bufs.output(argmax_tgs * 4); // f32 per TG
-        let partial_idxs = self.bufs.output(argmax_tgs * 4); // u32 per TG
-
-        let cmd = self.queue.new_command_buffer();
-        let enc = cmd.new_compute_command_encoder();
-
-        // gemv dispatch
         enc.set_compute_pipeline_state(&kh.state);
         enc.set_buffer(0, Some(&w_buf), 0);
         enc.set_buffer(1, Some(&x_buf), 0);
@@ -178,9 +173,74 @@ impl MetalBackend {
             metal::MTLSize::new(kh.threads_per_tg, 1, 1),
         );
 
-        // argmax partial dispatch
+        let (partial_vals, partial_idxs, n_partials) = self.encode_argmax_partial(enc, &scores, n);
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        Self::reduce_argmax_partial(&partial_vals, &partial_idxs, n_partials)
+    }
+
+    /// f16 gemv + GPU argmax. Mirrors `f32_gemv_topk1` for the tied-embed
+    /// lm_head path on Gemma 3/4 (mmap'd `embeddings.bin` reused as f16
+    /// lm_head). Saves the 1MB readback + 262K-element CPU sort that
+    /// `f16_gemv` + `top_k_sorted` would otherwise spend on each greedy
+    /// decode step.
+    pub fn f16_gemv_topk1(
+        &self,
+        w_f16: &[u8],
+        x: &[f32],
+        n: usize,
+        k: usize,
+    ) -> Option<(u32, f32)> {
+        if w_f16.len() < n * k * 2 || x.len() != k || n == 0 {
+            return None;
+        }
+        let w_buf = self.bufs.get_bytes(w_f16);
+        let x_buf = self.bufs.transient_from_f32(x);
+        let scores = self.bufs.output((n * 4) as u64);
+
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+
+        let kh = &self.f16_gemv_pipeline;
+        let n_u32 = n as u32;
+        let k_u32 = k as u32;
+        let gemv_tgs = (n as u64).div_ceil(kh.rows_per_tg);
+        enc.set_compute_pipeline_state(&kh.state);
+        enc.set_buffer(0, Some(&w_buf), 0);
+        enc.set_buffer(1, Some(&x_buf), 0);
+        enc.set_buffer(2, Some(&scores), 0);
+        enc.set_bytes(3, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            metal::MTLSize::new(gemv_tgs, 1, 1),
+            metal::MTLSize::new(kh.threads_per_tg, 1, 1),
+        );
+
+        let (partial_vals, partial_idxs, n_partials) = self.encode_argmax_partial(enc, &scores, n);
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        Self::reduce_argmax_partial(&partial_vals, &partial_idxs, n_partials)
+    }
+
+    /// Encode `f32_argmax_partial` over `scores[..n]` into `enc`. Returns
+    /// the (vals_buf, idxs_buf, n_partials) needed for `reduce_argmax_partial`
+    /// once the command buffer commits. The encoder is left active for any
+    /// downstream dispatches the caller wants to add (none today).
+    pub(crate) fn encode_argmax_partial(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        scores: &metal::Buffer,
+        n: usize,
+    ) -> (metal::Buffer, metal::Buffer, usize) {
+        const ARGMAX_TG_SZ: u64 = 256;
+        let argmax_tgs = (n as u64).div_ceil(ARGMAX_TG_SZ);
+        let partial_vals = self.bufs.output(argmax_tgs * 4);
+        let partial_idxs = self.bufs.output(argmax_tgs * 4);
+        let n_u32 = n as u32;
         enc.set_compute_pipeline_state(&self.f32_argmax_partial_pipeline);
-        enc.set_buffer(0, Some(&scores), 0);
+        enc.set_buffer(0, Some(scores), 0);
         enc.set_buffer(1, Some(&partial_vals), 0);
         enc.set_buffer(2, Some(&partial_idxs), 0);
         enc.set_bytes(3, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
@@ -188,19 +248,23 @@ impl MetalBackend {
             metal::MTLSize::new(argmax_tgs, 1, 1),
             metal::MTLSize::new(ARGMAX_TG_SZ, 1, 1),
         );
+        (partial_vals, partial_idxs, argmax_tgs as usize)
+    }
 
-        enc.end_encoding();
-        cmd.commit();
-        cmd.wait_until_completed();
-
-        // CPU final reduction over ≤1024 partial results (8 KB readback).
-        let n_partials = argmax_tgs as usize;
-        let vals = crate::metal::buffers::read_buffer_f32(&partial_vals, n_partials);
-        let idxs_raw = {
+    /// CPU side of the argmax_partial pipeline: read back ≤1024 partial
+    /// (val, idx) pairs (≤8 KB) and pick the global maximum. The caller
+    /// must have committed and waited on the command buffer that wrote
+    /// `partial_vals` / `partial_idxs`.
+    pub(crate) fn reduce_argmax_partial(
+        partial_vals: &metal::Buffer,
+        partial_idxs: &metal::Buffer,
+        n_partials: usize,
+    ) -> Option<(u32, f32)> {
+        let vals = crate::metal::buffers::read_buffer_f32(partial_vals, n_partials);
+        let idxs_raw = unsafe {
             let ptr = partial_idxs.contents() as *const u32;
-            unsafe { std::slice::from_raw_parts(ptr, n_partials) }.to_vec()
+            std::slice::from_raw_parts(ptr, n_partials)
         };
-
         let (best_idx, best_val) = vals
             .iter()
             .copied()
@@ -213,7 +277,6 @@ impl MetalBackend {
                     (bi, bv)
                 }
             });
-
         if best_val == f32::NEG_INFINITY {
             return None;
         }

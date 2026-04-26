@@ -557,10 +557,67 @@ weight cache utilisation. GPU layer_scalar skipped for MoE layers in the
 dispatch; the callback applies it correctly after combining dense + MoE.
 `kv_copy::populate_kv_one_layer` added for per-layer KV cache population.
 
-### GPU expert dispatch — Phase 2: pre-allocated staging buffers (open)
+### GPU expert dispatch — Phase 2: pre-allocated staging buffers (ACTIVE 2026-04-26)
 
-**Status**: Open — the single remaining fix to reach ~15–20 tok/s on Gemma 4 26B A4B  
+**Status**: ACTIVE — the single remaining fix to reach ~15–20 tok/s on Gemma 4 26B A4B  
 **Measured**: Phase 1 shipped 5.1 tok/s. Phase 2 expected ~4× gain. GPU-only ceiling: 56.8 tok/s.
+
+**Scope (single landing):**
+
+1. **Pre-allocate persistent staging buffers** in `decode_token_q4k_moe`
+   (`metal/moe_dispatch.rs`). Sizes are constants of `(top_k, inter_padded,
+   hidden, row_bytes, down_row_bytes)` — known once per decode, not per layer.
+   Buffers to pre-allocate (all `StorageModeShared` so CPU writes via
+   `buffer.contents()`):
+   - `gate_buf`: `top_k × inter × row_bytes`
+   - `up_buf`: `top_k × inter × row_bytes`
+   - `down_bufs`: `top_k` × `[hidden × down_row_bytes]` (per-expert; experts
+     come from different mmap pages, so K independent staging buffers — not
+     a single concatenated one).
+   - `g_out`, `u_out`: `top_k × inter × 4`
+   - `act_buf`: `top_k × inter_padded × 4`, zero-initialised once
+   - `expert_outs`: `top_k × hidden × 4`
+
+   `gpu_moe_dispatch` becomes `gpu_moe_dispatch_with_scratch(scratch, ...)`;
+   the per-call body just memcpys expert bytes into the existing buffer
+   contents and dispatches. No `self.bufs.output(...)` calls inside the
+   per-layer hot path.
+
+2. **Fix activation-stride bug** (P0 correctness blocker #3 in this file).
+   Today: `act_buf` allocated at `valid_count × inter_padded × 4`, but the
+   geglu kernel writes linearly at stride `inter`. For
+   `moe_intermediate_size` not a multiple of 256 (e.g. Gemma 4 26B's 2112 →
+   inter_padded 2304), expert `e>0` reads stale/garbage floats. Fix:
+   dispatch `geglu_gelu_tanh` per expert with `g_out`/`u_out` linear offset
+   `e × inter × 4` and `act_buf` strided offset `e × inter_padded × 4`. K
+   extra dispatches per layer (top_k=8 → 8 small dispatches) but each is
+   ~5µs — negligible vs the ~120ms allocation overhead this PR removes.
+   Alternative: stride-aware kernel — defer if perf demands it post-bench.
+
+3. **Borrow expert slices instead of `to_vec()`** (host-copy churn). Today
+   `larql-inference::layer_graph::generate::gpu` allocates two
+   `Vec<u8>` per expert per layer (~2.2 MB heap-copy × 30 layers × 8 experts
+   per token). Change `get_expert: impl Fn(layer, expert) -> Option<(Vec<u8>,
+   Vec<u8>)>` to return `Option<(&[u8], &[u8])>`. Lifetime-bound to the
+   weights mmap — borrow lasts only across the `gpu_moe_dispatch` call.
+   Updates `decode_token_q4k_moe` signature + the inference-side caller.
+
+4. **Add parity test** `gpu_moe_dispatch` Q4_K experts with
+   - aligned `inter` (e.g. 768),
+   - misaligned `inter` requiring padding (e.g. 704),
+   - `valid_count < top_k` (some experts return None),
+   against CPU MoE reference.
+
+**Acceptance criteria**:
+- `cargo test -p larql-compute --features metal` green (existing + new parity).
+- `larql bench gemma4-26b-a4b` ≥ 15 tok/s (3× from baseline 5.1).
+- No regression on `larql bench gemma3-4b-q4k-v2` (dense path untouched).
+
+**Out of scope for this PR**: dense kernel optimisation, fused
+QKV V-path correctness blocker (#2), the expert-bytes-→-Metal-buffer copy
+itself (already a single memcpy via `contents()` ptr; can't shrink further
+without DMA-side weights, which is a larger refactor).
+
 
 **Root cause of remaining gap.** `gpu_moe_dispatch` calls `self.bufs.output()` ~10 times per
 MoE layer to allocate gate, up, per-expert-down, activation, and output Metal buffers.

@@ -201,6 +201,48 @@ fn q4_matvec_small_matrix() {
 }
 
 #[test]
+fn q4_matvec_topk1_matches_full_argmax() {
+    let metal = get_metal();
+    let hidden = 2560;
+    let rows = 10240;
+
+    let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.001).sin()).collect();
+    let matrix: Vec<f32> = (0..rows * hidden)
+        .map(|i| (i as f32 * 0.0001).cos())
+        .collect();
+    let q4_data = quantize_q4_0(&matrix);
+    let (q8_x, q8_scales) = q4::quantize_to_q8(&x);
+
+    use larql_compute::QuantMatVec;
+    let topk1 = metal
+        .q4_matvec_topk1(&q4_data, &q8_x, &q8_scales, rows, hidden)
+        .expect("metal must produce a top-1 result");
+
+    let scores = metal
+        .q4_matvec(&q4_data, &q8_x, &q8_scales, rows, hidden)
+        .expect("metal must produce scores");
+    let (best_i, best_v) = scores
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.is_finite())
+        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+            if v > bv {
+                (i, v)
+            } else {
+                (bi, bv)
+            }
+        });
+
+    assert_eq!(topk1.0 as usize, best_i, "topk1 idx mismatches argmax");
+    assert!(
+        (topk1.1 - best_v).abs() < 1e-3,
+        "topk1 score {} vs argmax {}",
+        topk1.1,
+        best_v
+    );
+}
+
+#[test]
 fn q4_matvec_zero_input() {
     let metal = get_metal();
     let hidden = 256;

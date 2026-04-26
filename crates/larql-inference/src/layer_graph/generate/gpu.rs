@@ -172,9 +172,7 @@ pub fn generate(
                             rope,
                             norm_eps,
                             |layer_idx, expert_idx| {
-                                let (gu, dn) =
-                                    weights.get_layer_entry_bytes(layer_idx, expert_idx)?;
-                                Some((gu.to_vec(), dn.to_vec()))
+                                weights.get_layer_entry_bytes(layer_idx, expert_idx)
                             },
                         )
                         .unwrap_or_else(|| vec![0.0f32; hidden]);
@@ -382,10 +380,7 @@ pub fn generate(
                     weights.head_dim,
                     rope,
                     norm_eps,
-                    |layer_idx, expert_idx| {
-                        let (gu, dn) = weights.get_layer_entry_bytes(layer_idx, expert_idx)?;
-                        Some((gu.to_vec(), dn.to_vec()))
-                    },
+                    |layer_idx, expert_idx| weights.get_layer_entry_bytes(layer_idx, expert_idx),
                 )
             } else {
                 backend.decode_token(

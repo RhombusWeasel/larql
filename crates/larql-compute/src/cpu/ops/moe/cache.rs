@@ -105,18 +105,39 @@ fn cell() -> &'static Mutex<Inner> {
     })
 }
 
-/// Return a cached Arc<Vec<f32>> for `bytes` (the BF16 packed expert slice),
-/// dequantising + inserting on miss. On hit, no allocation happens.
-pub(super) fn cached_dequant(bytes: &[u8]) -> ExpertF32 {
+/// Return a cached Arc<Vec<f32>> for `bytes`, dequantising under `format` on
+/// miss. `expected_floats` is required for block formats (Q4_K) where the
+/// output length is not derivable from the input length without padding info;
+/// it's ignored for raw BF16. On hit, no allocation happens.
+pub(super) fn cached_dequant(
+    bytes: &[u8],
+    format: crate::QuantFormat,
+    expected_floats: usize,
+) -> ExpertF32 {
     let key = cache_key(bytes);
-    // Fast path: read-only hit under the mutex.
+    // Fast path: read-only hit under the mutex. Cache key is just the byte
+    // slice identity — same bytes always dequant to the same output.
     if let Ok(mut inner) = cell().lock() {
         if let Some(hit) = inner.get(key) {
             return hit;
         }
     }
     // Miss: dequantise OUTSIDE the lock, then insert.
-    let decoded = super::math::bf16_to_f32(bytes);
+    let decoded = match format {
+        crate::QuantFormat::BF16 => super::math::bf16_to_f32(bytes),
+        crate::QuantFormat::Q4_K => {
+            crate::cpu::ops::q4_common::dequantize_q4_k(bytes, expected_floats)
+        }
+        crate::QuantFormat::F32 => bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        _ => {
+            // Other formats not yet wired into the CPU MoE expert path.
+            // Empty fallback → caller treats as a skipped expert.
+            Vec::new()
+        }
+    };
     let arc = Arc::new(decoded);
     if let Ok(mut inner) = cell().lock() {
         inner.insert(key, arc.clone());

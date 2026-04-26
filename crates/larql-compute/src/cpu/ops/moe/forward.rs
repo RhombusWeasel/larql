@@ -18,14 +18,6 @@ use crate::MoeLayerWeights;
 use super::cache::cached_dequant;
 use super::math::{gelu_tanh, matmul_vec, rms_norm, rms_norm_no_weight, silu, softmax, top_k};
 
-/// Slice the byte range for one expert out of a packed BF16 tensor.
-/// Packed layout: `[num_experts, out_rows, in_cols]`, 2 bytes per value.
-fn expert_byte_slice(packed: &[u8], expert_idx: usize, out_rows: usize, in_cols: usize) -> &[u8] {
-    let bytes_per_expert = out_rows * in_cols * 2;
-    let start = expert_idx * bytes_per_expert;
-    &packed[start..start + bytes_per_expert]
-}
-
 /// Run the MoE expert block for one token.
 ///
 /// `h` — residual stream at this layer (hidden_size f32 values).
@@ -154,6 +146,14 @@ pub fn cpu_moe_forward(
     //    down layout:    [num_experts, hidden, inter]
     use rayon::prelude::*;
     let activation = moe.activation;
+    let format = moe.expert_data_format;
+    // Q4_K rounds inner dim up to a multiple of 256. For Gemma 4 MoE
+    // (inter=704), the dequantised matrix is 768 wide; we matmul the
+    // first `inter` columns. BF16 has no padding.
+    let (inter_dequant, inter_matmul) = match format {
+        crate::QuantFormat::Q4_K => (inter.div_ceil(256) * 256, inter),
+        _ => (inter, inter),
+    };
     let per_expert: Vec<(f32, Vec<f32>)> = expert_indices
         .par_iter()
         .zip(expert_weights.par_iter())
@@ -161,31 +161,37 @@ pub fn cpu_moe_forward(
             if weight == 0.0 {
                 return None;
             }
+            // Per-expert byte slices come straight from the mmap-backed
+            // tables; cached_dequant LRU-keys on the byte pointer so a
+            // re-selected expert skips both allocation and decode.
+            let gate_up_bytes = *moe.experts_gate_up.get(ei)?;
+            let gate_up_w = cached_dequant(gate_up_bytes, format, 2 * inter_dequant * hidden);
+            if gate_up_w.is_empty() {
+                return None;
+            }
+            let gate_w = &gate_up_w[..inter_dequant * hidden];
+            let up_w = &gate_up_w[inter_dequant * hidden..];
 
-            // Dequantise with LRU caching keyed by the mmap byte pointer.
-            // Re-selected experts skip both the 312 MB allocation and the
-            // BF16 → f32 conversion — the dominant cost on the scalar path.
-            let gate_up_bytes = expert_byte_slice(moe.experts_gate_up, ei, 2 * inter, hidden);
-            let gate_up_w = cached_dequant(gate_up_bytes);
-            let gate_w = &gate_up_w[..inter * hidden];
-            let up_w = &gate_up_w[inter * hidden..];
-
-            let gate_out = matmul_vec(&h_norm, gate_w, inter, hidden);
-            let up_out = matmul_vec(&h_norm, up_w, inter, hidden);
+            let gate_out = matmul_vec(&h_norm, gate_w, inter_dequant, hidden);
+            let up_out = matmul_vec(&h_norm, up_w, inter_dequant, hidden);
 
             // Gated activation: ACT(gate) * up.  Gemma 4 uses GELU-tanh; Mixtral uses SiLU.
             let hidden_state: Vec<f32> = gate_out
                 .iter()
                 .zip(up_out.iter())
+                .take(inter)
                 .map(|(&g, &u)| match activation {
                     crate::Activation::GeluTanh => gelu_tanh(g) * u,
                     _ => silu(g) * u,
                 })
                 .collect();
 
-            let down_bytes = expert_byte_slice(moe.experts_down, ei, hidden, inter);
-            let down_w = cached_dequant(down_bytes);
-            let expert_contribution = matmul_vec(&hidden_state, &down_w, hidden, inter);
+            let down_bytes = *moe.experts_down.get(ei)?;
+            let down_w = cached_dequant(down_bytes, format, hidden * inter_dequant);
+            if down_w.is_empty() {
+                return None;
+            }
+            let expert_contribution = matmul_vec(&hidden_state, &down_w, hidden, inter_matmul);
             Some((weight, expert_contribution))
         })
         .collect();

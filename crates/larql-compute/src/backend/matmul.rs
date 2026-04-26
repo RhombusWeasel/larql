@@ -54,6 +54,20 @@ pub trait MatMul {
         None
     }
 
+    /// f16 gemv + GPU argmax. Used by the lm_head greedy-decode path on
+    /// tied-embed models (Gemma 3/4) where the f16 mmap'd embeddings are
+    /// the lm_head matrix and the bench / production both pick top-1.
+    /// Returns `None` if not specialised.
+    fn f16_gemv_topk1(
+        &self,
+        _w_f16: &[u8],
+        _x: &[f32],
+        _n: usize,
+        _k: usize,
+    ) -> Option<(u32, f32)> {
+        None
+    }
+
     /// Like [`Self::f32_gemv`] but skips the internal CPU-vs-GPU flop
     /// threshold. Use when the caller has already decided the work is
     /// worth a GPU dispatch — e.g. the per-layer gate matmul that fires

@@ -8,23 +8,21 @@
 use super::cache::cached_dequant;
 use super::math::{gelu_tanh, matmul_vec, rms_norm, silu};
 
-fn expert_byte_slice(packed: &[u8], expert_idx: usize, out_rows: usize, in_cols: usize) -> &[u8] {
-    let bytes_per_expert = out_rows * in_cols * 2;
-    let start = expert_idx * bytes_per_expert;
-    &packed[start..start + bytes_per_expert]
-}
-
 /// Run a single expert's gated FFN given a pre-normed input vector.
 ///
-/// Returns the expert's output (not yet weighted by router probability).
-/// `h_norm` must already be RMS-normed — use `run_single_expert_with_norm`
-/// when you have the raw residual.
+/// `gate_up_bytes` and `down_bytes` carry exactly one expert's weights — the
+/// caller picks the right per-expert byte range (per-layer `layers/{L}/{e}`
+/// mmap entries or a stride into a legacy monolith). `format` tells the
+/// dequantiser how to decode them. Returns the expert's output (not yet
+/// weighted by router probability). `h_norm` must already be RMS-normed —
+/// use `run_single_expert_with_norm` when you have the raw residual.
+#[allow(clippy::too_many_arguments)]
 pub fn run_single_expert(
     h_norm: &[f32],
-    experts_gate_up: &[u8],
-    experts_down: &[u8],
-    expert_idx: usize,
+    gate_up_bytes: &[u8],
+    down_bytes: &[u8],
     inter: usize,
+    format: crate::QuantFormat,
     activation: crate::Activation,
 ) -> Vec<f32> {
     let hidden = h_norm.len();
@@ -32,26 +30,39 @@ pub fn run_single_expert(
         return vec![0.0f32; hidden];
     }
 
-    let gate_up_bytes = expert_byte_slice(experts_gate_up, expert_idx, 2 * inter, hidden);
-    let gate_up_w = cached_dequant(gate_up_bytes);
-    let gate_w = &gate_up_w[..inter * hidden];
-    let up_w = &gate_up_w[inter * hidden..];
+    // Q4_K rounds inner dim up to a multiple of 256. Gemma 4 MoE has
+    // inter=704, so the dequantised matrix is 768 wide; matmul reads the
+    // first `inter` columns. BF16 has no padding.
+    let (inter_dequant, inter_matmul) = match format {
+        crate::QuantFormat::Q4_K => (inter.div_ceil(256) * 256, inter),
+        _ => (inter, inter),
+    };
 
-    let gate_out = matmul_vec(h_norm, gate_w, inter, hidden);
-    let up_out = matmul_vec(h_norm, up_w, inter, hidden);
+    let gate_up_w = cached_dequant(gate_up_bytes, format, 2 * inter_dequant * hidden);
+    if gate_up_w.is_empty() {
+        return vec![0.0f32; hidden];
+    }
+    let gate_w = &gate_up_w[..inter_dequant * hidden];
+    let up_w = &gate_up_w[inter_dequant * hidden..];
+
+    let gate_out = matmul_vec(h_norm, gate_w, inter_dequant, hidden);
+    let up_out = matmul_vec(h_norm, up_w, inter_dequant, hidden);
 
     let hidden_state: Vec<f32> = gate_out
         .iter()
         .zip(up_out.iter())
+        .take(inter)
         .map(|(&g, &u)| match activation {
             crate::Activation::GeluTanh => gelu_tanh(g) * u,
             _ => silu(g) * u,
         })
         .collect();
 
-    let down_bytes = expert_byte_slice(experts_down, expert_idx, hidden, inter);
-    let down_w = cached_dequant(down_bytes);
-    matmul_vec(&hidden_state, &down_w, hidden, inter)
+    let down_w = cached_dequant(down_bytes, format, hidden * inter_dequant);
+    if down_w.is_empty() {
+        return vec![0.0f32; hidden];
+    }
+    matmul_vec(&hidden_state, &down_w, hidden, inter_matmul)
 }
 
 /// Apply pre-experts norm then run a single expert. Used by the remote
@@ -59,22 +70,22 @@ pub fn run_single_expert(
 #[allow(clippy::too_many_arguments)]
 pub fn run_single_expert_with_norm(
     h: &[f32],
-    experts_gate_up: &[u8],
-    experts_down: &[u8],
-    expert_idx: usize,
+    gate_up_bytes: &[u8],
+    down_bytes: &[u8],
     inter: usize,
     pre_experts_norm: &[f32],
     norm_offset: f32,
     eps: f32,
+    format: crate::QuantFormat,
     activation: crate::Activation,
 ) -> Vec<f32> {
     let h_norm = rms_norm(h, pre_experts_norm, eps, norm_offset);
     run_single_expert(
         &h_norm,
-        experts_gate_up,
-        experts_down,
-        expert_idx,
+        gate_up_bytes,
+        down_bytes,
         inter,
+        format,
         activation,
     )
 }
@@ -82,7 +93,7 @@ pub fn run_single_expert_with_norm(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Activation;
+    use crate::{Activation, QuantFormat};
 
     // BF16 encoding for common values (little-endian: low byte first).
     fn bf16_bytes(v: f32) -> [u8; 2] {
@@ -104,14 +115,14 @@ mod tests {
     #[test]
     fn zero_inter_returns_zero_vec() {
         let h = vec![1.0f32; 4];
-        let out = run_single_expert(&h, &[], &[], 0, 0, Activation::Silu);
+        let out = run_single_expert(&h, &[], &[], 0, QuantFormat::BF16, Activation::Silu);
         assert_eq!(out, vec![0.0f32; 4]);
     }
 
     #[test]
     fn zero_hidden_returns_empty() {
         let h: Vec<f32> = vec![];
-        let out = run_single_expert(&h, &[], &[], 0, 0, Activation::Silu);
+        let out = run_single_expert(&h, &[], &[], 0, QuantFormat::BF16, Activation::Silu);
         assert_eq!(out.len(), 0);
     }
 
@@ -119,11 +130,18 @@ mod tests {
     fn nonzero_weights_produce_nonzero_output() {
         let hidden = 4;
         let inter = 2;
-        // gate_up: [2*inter, hidden], down: [hidden, inter] — all 1.0 BF16
+        // One expert's worth of all-1.0 BF16 weights.
         let gate_up = fill_bf16(2 * inter * hidden, 1.0);
         let down = fill_bf16(hidden * inter, 1.0);
         let h = vec![1.0f32; hidden];
-        let out = run_single_expert(&h, &gate_up, &down, 0, inter, Activation::Silu);
+        let out = run_single_expert(
+            &h,
+            &gate_up,
+            &down,
+            inter,
+            QuantFormat::BF16,
+            Activation::Silu,
+        );
         assert_eq!(out.len(), hidden);
         assert!(
             out.iter().any(|v| v.abs() > 0.01),
@@ -141,7 +159,6 @@ mod tests {
         let norm_w = vec![1.0f32; hidden];
         let eps = 1e-6_f32;
 
-        // Manually apply RMS norm: h_norm[i] = h[i] / rms * w[i]
         let rms = (h.iter().map(|v| v * v).sum::<f32>() / h.len() as f32 + eps).sqrt();
         let h_normed: Vec<f32> = h
             .iter()
@@ -149,16 +166,23 @@ mod tests {
             .map(|(&x, &w)| x / rms * w)
             .collect();
 
-        let direct = run_single_expert(&h_normed, &gate_up, &down, 0, inter, Activation::Silu);
+        let direct = run_single_expert(
+            &h_normed,
+            &gate_up,
+            &down,
+            inter,
+            QuantFormat::BF16,
+            Activation::Silu,
+        );
         let via_norm = run_single_expert_with_norm(
             &h,
             &gate_up,
             &down,
-            0,
             inter,
             &norm_w,
             0.0,
             eps,
+            QuantFormat::BF16,
             Activation::Silu,
         );
 
@@ -175,14 +199,27 @@ mod tests {
 
     #[test]
     fn gelu_tanh_differs_from_silu() {
-        // Use h = [0.5; 4]: gate_out = 2.0 per row, where silu(2) ≠ gelu_tanh(2)
         let hidden = 4;
         let inter = 2;
         let gate_up = fill_bf16(2 * inter * hidden, 1.0);
         let down = fill_bf16(hidden * inter, 1.0);
         let h = vec![0.5f32; hidden];
-        let silu_out = run_single_expert(&h, &gate_up, &down, 0, inter, Activation::Silu);
-        let gelu_out = run_single_expert(&h, &gate_up, &down, 0, inter, Activation::GeluTanh);
+        let silu_out = run_single_expert(
+            &h,
+            &gate_up,
+            &down,
+            inter,
+            QuantFormat::BF16,
+            Activation::Silu,
+        );
+        let gelu_out = run_single_expert(
+            &h,
+            &gate_up,
+            &down,
+            inter,
+            QuantFormat::BF16,
+            Activation::GeluTanh,
+        );
         let max_diff: f32 = silu_out
             .iter()
             .zip(&gelu_out)

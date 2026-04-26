@@ -60,19 +60,15 @@ pub enum Activation {
 /// Gemma 4 26B A4B runs a dense MLP and an expert block in parallel per layer,
 /// summing their outputs. This struct carries the expert-block tensors.
 pub struct MoeLayerWeights<'a> {
-    /// Expert gate+up weight bytes. Format declared by `expert_data_format`.
-    ///
-    /// Legacy BF16 layout: [num_experts, 2 * inter, hidden] contiguous.
-    /// Per-layer Q4_K layout: NOT used here — per-layer format exposes
-    /// individual expert slices via `ModelWeights::get_layer_entry_bytes`.
-    /// When `expert_data_format == QuantFormat::Q4_K`, dispatch via
-    /// `get_layer_entry_bytes` rather than these fields.
-    pub experts_gate_up: &'a [u8],
-    /// Expert down weight bytes. See `experts_gate_up` note.
-    pub experts_down: &'a [u8],
-    /// Format of the expert weight bytes. `Q4_K` = per-layer Q4_K files
-    /// (GPU-dispatchable); anything else = legacy BF16 (CPU dequant path).
-    #[allow(dead_code)]
+    /// Per-expert gate+up weight bytes (`experts_gate_up[e]` is expert `e`'s
+    /// gate+up slice). Bytes are interpreted under `expert_data_format`.
+    /// Built from `layers/{L}/{e}/gate_up` mmap ranges (per-layer Q4_K) or
+    /// from `[num_experts, 2*inter, hidden]` strides (legacy BF16 monolith).
+    pub experts_gate_up: Vec<&'a [u8]>,
+    /// Per-expert down weight bytes (`experts_down[e]` is expert `e`'s down).
+    pub experts_down: Vec<&'a [u8]>,
+    /// Format of the per-expert byte slices. `Q4_K` = per-layer Q4_K files;
+    /// `BF16` = legacy monolith. Both flow through the same per-expert tables.
     pub expert_data_format: QuantFormat,
     /// Router linear projection weight [num_experts, hidden_size].
     pub router_proj: &'a [f32],
@@ -303,8 +299,8 @@ mod tests {
         assert!(!no_moe.is_hybrid_moe());
 
         let moe = MoeLayerWeights {
-            experts_gate_up: &[],
-            experts_down: &[],
+            experts_gate_up: Vec::new(),
+            experts_down: Vec::new(),
             router_proj: &[],
             router_scale: &[],
             router_per_expert_scale: &[],

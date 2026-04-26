@@ -118,6 +118,11 @@ impl VectorIndex {
     ///   1. Q4 matvec on `lm_head_q4.bin` (when present and backend has q4).
     ///   2. f16 gemv on the mmap'd embeddings (tied-embed models only).
     ///   3. f32 BLAS fallback via `lm_head_knn`.
+    ///
+    /// `top_k == 1` uses the GPU-argmax fast paths on backends that
+    /// implement them, returning a single `(token_id, score)` without
+    /// the 1MB scores readback + 262K-element CPU sort that the general
+    /// path requires. Bench (greedy decode) takes this path.
     pub fn lm_head_knn_backend(
         &self,
         query: &ndarray::Array1<f32>,
@@ -143,6 +148,13 @@ impl VectorIndex {
                 if vocab > 0 {
                     let x = query.as_slice().unwrap();
                     let (q8_x, q8_scales) = larql_compute::cpu::q4::quantize_to_q8(x);
+                    if top_k == 1 {
+                        if let Some((idx, score)) =
+                            backend.q4_matvec_topk1(q4_data, &q8_x, &q8_scales, vocab, hidden)
+                        {
+                            return vec![(idx, score)];
+                        }
+                    }
                     if let Some(scores_vec) =
                         backend.q4_matvec(q4_data, &q8_x, &q8_scales, vocab, hidden)
                     {
@@ -160,6 +172,13 @@ impl VectorIndex {
                 let expected = vocab * hidden * 2;
                 if f16_mmap.len() >= expected {
                     if let Some(x) = query.as_slice() {
+                        if top_k == 1 {
+                            if let Some((idx, score)) =
+                                backend.f16_gemv_topk1(&f16_mmap[..expected], x, vocab, hidden)
+                            {
+                                return vec![(idx, score)];
+                            }
+                        }
                         if let Some(scores_vec) =
                             backend.f16_gemv(&f16_mmap[..expected], x, vocab, hidden)
                         {
@@ -175,19 +194,82 @@ impl VectorIndex {
 
     /// Sort `scores` by descending value and keep the top `top_k`. Shared
     /// by the Q4 / f16 / f32 paths above.
+    ///
+    /// Uses a size-K min-heap instead of `select_nth_unstable_by` so we
+    /// don't materialise a 2MB `Vec<(u32, f32)>` for a 262K-vocab lm_head
+    /// only to throw away 262K-K of it. For typical K=1..5 on Gemma 3 4B
+    /// this drops the CPU portion of lm_head from ~0.5ms to ~50µs.
     fn top_k_sorted(scores: Vec<f32>, top_k: usize) -> Vec<(u32, f32)> {
-        let mut indexed: Vec<(u32, f32)> = scores
-            .into_iter()
-            .enumerate()
-            .map(|(i, s)| (i as u32, s))
-            .collect();
-        let k = top_k.min(indexed.len());
-        if k > 0 && k < indexed.len() {
-            indexed.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
-            indexed.truncate(k);
+        if scores.is_empty() || top_k == 0 {
+            return Vec::new();
         }
-        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        indexed
+        let k = top_k.min(scores.len());
+
+        // Argmax fast path — no heap, single linear scan.
+        if k == 1 {
+            let mut best_i: u32 = 0;
+            let mut best_v = f32::NEG_INFINITY;
+            for (i, &s) in scores.iter().enumerate() {
+                if s.is_finite() && s > best_v {
+                    best_v = s;
+                    best_i = i as u32;
+                }
+            }
+            if best_v == f32::NEG_INFINITY {
+                return Vec::new();
+            }
+            return vec![(best_i, best_v)];
+        }
+
+        // Min-heap of size K, smallest score at index 0. We push until full,
+        // then replace-and-sift-down whenever we see something larger than
+        // the current min.
+        let mut heap: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
+
+        fn sift_down(h: &mut [(f32, u32)], mut i: usize) {
+            let n = h.len();
+            loop {
+                let mut smallest = i;
+                let l = 2 * i + 1;
+                let r = 2 * i + 2;
+                if l < n && h[l].0 < h[smallest].0 {
+                    smallest = l;
+                }
+                if r < n && h[r].0 < h[smallest].0 {
+                    smallest = r;
+                }
+                if smallest == i {
+                    break;
+                }
+                h.swap(i, smallest);
+                i = smallest;
+            }
+        }
+
+        for (i, &s) in scores.iter().enumerate() {
+            if !s.is_finite() {
+                continue;
+            }
+            if heap.len() < k {
+                heap.push((s, i as u32));
+                if heap.len() == k {
+                    for j in (0..k / 2).rev() {
+                        sift_down(&mut heap, j);
+                    }
+                }
+            } else if s > heap[0].0 {
+                heap[0] = (s, i as u32);
+                sift_down(&mut heap, 0);
+            }
+        }
+        if heap.len() < k && heap.len() > 1 {
+            for j in (0..heap.len() / 2).rev() {
+                sift_down(&mut heap, j);
+            }
+        }
+
+        heap.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        heap.into_iter().map(|(s, i)| (i, s)).collect()
     }
 
     /// KNN against lm_head: find top-K tokens by dot product with query vector.

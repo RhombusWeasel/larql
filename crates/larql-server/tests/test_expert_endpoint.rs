@@ -309,11 +309,21 @@ fn local_output(
     router_proj: &[f32],
     pre_norm: &[f32],
 ) -> Vec<f32> {
+    // Synthetic test fixtures store BF16 monolith. Slice into per-expert
+    // tables for the new MoeLayerWeights API.
+    let gu_stride = 2 * INTER * HIDDEN * 2;
+    let dn_stride = HIDDEN * INTER * 2;
+    let experts_gate_up: Vec<&[u8]> = (0..NUM_EXPERTS)
+        .map(|e| &gate_up[e * gu_stride..(e + 1) * gu_stride])
+        .collect();
+    let experts_down: Vec<&[u8]> = (0..NUM_EXPERTS)
+        .map(|e| &down[e * dn_stride..(e + 1) * dn_stride])
+        .collect();
     cpu_moe_forward(
         h,
         &MoeLayerWeights {
-            experts_gate_up: gate_up,
-            experts_down: down,
+            experts_gate_up,
+            experts_down,
             router_proj,
             router_scale: &[],
             router_per_expert_scale: &[],
@@ -327,7 +337,7 @@ fn local_output(
             top_k: TOP_K,
             intermediate_size: INTER,
             activation: larql_compute::Activation::Silu,
-            expert_data_format: larql_compute::QuantFormat::F32,
+            expert_data_format: larql_compute::QuantFormat::BF16,
         },
         0.0,
         1e-6,

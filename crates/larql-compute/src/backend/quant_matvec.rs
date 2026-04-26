@@ -123,6 +123,21 @@ pub trait QuantMatVec {
         None
     }
 
+    /// Q4 matvec + GPU argmax for greedy lm_head decode. Returns
+    /// `(token_id, score)` for the top-1 element without the 1MB
+    /// scores readback that `q4_matvec` requires. Returns `None` if
+    /// not specialised.
+    fn q4_matvec_topk1(
+        &self,
+        _q4_data: &[u8],
+        _q8_x: &[i8],
+        _q8_scales: &[f32],
+        _num_rows: usize,
+        _hidden: usize,
+    ) -> Option<(u32, f32)> {
+        None
+    }
+
     /// Q4 vector-matrix: `out[K] = activation[N] @ Q4[N, K]`.
     fn q4_vecmat(
         &self,

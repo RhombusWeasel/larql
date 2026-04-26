@@ -19,6 +19,47 @@ impl QuantMatVec for MetalBackend {
         Some(self.q4_matvec_direct(q4_data, q8_x, q8_scales, num_rows, hidden))
     }
 
+    /// Q4 matvec → GPU argmax_partial, returning `(token_id, score)` for
+    /// the top-1 element. Used by the lm_head greedy-decode path on models
+    /// that have a Q4 lm_head (`lm_head_q4.bin` or synthesized from f16
+    /// embeddings). Saves the 1MB readback + 262K-element CPU sort.
+    fn q4_matvec_topk1(
+        &self,
+        q4_data: &[u8],
+        q8_x: &[i8],
+        q8_scales: &[f32],
+        num_rows: usize,
+        hidden: usize,
+    ) -> Option<(u32, f32)> {
+        if num_rows == 0 || q8_x.len() != hidden {
+            return None;
+        }
+        let buf_q4 = self.bufs.get_bytes(q4_data);
+        let buf_q8 = self.bufs.transient_from_i8(q8_x);
+        let buf_scales = self.bufs.transient_from_f32(q8_scales);
+        let scores = self.bufs.output((num_rows * 4) as u64);
+
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        crate::metal::ops::q4_matvec::encode(
+            enc,
+            &self.q4.matvec,
+            &buf_q4,
+            &buf_q8,
+            &buf_scales,
+            &scores,
+            num_rows as u32,
+            hidden as u32,
+            num_rows,
+        );
+        let (partial_vals, partial_idxs, n_partials) =
+            self.encode_argmax_partial(enc, &scores, num_rows);
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        Self::reduce_argmax_partial(&partial_vals, &partial_idxs, n_partials)
+    }
+
     fn q4_vecmat(
         &self,
         activation: &[f32],

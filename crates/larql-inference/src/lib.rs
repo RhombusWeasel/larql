@@ -33,6 +33,7 @@ pub use larql_compute::cpu::ops::moe::{
 pub use larql_compute::Activation as ComputeActivation;
 pub use larql_compute::CpuBackend;
 pub use larql_compute::MoeLayerWeights;
+pub use larql_compute::QuantFormat;
 pub use larql_compute::{
     cpu_backend, default_backend, dot_proj_gpu, matmul_gpu, ComputeBackend, MatMulOp,
 };

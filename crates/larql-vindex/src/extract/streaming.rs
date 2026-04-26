@@ -471,7 +471,8 @@ pub fn build_vindex_streaming(
             }
         } else if expert_format == larql_models::ExpertFormat::PackedBF16 && is_moe {
             // Hybrid MoE (Gemma 4 26B A4B): use dense FFN down for down_meta.
-            // Expert down matrices are in experts_packed.bin for inference.
+            // Expert down matrices live per-layer at `layers/layer_{L:02}.weights`
+            // (Q4_K), written by the q4k weight writer.
             let down_key = normalize_key(&arch.ffn_down_key(layer), prefixes);
             match get_tensor_f32(&shard_mmaps, &tensor_index, &down_key)? {
                 Some(t) => vec![t],

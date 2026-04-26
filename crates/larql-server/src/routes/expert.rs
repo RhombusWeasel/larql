@@ -101,23 +101,50 @@ fn run_expert(
         )));
     }
 
-    // Retrieve MoE weight keys.
-    let gate_up_key = arch.packed_experts_gate_up_key(layer).ok_or_else(|| {
-        ServerError::BadRequest(format!("no MoE gate/up weights for layer {layer}"))
-    })?;
-    let down_key = arch
-        .packed_experts_down_key(layer)
-        .ok_or_else(|| ServerError::BadRequest(format!("no MoE down weights for layer {layer}")))?;
-
-    let experts_gate_up = weights
-        .get_packed_bytes(&gate_up_key)
-        .ok_or_else(|| ServerError::Internal(format!("gate_up bytes missing for layer {layer}")))?;
-    let experts_down = weights
-        .get_packed_bytes(&down_key)
-        .ok_or_else(|| ServerError::Internal(format!("down bytes missing for layer {layer}")))?;
-
     let inter = arch.moe_intermediate_size();
+    let hidden = model.config.hidden_size;
     let activation = larql_inference::activation_from_arch(arch);
+
+    // Resolve this expert's per-expert byte slice. Per-layer Q4_K vindexes
+    // expose entries at `layers/{layer}/{expert}/...`; legacy BF16 vindexes
+    // expose a monolithic `packed_experts_{gate_up,down}_key` blob that we
+    // slice by stride. Either way we feed `run_single_expert*` exactly one
+    // expert's bytes — no monolith arithmetic in the compute path.
+    let (gate_up_bytes, down_bytes, format) = if weights.has_per_layer_ffn() {
+        let (gu, dn) = weights.get_layer_entry_bytes(layer, expert_id).ok_or_else(|| {
+            ServerError::Internal(format!(
+                "per-layer entry missing for layer {layer} expert {expert_id}"
+            ))
+        })?;
+        (gu, dn, larql_inference::QuantFormat::Q4_K)
+    } else {
+        let gate_up_key = arch.packed_experts_gate_up_key(layer).ok_or_else(|| {
+            ServerError::BadRequest(format!("no MoE gate/up weights for layer {layer}"))
+        })?;
+        let down_key = arch.packed_experts_down_key(layer).ok_or_else(|| {
+            ServerError::BadRequest(format!("no MoE down weights for layer {layer}"))
+        })?;
+        let gu_all = weights.get_packed_bytes(&gate_up_key).ok_or_else(|| {
+            ServerError::Internal(format!("gate_up bytes missing for layer {layer}"))
+        })?;
+        let dn_all = weights.get_packed_bytes(&down_key).ok_or_else(|| {
+            ServerError::Internal(format!("down bytes missing for layer {layer}"))
+        })?;
+        let gu_stride = 2 * inter * hidden * 2; // BF16 = 2 bytes
+        let dn_stride = hidden * inter * 2;
+        let gu_start = expert_id * gu_stride;
+        let dn_start = expert_id * dn_stride;
+        if gu_start + gu_stride > gu_all.len() || dn_start + dn_stride > dn_all.len() {
+            return Err(ServerError::Internal(format!(
+                "expert {expert_id} byte range out of bounds for layer {layer}"
+            )));
+        }
+        (
+            &gu_all[gu_start..gu_start + gu_stride],
+            &dn_all[dn_start..dn_start + dn_stride],
+            larql_inference::QuantFormat::BF16,
+        )
+    };
 
     let output = if let Some(norm_key) = arch.moe_pre_experts_norm_key(layer) {
         let pre_experts_norm = weights
@@ -127,22 +154,22 @@ fn run_expert(
             .unwrap_or(&[]);
         larql_inference::run_single_expert_with_norm(
             residual,
-            experts_gate_up,
-            experts_down,
-            expert_id,
+            gate_up_bytes,
+            down_bytes,
             inter,
             pre_experts_norm,
             arch.norm_weight_offset(),
             arch.norm_eps(),
+            format,
             activation,
         )
     } else {
         larql_inference::run_single_expert(
             residual,
-            experts_gate_up,
-            experts_down,
-            expert_id,
+            gate_up_bytes,
+            down_bytes,
             inter,
+            format,
             activation,
         )
     };
