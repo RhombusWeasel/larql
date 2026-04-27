@@ -251,9 +251,7 @@ impl MetalBackend {
             } else {
                 layer_head_dim
             };
-            let uses_q4k = layer.wq.format == crate::QuantFormat::Q4_K
-                || layer.wq.format == crate::QuantFormat::Q6_K
-                || layer.wq.format == crate::QuantFormat::Q4_KF;
+            let uses_q4k = layer.wq.format.is_q4k_family();
             let layer_q_dim = layer_num_q_heads * layer_head_dim;
             let layer_kv_dim = layer_num_kv_heads * layer_head_dim;
             let window_size = layer.sliding_window as u32;
@@ -473,9 +471,7 @@ impl MetalBackend {
             }
 
             // ── Step 5: Residual + norm (format-aware: Q4_K skips Q8 quantize) ──
-            let ffn_uses_q4k = layer.gate.format == crate::QuantFormat::Q4_K
-                || layer.gate.format == crate::QuantFormat::Q4_KF
-                || layer.gate.format == crate::QuantFormat::Q6_K;
+            let ffn_uses_q4k = layer.gate.format.is_q4k_family();
             // ffn_norm_out pre-allocated above
 
             let has_post_norms = layer.has_post_norms;

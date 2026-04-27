@@ -22,7 +22,11 @@ fn q4k_lifted_matches_larql_models_reference() {
     }
 
     let bytes = quantize_q4_k(&data);
-    assert_eq!(bytes.len(), 144 * 3, "Q4_K = 144 bytes per 256-elem super-block");
+    assert_eq!(
+        bytes.len(),
+        144 * 3,
+        "Q4_K = 144 bytes per 256-elem super-block"
+    );
 
     let lifted = dequantize_q4_k(&bytes, n);
     let reference =
@@ -41,7 +45,9 @@ fn q4k_lifted_matches_larql_models_reference() {
 #[test]
 fn q4k_round_trip_within_quant_noise() {
     // Smooth ramp [-1, 1]: worst case for block-level scales.
-    let data: Vec<f32> = (0..256 * 4).map(|i| (i as f32 / (256.0 * 4.0 - 1.0)) * 2.0 - 1.0).collect();
+    let data: Vec<f32> = (0..256 * 4)
+        .map(|i| (i as f32 / (256.0 * 4.0 - 1.0)) * 2.0 - 1.0)
+        .collect();
     let bytes = quantize_q4_k(&data);
     let decoded = dequantize_q4_k(&bytes, data.len());
 

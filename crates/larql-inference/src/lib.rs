@@ -80,6 +80,7 @@ pub use layer_graph::{
     build_adaptive_graph,
     detect_template,
     generate,
+    generate_streaming,
     generate_with_sampling,
     // Expert grid generation
     grid::{generate_with_remote_moe, GridGenerateResult},
@@ -93,19 +94,25 @@ pub use layer_graph::{
     trace_with_graph,
     AttentionCache,
     CachedLayerGraph,
+    // Multi-turn chat session
+    ChatMLRenderer,
+    ChatSession,
     DenseLayerGraph,
     // Generation building blocks (EOS, detok, sampling)
     Detokenizer,
     EosConfig,
+    GemmaRenderer,
     GenerateResult,
     GuidedWalkLayerGraph,
     // Production
     LayerGraph,
     LayerOutput,
+    Llama3Renderer,
     PerLayerGraph,
     PipelinedLayerGraph,
     Sampler,
     SamplingConfig,
+    TurnRenderer,
     // Analysis/validation
     TemplatePattern,
     TemplateUniverse,

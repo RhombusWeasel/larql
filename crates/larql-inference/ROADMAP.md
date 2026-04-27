@@ -41,10 +41,13 @@ multi-byte UTF-8 chars that straddle a token boundary. Demo at
 fix ("the capital of france is paris").
 
 ### Token streaming
-**Status**: Not started  
-Change `generate` / `generate_cached` to accept `on_token: impl FnMut(&str, f64)`
-callback. Currently the full token list is collected before returning. Detok
-buffer is already in place via `Detokenizer::push`; this is now glue.
+**Status**: ✅ Done 2026-04-26 — see `layer_graph/generate/gpu.rs`  
+`generate_streaming(..., on_token: F)` fires `on_token(id, text, prob)` for
+every emitted token, including the first (which comes out of prefill). Uses
+`Detokenizer::push` so streamed text preserves HF leading-space spacing.
+`generate_with_sampling` is a thin wrapper passing a no-op closure so
+non-streaming callers are unaffected. Demo at `examples/streaming_demo.rs`
+prints tokens live with stdout flushing.
 
 ### Sampling
 **Status**: ✅ Done 2026-04-26 — see `layer_graph/generate/sampling.rs`  
@@ -56,14 +59,24 @@ overhead is <2µs/call at top-K=64 (<0.02% of decode budget). CLI flags
 (`--temperature`/`--top-p`/`--top-k`) are still owned by `larql-cli`.
 
 ### Multi-turn KV state
-**Status**: Not started — `larql chat` resets KV cache per turn today  
-Maintain a running `token_ids` buffer across turns. `--max-context N` eviction:
-drop oldest turns when the buffer exceeds `N`.
+**Status**: ✅ Done 2026-04-26 (token-buffer) — see `layer_graph/generate/chat_session.rs`  
+`ChatSession` owns the running token buffer with whole-turn eviction at
+`max_context`. Pluggable `TurnRenderer` covers Gemma / ChatML / Llama-3
+templates. The most recent turn is never dropped — eviction is a no-op
+when only one turn remains, so a long single prompt is preserved over
+silently truncating. `examples/chat_demo.rs` runs a 3-turn conversation.
+
+True KV carryover across turns (so prefill on turn N+1 only processes
+the new tokens) is a follow-up — the API surface is in place; it's an
+internal optimisation.
 
 ### Gemma 3 4B regression smoke test
-**Status**: Not started  
-Load `gemma3-4b-q4k-streaming`, run one-token generation, assert first token is
-`"Paris"`. Gate on `CI_INTEGRATION=1`.
+**Status**: ✅ Done 2026-04-26 — see `tests/test_gemma3_smoke.rs`  
+Loads vindex from `LARQL_VINDEX_PATH`, runs single-token greedy generation
+on `"The capital of France is"`, asserts first token (trimmed) equals
+`"Paris"`. Gated `#[ignore]`; `CI_INTEGRATION=1` flips to fail-loud when
+the vindex env isn't set so CI can require the test rather than silently
+skip. Defaults configurable via `LARQL_SMOKE_PROMPT` / `LARQL_SMOKE_EXPECTED`.
 
 ---
 
@@ -469,3 +482,12 @@ bottleneck.
 | Examples: `sampling_demo`, `eos_demo`, `detok_demo` | 2026-04-26 | End-to-end demos; detok runs without a model |
 | `bench_sampling` benchmark | 2026-04-26 | Per-call cost across 4 configs × 3 vocab sizes; results in PERFORMANCE.md |
 | 35 sampling/eos/detok tests | 2026-04-26 | All passing; 613 lib tests total |
+| `generate_streaming(... on_token)` callback | 2026-04-26 | Per-token streaming; `generate_with_sampling` is thin no-op wrapper |
+| `chat_session.rs` — `ChatSession` + `TurnRenderer` | 2026-04-26 | Multi-turn buffer with whole-turn eviction; Gemma/ChatML/Llama-3 renderers |
+| Examples: `streaming_demo`, `chat_demo` | 2026-04-26 | Live token streaming + 3-turn chat over `ChatSession` |
+| Smoke test: `test_gemma3_smoke.rs` | 2026-04-26 | One-token greedy regression; CI_INTEGRATION fail-loud mode |
+| 13 ChatSession tests + streaming integration | 2026-04-26 | All passing; 626 lib tests total |
+| Q4_K stride validation in `load_attn_q4k` | 2026-04-27 | Catches stale 148-byte vindexes; clear "rebuild" error vs silent NaN |
+| `QuantFormatInfo::expected_bytes(&shape)` helper | 2026-04-27 | Single source of truth for stride math; used by loader validation |
+| 11 stride-validation tests (registry + loader) | 2026-04-27 | 144 vs 148-byte stride; arbitrary lengths; Q4_K & Q6_K shapes |
+| Q4_K vs Q4_KF kernel routing fix in `quant_matvec::encode` | 2026-04-27 | Q4_K weights now dispatch the Q4_K kernel; `FusedQkvKernel` enum carries TG geometry |

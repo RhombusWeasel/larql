@@ -65,13 +65,31 @@ pub(super) fn encode_input_norm_and_qkv(
     let q8s_off = |p: usize| (p * ctx.q8s_row_bytes) as u64;
 
     let all_same_format = layer.wq.format == layer.wk.format && layer.wk.format == layer.wv.format;
-    let fused_qkv_pipe = pipes.q4kf_qkv_proj.or(pipes.q4k_qkv_proj).filter(|_| {
-        all_same_format
-            && matches!(
-                layer.wq.format,
-                crate::QuantFormat::Q4_K | crate::QuantFormat::Q4_KF
-            )
-    });
+    // Pick the fused kernel whose host-side TG geometry matches the
+    // shader being dispatched. The two shaders use different rows/TG and
+    // threads/TG counts; getting them out of sync silently leaves rows
+    // unwritten because the kernel's `if (global_row >= total_rows)`
+    // guard hides the under-coverage. Encoded as a (pipeline, kernel)
+    // pair so the dispatcher can't use one without the other.
+    let fused_qkv_pipe: Option<(&ComputePipelineState, qkv_proj::FusedQkvKernel)> =
+        if all_same_format {
+            match layer.wq.format {
+                crate::QuantFormat::Q4_KF => pipes
+                    .q4kf_qkv_proj
+                    .map(|p| (p, qkv_proj::FusedQkvKernel::Q4kf))
+                    .or_else(|| {
+                        pipes
+                            .q4k_qkv_proj
+                            .map(|p| (p, qkv_proj::FusedQkvKernel::Q4k))
+                    }),
+                crate::QuantFormat::Q4_K => pipes
+                    .q4k_qkv_proj
+                    .map(|p| (p, qkv_proj::FusedQkvKernel::Q4k)),
+                _ => None,
+            }
+        } else {
+            None
+        };
 
     if uses_f32_input {
         // Q4_K / Q6_K / Q4_KF: f32 norm output, then either fused or
@@ -90,10 +108,11 @@ pub(super) fn encode_input_norm_and_qkv(
                 ctx.eps,
                 ctx.norm_offset,
             );
-            if let Some(fused_pipeline) = fused_qkv_pipe {
+            if let Some((fused_pipeline, fused_kernel)) = fused_qkv_pipe {
                 qkv_proj::encode_fused_f32(
                     enc,
                     fused_pipeline,
+                    fused_kernel,
                     &lb.wq[l],
                     &lb.wk[l],
                     &lb.wv[l],

@@ -70,13 +70,95 @@ sweep, and 16.6 GB steady RSS — i.e. the change cut latency 2.5× and RSS 1.7�
 
 ## P0: Active
 
-Nothing critical-path is blocking right now.
+Functional gaps from the 2026-04-27 server review. Numbering is stable so we
+can reference items in commits and reviews.
 
----
+### F1. Router-side expert-shard fan-out
+**Files**: `crates/larql-router/src/main.rs`, `crates/larql-router/src/grid.rs`,
+`crates/larql-router-protocol/proto/*.proto`.
+The grid router fans out `walk-ffn` by layer ranges only. For MoE, the
+remote-expert client (`RemoteMoeBackend` in `larql-inference`) carries the
+expert→shard map itself; nothing on the router side. Means clients can't just
+point at the router for MoE. Add `POST /v1/expert/{layer}/{id}` and
+`POST /v1/expert/batch` to the router, with shard discovery via the existing
+gRPC announce stream. Pairs with **F11** (topology endpoint).
+
+### F2. Streaming HTTP infer (SSE)
+**Files**: `crates/larql-server/src/routes/infer.rs` (new sibling
+`infer_stream.rs`).
+`/v1/infer` is single-shot — full output buffered, no incremental tokens. WS
+has it (`WS_CMD_INFER`) but most chat UIs talk SSE. Add
+`POST /v1/infer/stream` with `text/event-stream`. Same generation loop, yield
+each token. Mid-generation cancellation on client disconnect (see **F16**).
+
+### F3. `/metrics` (Prometheus)
+**Files**: `crates/larql-server/src/main.rs`, new `crates/larql-server/src/metrics.rs`.
+No latency histograms, no per-endpoint counters, no rate-limit drops, no
+shard-call durations today. Wire `metrics` + `metrics-exporter-prometheus` (or
+hand-rolled). Histograms for: `walk-ffn` per `layer_count`, `forward_moe` per
+`top_k`, queue wait, auth failures, rate-limit drops, shard-call latency.
+
+### F4. Graceful shutdown with in-flight drain
+**Files**: `crates/larql-server/src/main.rs`.
+SIGTERM today probably cuts long-running walks. Standard axum + tokio shutdown
+signal: stop accepting, drain N seconds (configurable), hard-kill. Important
+for grid rolling restarts.
+
+### F5. Readiness vs liveness split
+**Files**: `crates/larql-server/src/routes/health.rs`, `routes/mod.rs`.
+`/v1/health` returns `{status, uptime, requests_served}`. Add `GET /v1/ready`
+returning 503 until weights are loaded (under `--warmup-walk-ffn` or first
+lazy load); include `model_id`, `mode`, `version`, `git_sha`, `format`
+(per-layer vs legacy) in the readiness payload. Standard k8s liveness/readiness
+split.
 
 ---
 
 ## P1: Active
+
+### F6. Replica round-robin + retry on shard failure
+**Files**: `crates/larql-router/src/grid.rs`.
+Router picks first owning shard; no load-balancing across replicas, no retry
+on 5xx. `--shards "0-15=A,0-15=B"` doesn't fan evenly today.
+
+### F7. KV-cache prefix sharing for chat
+**Files**: `crates/larql-inference/src/layer_graph/generate/*`,
+`crates/larql-server/src/routes/infer.rs`.
+Every `/v1/infer` call is fresh prefill. For chat (long shared system prompt +
+short user turn) prefix-caching is a 5–10× decode-time win. Needs a
+`session_id`-keyed KV cache.
+
+### F8. Vindex hot-swap admin endpoints
+**Files**: `crates/larql-server/src/routes/` (new `admin.rs`),
+`crates/larql-server/src/state.rs` (mutable model registry).
+`POST /v1/admin/vindex/load`, `DELETE /v1/admin/vindex/{id}`,
+`POST /v1/admin/vindex/reload`. Admin-key-gated (see **F14**). Otherwise every
+model swap is a process restart.
+
+### F9. Binary wire format for `expert/batch`
+**Files**: `crates/larql-server/src/routes/expert.rs`,
+`crates/larql-inference/src/ffn/moe_remote.rs`.
+A K=8 batch on Gemma 4 26B-A4B is ~90 KB JSON per call. The
+`application/x-larql-ffn` binary format already exists for `walk-ffn`; mirror
+it for `expert/batch`. Expected 3–5× wire reduction.
+
+### F10. OpenAI-compat `/v1/chat/completions`
+**Files**: new `crates/larql-server/src/routes/openai.rs`.
+Map to `/v1/infer` with stream support. Lets every OpenAI client work
+unmodified — single biggest reach win for adoption. Includes
+`/v1/completions` (legacy) and `/v1/embeddings` (mapped to embed-service).
+
+### F11. Expert topology endpoint
+**Files**: new `crates/larql-server/src/routes/topology.rs`.
+`GET /v1/expert/topology` returns `{model_id, layers, num_experts, owned: [start,end]}`.
+Lets clients build the shard map dynamically instead of having it baked in.
+Pairs with **F1** (router fan-out).
+
+### F12. Batched infer
+**Files**: `crates/larql-server/src/routes/infer.rs`.
+`/v1/infer` takes one prompt today. RAG workloads send N prompts; one batched
+call across them amortises router/dispatch overhead. Either accept
+`prompts: [...]` or new `/v1/infer/batch`.
 
 ### T3. Review follow-up — server hygiene ✅ done 2026-04-26
 
@@ -231,13 +313,83 @@ restarting.
 **Impact**: For DeepSeek-V3+/Kimi K-class models (1k+ experts), shard
 by expert ID within a layer rather than by layer range. Needs an
 `ExpertRoute` message type in `larql-router-protocol` and
-GridState dispatch updates. Mentioned in larql-vindex P2.
+GridState dispatch updates. Mentioned in larql-vindex P2. Subsumed by
+**F1** (router-side expert fan-out) at the router layer; G5 covers the
+router-protocol changes specifically.
 
 ### G6. Live router-shard topology change
 **Impact**: Today shards are static (`--shards` flag at router boot).
 For ops convenience, expose `POST /v1/router/shards` (admin-gated)
 to add/remove a shard without restarting the router. Pair with
 `--grid-port` health checks.
+
+### F13. OpenTelemetry tracing exporter
+**Files**: `crates/larql-server/src/main.rs`.
+Per-request spans across HTTP→shard fan-out. `tracing_subscriber::fmt` is the
+only output today. Wire `tracing-opentelemetry` + OTLP exporter, configurable
+via `--otel-endpoint`. Pairs with **F3** (metrics).
+
+### F14. Per-key quotas + audit log
+**Files**: `crates/larql-server/src/auth.rs`, `crates/larql-server/src/main.rs`.
+Single API key today; no per-key quotas, no rotation, no scoped tokens. Add
+`--api-keys keys.toml` (name + role + per-key rate). Structured audit on
+patches + admin ops to a configurable sink (file / stdout / OTel).
+
+### F15. RBAC (read-only vs admin keys)
+**Files**: `crates/larql-server/src/auth.rs`, all mutating routes.
+Today any key can patch the loaded model. Add `role` per key
+(read / infer / patch / admin). Mutating endpoints (`patches/apply`,
+`insert`, future `admin/*`) require the matching role.
+
+### F16. Mid-generation cancellation on HTTP infer
+**Files**: `crates/larql-server/src/routes/infer.rs`.
+Client disconnect on `/v1/infer` waits for the full max_tokens. Wire
+`tokio::select!` against an axum `OnUpgrade`-style cancellation token (or just
+poll the connection on each decode step) to abort early.
+
+### F17. Structured-output / grammar-constrained generation
+**Files**: `crates/larql-inference/src/layer_graph/generate/*`,
+`crates/larql-server/src/routes/infer.rs`.
+`{format: "json", schema: ...}` or `{grammar: "gbnf:..."}` on `/v1/infer`.
+Constrains decoding by masking the logits to grammar-valid tokens. Standard
+ML-server feature; missing today.
+
+### F18. Log-prob / perplexity endpoint
+**Files**: new `crates/larql-server/src/routes/logprobs.rs`.
+`POST /v1/logprobs {prompt, top_k}` — return per-token log-probabilities.
+Needed for ranking, classification, and eval workflows.
+
+### F19. OpenAPI schema route
+**Files**: new derive macro setup using `utoipa` (or hand-rolled).
+`GET /openapi.json`. Required for SDK codegen, `kubectl explain`-style
+tooling, and external API consumers. Today external consumers read the
+README.
+
+### F20. Compression negotiation
+**Files**: `crates/larql-server/src/main.rs`.
+No `Content-Encoding: gzip|zstd` advertised; relies on a reverse proxy. Wire
+`tower-http::compression`. Particularly useful for `walk-ffn` JSON responses
+on slow links.
+
+### F21. `/v1/stats` per-layer mmap residency
+**Files**: `crates/larql-server/src/routes/stats.rs`.
+Existing `q4k_ffn` block exposes cache slots/bytes; extend with per-layer
+hot/cold (resident vs paged-out) so operators can see what `--release-mmap-after-request`
+actually buys them.
+
+### F22. Persistent patches
+**Files**: `crates/larql-server/src/session.rs`,
+`crates/larql-server/src/routes/patches.rs`.
+Patches are session-scoped today; no on-disk overlay. Add a durable
+`POST /v1/patches/save` + auto-apply on boot. Pairs with **F8** (hot-swap)
+so a patched model survives restart.
+
+### F23. Python HTTP client SDK
+**Files**: new `crates/larql-python/src/http_client.rs` (or new crate).
+`larql-python` is walk-only against a local vindex; no HTTP client. Add a
+`pip install larql` package speaking the server's HTTP API (sync + async),
+mirroring the OpenAI Python SDK shape. Pairs with **F10** (OpenAI compat) so
+the SDK is a thin wrapper over the OpenAI client.
 
 ---
 

@@ -137,10 +137,7 @@ kernel void f32_argmax_partial(
 /// self-contained — no order-of-concatenation hazards when several
 /// templated shaders end up in the same bundle.
 pub fn argmax_shader_source() -> String {
-    ARGMAX_SHADER_BODY.replace(
-        "MAX_SIMDGROUPS_PER_TG",
-        &MAX_SIMDGROUPS_PER_TG.to_string(),
-    )
+    ARGMAX_SHADER_BODY.replace("MAX_SIMDGROUPS_PER_TG", &MAX_SIMDGROUPS_PER_TG.to_string())
 }
 
 pub struct ArgmaxKernel;
@@ -232,10 +229,7 @@ pub fn topk_shader_source() -> String {
     TOPK_SHADER_BODY
         .replace("K_TOPK", &K_TOPK.to_string())
         .replace("PARTIAL_TG_SZ", &PARTIAL_TG_SZ.to_string())
-        .replace(
-            "MAX_SIMDGROUPS_PER_TG",
-            &MAX_SIMDGROUPS_PER_TG.to_string(),
-        )
+        .replace("MAX_SIMDGROUPS_PER_TG", &MAX_SIMDGROUPS_PER_TG.to_string())
 }
 
 pub struct TopKKernel;

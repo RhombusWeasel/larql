@@ -103,11 +103,38 @@ impl VectorIndex {
                             "attn_weights_q4k_manifest entry missing `format` field".into(),
                         )
                     })?;
-                    if crate::quant::registry::lookup(tag).is_none() {
-                        return Err(VindexError::Parse(format!(
+                    let qfmt = crate::quant::registry::lookup(tag).ok_or_else(|| {
+                        VindexError::Parse(format!(
                             "attn_weights_q4k_manifest: unknown format tag {tag:?} \
                              — quant::registry has no entry"
-                        )));
+                        ))
+                    })?;
+
+                    // Stride sanity check — catches stale vindexes built
+                    // with the legacy 148-byte block_q4_K layout against
+                    // the current 144-byte GGUF kernels (the read drifts
+                    // 4 bytes per superblock, producing all-NaN output).
+                    let key = e["key"].as_str().unwrap_or("<no-key>");
+                    let shape: Vec<usize> = e["shape"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(expected) = qfmt.expected_bytes(&shape) {
+                        if expected != length {
+                            return Err(VindexError::Parse(format!(
+                                "attn_weights_q4k_manifest: tensor {key:?} ({tag}, shape {shape:?}) \
+                                 has length {length} but format expects {expected} \
+                                 ({} bytes/block × {}). \
+                                 Likely cause: vindex built with legacy 148-byte block_q4_K layout — \
+                                 rebuild the vindex with current code (`larql q4k <model>` or equivalent).",
+                                qfmt.bytes_per_block,
+                                length / qfmt.bytes_per_block.max(1),
+                            )));
+                        }
                     }
                     Ok((offset, length, tag.to_string()))
                 })
@@ -199,5 +226,157 @@ impl VectorIndex {
         let o_data = &mmap[o.0..o.0 + o.1];
 
         Some((q_data, k_data, v_data, o_data))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal vindex directory with the given attn_weights_q4k.bin
+    /// payload + manifest. Returns a `tempfile::TempDir` whose path can be
+    /// passed straight to `load_attn_q4k`.
+    fn make_vindex_with_attn_q4k(payload: &[u8], manifest: serde_json::Value) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(ATTN_WEIGHTS_Q4K_BIN), payload).unwrap();
+        std::fs::write(
+            tmp.path().join(ATTN_WEIGHTS_Q4K_MANIFEST_JSON),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        tmp
+    }
+
+    fn empty_vindex() -> VectorIndex {
+        // Layer count and hidden size don't matter for the load_attn_q4k
+        // path — both are read from the manifest, not from the index.
+        VectorIndex::empty(1, 2560)
+    }
+
+    /// Q4_K shape `[2048, 2560]` at the canonical 144-byte GGUF stride
+    /// must load cleanly.
+    #[test]
+    fn load_attn_q4k_accepts_correct_144_byte_stride() {
+        let len = 2048 * (2560 / 256) * 144; // 2_949_120
+        let payload = vec![0u8; len];
+        let manifest = serde_json::json!([
+            {
+                "key": "layers.0.self_attn.q_proj.weight",
+                "shape": [2048, 2560],
+                "format": "Q4_K",
+                "offset": 0,
+                "length": len,
+            }
+        ]);
+        let tmp = make_vindex_with_attn_q4k(&payload, manifest);
+        let mut idx = empty_vindex();
+        idx.load_attn_q4k(tmp.path()).expect("clean stride must load");
+    }
+
+    /// Regression: an attn_weights_q4k.bin written with the legacy
+    /// 148-byte block_q4_K layout must be rejected at load time. The
+    /// kernel reads 144-byte GGUF strides; without this check, every
+    /// row's read window drifts by 4 bytes per superblock and the GPU
+    /// prefill silently produces all-NaN.
+    #[test]
+    fn load_attn_q4k_rejects_legacy_148_byte_stride() {
+        let bad_len = 2048 * (2560 / 256) * 148; // 3_031_040 — what 8-Apr vindexes have
+        let payload = vec![0u8; bad_len];
+        let manifest = serde_json::json!([
+            {
+                "key": "layers.0.self_attn.q_proj.weight",
+                "shape": [2048, 2560],
+                "format": "Q4_K",
+                "offset": 0,
+                "length": bad_len,
+            }
+        ]);
+        let tmp = make_vindex_with_attn_q4k(&payload, manifest);
+        let mut idx = empty_vindex();
+        let err = idx
+            .load_attn_q4k(tmp.path())
+            .expect_err("legacy 148-byte stride must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("rebuild the vindex"),
+            "error must guide the user to rebuild — got: {msg}"
+        );
+        assert!(
+            msg.contains("3031040") || msg.contains("2949120"),
+            "error must include both lengths so the user can see the drift — got: {msg}"
+        );
+    }
+
+    /// A length that's neither 144 × n nor 148 × n still gets rejected
+    /// (anything that's not the canonical stride is an error).
+    #[test]
+    fn load_attn_q4k_rejects_arbitrary_wrong_length() {
+        let weird_len = 2_949_120 + 17; // off-by-17 — definitely not aligned
+        let payload = vec![0u8; weird_len];
+        let manifest = serde_json::json!([
+            {
+                "key": "layers.0.self_attn.q_proj.weight",
+                "shape": [2048, 2560],
+                "format": "Q4_K",
+                "offset": 0,
+                "length": weird_len,
+            }
+        ]);
+        let tmp = make_vindex_with_attn_q4k(&payload, manifest);
+        let mut idx = empty_vindex();
+        idx.load_attn_q4k(tmp.path())
+            .expect_err("non-canonical stride must be rejected");
+    }
+
+    /// Q6_K stride (210 bytes per 256-element block) must also validate
+    /// — V projections in Gemma 3 4B are Q6_K and would suffer the same
+    /// silent-drift class of bug.
+    #[test]
+    fn load_attn_q4k_validates_q6k_v_projection() {
+        let q4k_len = 1024 * (2560 / 256) * 144; // K projection: 1024 × 1440 = 1_474_560
+        let q6k_len = 1024 * (2560 / 256) * 210; // V projection: 1024 × 2100 = 2_150_400
+        let total = q4k_len + q6k_len;
+        let payload = vec![0u8; total];
+        let manifest = serde_json::json!([
+            {
+                "key": "layers.0.self_attn.k_proj.weight",
+                "shape": [1024, 2560],
+                "format": "Q4_K",
+                "offset": 0,
+                "length": q4k_len,
+            },
+            {
+                "key": "layers.0.self_attn.v_proj.weight",
+                "shape": [1024, 2560],
+                "format": "Q6_K",
+                "offset": q4k_len,
+                "length": q6k_len,
+            }
+        ]);
+        let tmp = make_vindex_with_attn_q4k(&payload, manifest);
+        let mut idx = empty_vindex();
+        idx.load_attn_q4k(tmp.path())
+            .expect("matched Q4_K + Q6_K strides must load");
+    }
+
+    /// A Q6_K manifest entry recorded with a Q4_K-sized length (210 vs
+    /// 144 confusion at write time) must be rejected.
+    #[test]
+    fn load_attn_q4k_rejects_q6k_with_q4k_stride() {
+        let wrong_len = 1024 * (2560 / 256) * 144; // Q4_K stride applied to a Q6_K tensor
+        let payload = vec![0u8; wrong_len];
+        let manifest = serde_json::json!([
+            {
+                "key": "layers.0.self_attn.v_proj.weight",
+                "shape": [1024, 2560],
+                "format": "Q6_K",
+                "offset": 0,
+                "length": wrong_len,
+            }
+        ]);
+        let tmp = make_vindex_with_attn_q4k(&payload, manifest);
+        let mut idx = empty_vindex();
+        idx.load_attn_q4k(tmp.path())
+            .expect_err("Q6_K tensor with Q4_K length must be rejected");
     }
 }

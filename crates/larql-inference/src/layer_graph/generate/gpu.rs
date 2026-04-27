@@ -62,6 +62,38 @@ pub fn generate(
 }
 
 /// Multi-token generation with explicit sampling and EOS configuration.
+/// Identical to [`generate_streaming`] but with no per-token callback.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_with_sampling(
+    weights: &mut ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    index: &larql_vindex::VectorIndex,
+    backend: &dyn ComputeBackend,
+    cached_layers: &CachedLayerGraph,
+    layer_range: std::ops::Range<usize>,
+    sampling: SamplingConfig,
+    eos: &EosConfig,
+) -> GenerateResult {
+    generate_streaming(
+        weights,
+        tokenizer,
+        token_ids,
+        max_tokens,
+        index,
+        backend,
+        cached_layers,
+        layer_range,
+        sampling,
+        eos,
+        |_, _, _| {},
+    )
+}
+
+/// Streaming multi-token generation. Fires `on_token(id, text, prob)` for
+/// every generated token as it's produced, including the first (which
+/// comes out of prefill).
 ///
 /// Pipeline:
 ///
@@ -77,9 +109,12 @@ pub fn generate(
 ///    semantics by emitting only the cumulative-decode delta.
 /// 6. EOS check via `eos.is_eos(tid, &tok_str)`.
 ///
+/// `on_token` is invoked synchronously inside the decode loop. For UI
+/// printing pass `|_, text, _| { print!("{text}"); std::io::Write::flush(&mut std::io::stdout()).ok(); }`.
+///
 /// Returns `(token_string, probability)` per generated token plus timing.
 #[allow(clippy::too_many_arguments)]
-pub fn generate_with_sampling(
+pub fn generate_streaming<F>(
     weights: &mut ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
     token_ids: &[u32],
@@ -90,7 +125,11 @@ pub fn generate_with_sampling(
     layer_range: std::ops::Range<usize>,
     sampling: SamplingConfig,
     eos: &EosConfig,
-) -> GenerateResult {
+    mut on_token: F,
+) -> GenerateResult
+where
+    F: FnMut(u32, &str, f64),
+{
     // Backends that don't implement the fused Q4 prefill (today: CpuBackend)
     // delegate to the CPU Q4K per-layer dequant path. It mutates `weights.tensors`
     // per layer and needs &mut; this is the sole reason `generate` itself takes
@@ -367,6 +406,7 @@ pub fn generate_with_sampling(
             weights.arch.logits_scaling(),
             weights.arch.final_logit_softcapping(),
         );
+        on_token(picked_id, &tok_str, prob);
         tokens.push((tok_str, prob));
     }
 
@@ -580,6 +620,7 @@ pub fn generate_with_sampling(
                 t_norm += norm_ms;
                 t_lmhead += lmhead_ms;
                 t_detok += detok_ms;
+                on_token(picked_id, &tok_str, prob);
                 tokens.push((tok_str, prob));
                 current_token_id = picked_id;
                 if is_eos {

@@ -44,9 +44,7 @@ impl MetalBackend {
         } else {
             layer_head_dim
         };
-        let uses_q4k = layer.wq.format == crate::QuantFormat::Q4_K
-            || layer.wq.format == crate::QuantFormat::Q6_K
-            || layer.wq.format == crate::QuantFormat::Q4_KF;
+        let uses_q4k = layer.wq.format.is_q4k_family();
         let layer_q_dim = layer_num_q_heads * layer_head_dim;
         let window_size = layer.sliding_window as u32;
 

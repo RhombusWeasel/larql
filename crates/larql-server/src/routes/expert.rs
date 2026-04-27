@@ -73,10 +73,14 @@ fn run_expert(
     let model = state.model_or_err(None)?;
 
     // Ownership check: reject if this shard doesn't own this expert.
-    if let Some((start, end)) = model.expert_filter {
-        if expert_id < start || expert_id > end {
+    // `expert_filter` uses the half-open `[start, end_exclusive)` convention
+    // returned by `parse_layer_range`, so the upper bound is exclusive.
+    // Display the inclusive bound in the error message to match the CLI flag.
+    if let Some((start, end_excl)) = model.expert_filter {
+        if expert_id < start || expert_id >= end_excl {
+            let end_inclusive = end_excl.saturating_sub(1);
             return Err(ServerError::BadRequest(format!(
-                "expert {expert_id} not owned by this shard (owns {start}–{end})"
+                "expert {expert_id} not owned by this shard (owns {start}–{end_inclusive})"
             )));
         }
     }

@@ -166,14 +166,16 @@ impl MetalBackend {
             && layer.wv.format == crate::QuantFormat::Q6_K;
 
         if uniform_q4k {
-            let fused_pipe = if layer.wq.format == crate::QuantFormat::Q4_KF {
-                &self.q4kf_qkv_proj_pipeline
+            use crate::metal::stages::qkv_proj::FusedQkvKernel;
+            let (fused_pipe, fused_kernel) = if layer.wq.format == crate::QuantFormat::Q4_KF {
+                (&self.q4kf_qkv_proj_pipeline, FusedQkvKernel::Q4kf)
             } else {
-                &self.q4k_qkv_proj_pipeline
+                (&self.q4k_qkv_proj_pipeline, FusedQkvKernel::Q4k)
             };
             crate::metal::stages::qkv_proj::encode_fused_f32(
                 enc,
                 &fused_pipe.state,
+                fused_kernel,
                 bufs.wq,
                 bufs.wk,
                 bufs.wv,

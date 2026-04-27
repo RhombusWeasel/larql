@@ -27,15 +27,53 @@ pub struct Proj<'a> {
     pub rows: usize,
 }
 
+/// Threadgroup geometry for a fused-QKV f32-input kernel.
+///
+/// The two kernels we dispatch from [`encode_fused_f32`] use different
+/// per-TG row counts and thread counts:
+///
+/// - `q4k_qkv_proj` (the simple Q4_K shader): 8 rows/TG, 256 threads/TG.
+/// - `q4kf_qkv_proj` (llama.cpp-exact Q4_KF shader): 4 rows/TG, 64 threads/TG.
+///
+/// Both shaders' constants are exported as `ROWS_PER_TG`/`THREADS_PER_TG`
+/// from their respective Rust modules. Dispatching with the wrong
+/// geometry silently leaves rows unwritten (the kernel's `if (global_row
+/// >= total_rows) return` guard hides the under-coverage). Pass the
+/// matching `FusedQkvKernel` so the row check on the host stays in sync.
+#[derive(Clone, Copy)]
+pub enum FusedQkvKernel {
+    /// `shaders::q4k_qkv_proj::QkvKernel` — Q4_K simple (8 rows/TG, 256 threads).
+    Q4k,
+    /// `shaders::q4kf_qkv_proj::Kernel` — Q4_KF llama.cpp-port (4 rows/TG, 64 threads).
+    Q4kf,
+}
+
+impl FusedQkvKernel {
+    fn rows_per_tg(self) -> u64 {
+        match self {
+            Self::Q4k => crate::metal::shaders::q4k_qkv_proj::ROWS_PER_TG,
+            Self::Q4kf => crate::metal::shaders::q4kf_qkv_proj::ROWS_PER_TG,
+        }
+    }
+    fn threads_per_tg(self) -> u64 {
+        match self {
+            Self::Q4k => crate::metal::shaders::q4k_qkv_proj::THREADS_PER_TG,
+            Self::Q4kf => crate::metal::shaders::q4kf_qkv_proj::THREADS_PER_TG,
+        }
+    }
+}
+
 /// Fused Q4_K / Q4_KF QKV — all three projections same format.
 ///
-/// Dispatches `q4kf_qkv_proj` (preferred, 144-byte GGUF) or its legacy
-/// 148-byte fallback if only that's available. Writes Q / K / V outputs
-/// at their respective byte offsets.
+/// Dispatches the kernel referenced by `pipeline`. The `kernel`
+/// discriminant must match — see [`FusedQkvKernel`] — because the two
+/// kernels have different per-TG geometries that must agree on the host
+/// or rows go unwritten.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_fused_f32(
     enc: &ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
+    kernel: FusedQkvKernel,
     wq_buf: &Buffer,
     wk_buf: &Buffer,
     wv_buf: &Buffer,
@@ -51,13 +89,12 @@ pub fn encode_fused_f32(
     kv_rows: usize,
     hidden: usize,
 ) {
-    use crate::metal::shaders::q4kf_qkv_proj as q4kf_qkv;
     let total_rows = (q_rows + kv_rows + kv_rows) as u32;
     let q_rows_val = q_rows as u32;
     let k_rows_val = kv_rows as u32;
     let v_rows_val = kv_rows as u32;
     let k_val = hidden as u32;
-    let num_tgs = (total_rows as u64).div_ceil(q4kf_qkv::ROWS_PER_TG);
+    let num_tgs = (total_rows as u64).div_ceil(kernel.rows_per_tg());
     enc.set_compute_pipeline_state(pipeline);
     enc.set_buffer(0, Some(wq_buf), 0);
     enc.set_buffer(1, Some(wk_buf), 0);
@@ -72,7 +109,7 @@ pub fn encode_fused_f32(
     enc.set_bytes(10, 4, &k_val as *const u32 as *const c_void);
     enc.dispatch_thread_groups(
         MTLSize::new(num_tgs, 1, 1),
-        MTLSize::new(q4kf_qkv::THREADS_PER_TG, 1, 1),
+        MTLSize::new(kernel.threads_per_tg(), 1, 1),
     );
 }
 

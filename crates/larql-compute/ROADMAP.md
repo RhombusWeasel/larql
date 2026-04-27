@@ -83,12 +83,13 @@ The stash that fixed the dispatch to `ROWS_PER_TG = 2` made the output correct b
 1. **✅ q6k_matvec ROWS_PER_TG mismatch** — FIXED. Shader and Rust constants both set
    to 4. All 2560 rows now covered; dense model back to 78.7 tok/s. See entry above.
 
-2. **Mixed Q4_K/Q6_K QKV fused V path (open).**
-   `cargo test -p larql-compute --features metal` fails
-   `q4k_q6k_qkv_proj_normed_matches_separate_norm_and_proj` (pre-existing, not introduced
-   by MoE work). The dedicated fused-QKV shader's V branch drifted from the standalone
-   `q6k_matvec` implementation. Production-routed for Gemma 3/4 (`Q4_K` Q/K + `Q6_K` V);
-   fix before treating QKV fusion as a closed dispatch win.
+2. **✅ Mixed Q4_K/Q6_K QKV fused V path** — resolved 2026-04-26 (stale entry).
+   The named test `q4k_q6k_qkv_proj_normed_matches_separate_norm_and_proj`
+   passes against `q6k_matvec` at the original 512-hidden test geometry
+   AND at production hidden=2560 (10 super-blocks/row). Added
+   `q4k_q6k_qkv_proj_normed_matches_at_production_hidden` regression
+   test pinning the larger shape so any future drift is caught at
+   production K, not via a model-output bug report.
 
 3. **MoE GPU dispatch: activation scratch not padded to `inter_padded` (open).**
    `gpu_moe_dispatch` dispatches expert down with `K = inter_padded` but the activation
@@ -233,7 +234,7 @@ Saves ~0.33ms for top_k=1 callers. Implemented on MetalBackend. Main decode loop
 uses the KNN lm_head path (top_k=5 → KNN fires first), so this doesn't yet
 benefit the bench. Useful for non-KNN models and future greedy-decode APIs.
 
-### Q4_K `sumy` precompute (2026-04-26)
+### Q4_K `sumy` precompute (2026-04-26, measured 2026-04-27 — no measurable gain)
 
 Separated the X-sum used in the min-correction term from the FMA dot-product
 loop in `q4k_matvec` and `q4k_ffn_gate_up`. Previously both shared one loop
@@ -242,8 +243,19 @@ runs first, leaving the dot loop as a pure FMA chain the compiler can
 schedule without interleaved additions. Applied to both the standalone matvec
 and the fused gate+up shader.
 
-Expected: minor compiler scheduling win on the ALU-limited K=2560 path.
-Measured gain TBD — run `larql bench gemma3-4b-q4k-downq4k` before/after.
+**Measured 2026-04-27 on the all-Q4_K extract (`gemma3-4b-q4k-downq4k`),
+3 runs each, identical bench setup:**
+
+| Shader form | Run 1 | Run 2 | Run 3 | GPU fwd |
+|---|---|---|---|---|
+| With `sumy` precompute (split loops) | 71.7 | 72.3 | 72.1 | 12.67–12.74 ms |
+| Without (combined `dot_acc` / `sum_acc`) | 72.4 | 71.6 | 72.9 | 12.62–12.77 ms |
+
+Difference is within run-to-run variance — the Apple Silicon shader compiler
+schedules the combined loop just as well as the split form. Kept the split
+version anyway since it's cleaner code for future readers; no perf regression
+either direction. Worth flagging that this micro-optimisation didn't pan out
+so future "split the FMA chain from the sum" attempts know the answer.
 
 ### #6 — Q4_K kernel optimization (explored 2026-04-26, blocked by ALU bound)
 
@@ -412,17 +424,25 @@ Added `ShaderKernel` trait + `get_shader_pipeline::<T>()` to
 exports a compile-time `NAME` constant — renaming a shader causes a
 compile error rather than a silent runtime panic.
 
-### #7 — `QuantFormat` pattern-match spread (open)
+### #7 — `QuantFormat` pattern-match spread (partial — classifiers shipped 2026-04-27)
 
-14 files independently `match QuantFormat::*`. Adding FP4 / FP8 /
-BF16 = 14 file edits.
+**Classifier helpers shipped:** `QuantFormat::is_q4k_family()` /
+`is_q4kf()` / `is_legacy_q8()` on `pipeline.rs`. The most-duplicated
+predicate (`format == Q4_K || == Q4_KF || == Q6_K`, repeated verbatim
+in `decode/mod.rs` ×2 and `decode_hybrid.rs` ×1) collapses to a single
+method call. Adding a future Q4_K-style format updates one classifier,
+not 3+ OR-chains. Pinned by `quant_format_classifiers` test.
 
-Introduce a `FormatRoute` enum computed once per layer
-(`F32Input { fused_down: Option<&KernelHandle> }`,
-`Q8Input { norm_q8: …, qkv_q8: … }`, etc.) with the `match
-QuantFormat::*` confined to one constructor in
-`metal/stages/quant_matvec.rs`. Callers receive the opaque route.
-Adding FP4 = one match arm.
+**Full `FormatRoute` enum DEFERRED.** The roadmap intent
+(`F32Input { fused_down: Option<&KernelHandle> }` / `Q8Input { norm_q8,
+qkv_q8 }` / etc., with the `match QuantFormat::*` confined to one
+constructor in `metal/stages/quant_matvec.rs`) is a 49-file refactor —
+every dispatch site that currently matches on `QuantFormat` would need
+to switch to consuming a `FormatRoute`. Doing it concurrently with the
+in-flight MoE struct refactor risks heavy merge conflicts. Defer until
+MoE settles AND there's a concrete near-term need (e.g. an FP4 / FP8
+format being added). The classifier helpers above absorb the immediate
+duplication cost in the meantime.
 
 ### #8 — `Pipelines` struct asymmetry (DONE)
 
@@ -431,14 +451,24 @@ All fields in `metal/stages/quant_matvec.rs::Pipelines` now use
 a silent dispatch mismatch. ~100 LOC mechanical migration across
 callsites.
 
-### #9 — `FullPipelineLayer` 63 pub fields (open)
+### #9 — `FullPipelineLayer` 63 pub fields (partial — `Default` shipped 2026-04-27)
 
-Constructing one for tests is 30 lines of `field: junk`. Split into
-`LayerWeights { wq, wk, wv, wo, gate, up, down }` +
-`LayerNorms { input_norm, post_attn_norm, … }` +
-`LayerArchParams { eps, attn_scale, head_dim, … }` + optional
-`MoeBlock` (already exists). Tests construct just the relevant
-subset. ~200 LOC of restructuring + caller updates.
+**Test ergonomics fix shipped:** `FullPipelineLayer` and `QuantWeight` now
+implement `Default`, so test code uses
+`FullPipelineLayer { wq, ..Default::default() }` instead of spelling out 30
+fields. The pre-existing `minimal_layer` helper collapsed from 30 lines to
+10. New `default_layer_accepts_local_borrows_via_spread` test pins the
+pattern for future tests (verifies `..Default::default()` reborrows the
+`'static` defaults at the caller's stack-local lifetime — typical Rust
+HRTB territory but worth a test since it's a non-obvious property).
+
+**Full sub-struct split DEFERRED.** The roadmap intent
+(`LayerWeights` / `LayerNorms` / `LayerArchParams` / optional `MoeBlock`)
+is a 30+ caller-file refactor. Doing it concurrently with the in-flight
+MoE struct refactor (ongoing in this branch) risks merge conflicts on
+`pipeline.rs`. Pick this back up once MoE work settles. The `Default`
+impl removes the immediate test pain — that was the user-visible cost
+of #9.
 
 ### #10 — `dispatch_full_pipeline` 30+ params (open)
 

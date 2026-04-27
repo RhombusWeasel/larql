@@ -20,6 +20,40 @@ pub enum QuantFormat {
     F32,   // raw float32  (4 bytes per value)
 }
 
+impl QuantFormat {
+    /// Whether this format uses the GGUF "Q4_K family" 256-element
+    /// super-block layout that flows through the dedicated Q4_K /
+    /// Q4_KF / Q6_K matvec dispatchers (vs the legacy block-32
+    /// Q4_0 / Q8_0 path). Used to gate the "skip Q8 quantize"
+    /// fast path in `residual_norm` and FFN routing.
+    ///
+    /// Adding a future Q4_K-style format (e.g. a hypothetical Q5_K)
+    /// would update this one method, not the ~10 OR-chains it
+    /// currently replaces. Roadmap #7 (`FormatRoute` enum) is the
+    /// fuller version of this idea; this helper is the contained
+    /// step that addresses the user-visible code-duplication cost
+    /// without rippling through 49 files.
+    pub fn is_q4k_family(self) -> bool {
+        matches!(self, Self::Q4_K | Self::Q4_KF | Self::Q6_K)
+    }
+
+    /// Whether this format uses the llama.cpp-exact "Q4_KF" pre-baked
+    /// half-scale fast path (`q4kf_proj` shader). Distinct from the
+    /// canonical `Q4_K` GGUF layout used by Ollama extracts.
+    pub fn is_q4kf(self) -> bool {
+        matches!(self, Self::Q4_KF)
+    }
+
+    /// Whether this format uses the legacy block-32 Q8 dispatch path
+    /// (`q4_matvec` / `q8_matvec` against pre-quantised Q8 input). The
+    /// inverse of [`Self::is_q4k_family`] for the dense matvec dispatch
+    /// (the float-input `BF16` / `F16` / `F32` branches don't run on
+    /// these dispatchers, so `is_legacy_q8` covers exactly the rest).
+    pub fn is_legacy_q8(self) -> bool {
+        matches!(self, Self::Q4_0 | Self::Q8_0)
+    }
+}
+
 /// A quantized weight matrix — raw bytes with format tag.
 #[derive(Clone, Copy)]
 pub struct QuantWeight<'a> {
@@ -205,6 +239,70 @@ impl<'a> FullPipelineLayer<'a> {
     }
 }
 
+// ── Defaults ──
+//
+// `Default` for the leaf types (`QuantWeight`, `FullPipelineLayer`, …) lets
+// tests construct minimal instances with `..Default::default()` instead of
+// spelling out all 30+ fields. The roadmap's "FullPipelineLayer 63 pub
+// fields" cleanup tracks a fuller restructure into LayerWeights /
+// LayerNorms / LayerArchParams sub-structs; that's deferred until the
+// MoE refactor settles. In the meantime `Default` collapses the test
+// boilerplate without rippling through 30 caller files.
+
+impl Default for QuantWeight<'_> {
+    fn default() -> Self {
+        Self {
+            data: &[],
+            scales: None,
+            format: QuantFormat::Q4_0,
+        }
+    }
+}
+
+impl Default for FullPipelineLayer<'_> {
+    fn default() -> Self {
+        let qw = QuantWeight::default();
+        Self {
+            wq: qw,
+            wk: qw,
+            wv: qw,
+            wo: qw,
+            gate: qw,
+            up: qw,
+            down: qw,
+            input_norm: &[],
+            post_attn_norm: &[],
+            pre_ffn_norm: None,
+            post_ffn_norm: None,
+            input_norm_bias: None,
+            post_attn_norm_bias: None,
+            norm_offset: 0.0,
+            qk_norm_offset: 0.0,
+            eps: 1e-6,
+            has_post_norms: false,
+            norm_type: NormType::RmsNorm,
+            ffn_type: FfnType::Gated,
+            activation: Activation::Silu,
+            attn_scale: 1.0,
+            head_dim: 0,
+            num_q_heads: 0,
+            num_kv_heads: 0,
+            rope_base: 10000.0,
+            rotary_dim: 0,
+            sliding_window: 0,
+            has_v_norm: false,
+            layer_scalar: 0.0,
+            q_norm_weight: None,
+            k_norm_weight: None,
+            ffn_up_bias: None,
+            ffn_down_bias: None,
+            moe: None,
+            moe_combined_output_norm: false,
+            moe_outer_post_norm: None,
+        }
+    }
+}
+
 // ── Backward compatibility: convert old-style bool to new enums ──
 
 impl From<bool> for Activation {
@@ -237,6 +335,9 @@ mod tests {
         moe: Option<MoeLayerWeights<'a>>,
     ) -> FullPipelineLayer<'a> {
         let qw = minimal_qw(data);
+        // Spread `..Default::default()` collapses the 30-field boilerplate
+        // to just the fields this test actually exercises. Pin this pattern
+        // so any future test that wants a minimal layer copies it.
         FullPipelineLayer {
             wq: qw,
             wk: qw,
@@ -247,33 +348,13 @@ mod tests {
             down: qw,
             input_norm: norms,
             post_attn_norm: norms,
-            pre_ffn_norm: None,
-            post_ffn_norm: None,
-            input_norm_bias: None,
-            post_attn_norm_bias: None,
-            norm_offset: 0.0,
-            qk_norm_offset: 0.0,
-            eps: 1e-6,
-            has_post_norms: false,
-            norm_type: NormType::RmsNorm,
             ffn_type,
-            activation: Activation::Silu,
             attn_scale: 0.5,
             head_dim: 4,
             num_q_heads: 1,
             num_kv_heads: 1,
-            rope_base: 10000.0,
-            rotary_dim: 0,
-            sliding_window: 0,
-            has_v_norm: false,
-            layer_scalar: 0.0,
-            q_norm_weight: None,
-            k_norm_weight: None,
-            ffn_up_bias: None,
-            ffn_down_bias: None,
             moe,
-            moe_combined_output_norm: false,
-            moe_outer_post_norm: None,
+            ..FullPipelineLayer::default()
         }
     }
 
@@ -325,5 +406,62 @@ mod tests {
         assert_eq!(QuantFormat::Q4_K, QuantFormat::Q4_K);
         assert_ne!(QuantFormat::Q4_K, QuantFormat::Q6_K);
         assert_ne!(QuantFormat::Q4_0, QuantFormat::Q4_KF);
+    }
+
+    /// Pin the Q4_K-family taxonomy. Adding a new format requires
+    /// updating exactly one of these classifiers.
+    #[test]
+    fn quant_format_classifiers() {
+        // Q4_K family (256-element super-blocks)
+        assert!(QuantFormat::Q4_K.is_q4k_family());
+        assert!(QuantFormat::Q4_KF.is_q4k_family());
+        assert!(QuantFormat::Q6_K.is_q4k_family());
+        // Legacy block-32 Q8 path
+        assert!(QuantFormat::Q4_0.is_legacy_q8());
+        assert!(QuantFormat::Q8_0.is_legacy_q8());
+        // Float-input formats are neither
+        for fmt in [QuantFormat::BF16, QuantFormat::F16, QuantFormat::F32] {
+            assert!(!fmt.is_q4k_family());
+            assert!(!fmt.is_legacy_q8());
+        }
+        // Q4_KF is a subset of Q4_K-family
+        assert!(QuantFormat::Q4_KF.is_q4kf());
+        assert!(!QuantFormat::Q4_K.is_q4kf());
+        assert!(!QuantFormat::Q6_K.is_q4kf());
+    }
+
+    /// `..Default::default()` must work with stack-local borrowed data —
+    /// the compiler reborrows the `'static` defaults at the caller's
+    /// shorter lifetime. Pin the pattern.
+    #[test]
+    fn default_layer_accepts_local_borrows_via_spread() {
+        let data: Vec<u8> = vec![0, 1, 2];
+        let norms: Vec<f32> = vec![1.0; 4];
+
+        let layer = FullPipelineLayer {
+            input_norm: &norms,
+            post_attn_norm: &norms,
+            wq: QuantWeight {
+                data: &data,
+                ..Default::default()
+            },
+            head_dim: 4,
+            num_q_heads: 1,
+            num_kv_heads: 1,
+            ..Default::default()
+        };
+
+        // Defaulted fields carry through.
+        assert_eq!(layer.eps, 1e-6);
+        assert_eq!(layer.norm_type, NormType::RmsNorm);
+        assert_eq!(layer.ffn_type, FfnType::Gated);
+        assert_eq!(layer.activation, Activation::Silu);
+        assert!(!layer.has_v_norm);
+        assert!(layer.moe.is_none());
+
+        // Explicit fields are honoured.
+        assert_eq!(layer.input_norm.len(), 4);
+        assert_eq!(layer.wq.data.len(), 3);
+        assert_eq!(layer.head_dim, 4);
     }
 }

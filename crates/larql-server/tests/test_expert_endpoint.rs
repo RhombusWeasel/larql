@@ -278,6 +278,20 @@ fn make_loaded_model(
     }
 }
 
+/// Variant that sets `expert_filter` on the returned model. Used to test
+/// `--experts START-END` ownership enforcement.
+fn make_loaded_model_with_filter(
+    gate_up: Vec<u8>,
+    down: Vec<u8>,
+    router_proj: Vec<f32>,
+    pre_norm: Vec<f32>,
+    filter: (usize, usize),
+) -> LoadedModel {
+    let mut m = make_loaded_model(gate_up, down, router_proj, pre_norm);
+    m.expert_filter = Some(filter);
+    m
+}
+
 // ── Server helper ─────────────────────────────────────────────────────────────
 
 async fn spawn_server_with_model(model: LoadedModel) -> String {
@@ -628,5 +642,94 @@ async fn expert_endpoint_no_shard_error() {
     assert!(
         matches!(err, Err(RemoteMoeError::NoShard { expert_id: 3 })),
         "expected NoShard(3), got {err:?}"
+    );
+}
+
+/// Regression test: `--experts 0-1` (CLI) → `expert_filter = (0, 2)` (the
+/// half-open range `parse_layer_range` produces). The route handler must
+/// REJECT expert 2 even though it's at the half-open upper bound — earlier
+/// the inclusive `>` check let `expert_id == end` slip through, exposing a
+/// neighbour shard's experts. Test covers boundaries: 0 (in), 1 (in, last),
+/// 2 (out, off-by-one), 3 (out, far).
+#[tokio::test]
+async fn expert_filter_rejects_at_upper_bound() {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use larql_server::{
+        cache::DescribeCache, routes::single_model_router, session::SessionManager,
+        state::AppState,
+    };
+    use std::sync::atomic::AtomicU64;
+    use tower::ServiceExt as _;
+
+    let gate_up = make_gate_up_bytes();
+    let down = make_down_bytes();
+    let router_proj = make_router_proj();
+    let pre_norm = make_pre_norm();
+    let h = make_input();
+
+    // Filter: (0, 2) = inclusive 0-1 = `--experts 0-1`.
+    let model = make_loaded_model_with_filter(gate_up, down, router_proj, pre_norm, (0, 2));
+    let state = Arc::new(AppState {
+        models: vec![Arc::new(model)],
+        started_at: std::time::Instant::now(),
+        requests_served: AtomicU64::new(0),
+        api_key: None,
+        sessions: SessionManager::new(3600),
+        describe_cache: DescribeCache::new(60),
+    });
+    let app = single_model_router(state);
+
+    async fn call(
+        app: axum::Router,
+        h: &[f32],
+        id: usize,
+    ) -> (StatusCode, String) {
+        let body_str = serde_json::json!({ "residual": h }).to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/expert/0/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body_str))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        (status, text)
+    }
+
+    let (s0, _) = call(app.clone(), &h, 0).await;
+    assert_eq!(s0, StatusCode::OK, "expert 0 (in-range) must succeed");
+
+    let (s1, _) = call(app.clone(), &h, 1).await;
+    assert_eq!(s1, StatusCode::OK, "expert 1 (last in-range) must succeed");
+
+    let (s2, body2) = call(app.clone(), &h, 2).await;
+    assert_eq!(
+        s2,
+        StatusCode::BAD_REQUEST,
+        "expert 2 (one past the inclusive end) MUST be rejected — \
+         this catches the half-open vs inclusive off-by-one. body: {body2}"
+    );
+    assert!(
+        body2.contains("not owned"),
+        "rejection body must explain ownership: {body2}"
+    );
+    // Error message displays the inclusive bound, not the half-open one.
+    assert!(
+        body2.contains("0–1") || body2.contains("0-1"),
+        "error message must show inclusive range 0–1, not 0–2; got: {body2}"
+    );
+
+    let (s3, _) = call(app, &h, 3).await;
+    assert_eq!(
+        s3,
+        StatusCode::BAD_REQUEST,
+        "expert 3 (well out of range) must be rejected"
     );
 }

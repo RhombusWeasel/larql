@@ -25,8 +25,9 @@ mod template;
 mod walk;
 
 pub use generate::{
-    generate, generate_constrained, generate_with_sampling, lm_head_topk, Detokenizer, EosConfig,
-    GenerateResult, Sampler, SamplingConfig, StageTimings,
+    generate, generate_constrained, generate_streaming, generate_with_sampling, lm_head_topk,
+    ChatMLRenderer, ChatSession, Detokenizer, EosConfig, GemmaRenderer, GenerateResult,
+    Llama3Renderer, Sampler, SamplingConfig, StageTimings, TurnRenderer,
 };
 
 use ndarray::Array2;

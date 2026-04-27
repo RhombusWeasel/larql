@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut cb = SilentLoadCallbacks;
     let mut index = VectorIndex::load_vindex(&vindex_path, &mut cb)?;
-    index.load_lm_head(&vindex_path)?;
+    let _ = index.load_lm_head(&vindex_path);
     let _ = index.load_lm_head_q4(&vindex_path);
     let _ = index.load_attn_q4k(&vindex_path);
     let _ = index.load_attn_q8(&vindex_path);

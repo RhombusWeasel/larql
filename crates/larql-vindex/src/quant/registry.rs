@@ -76,6 +76,21 @@ impl QuantFormatInfo {
         Some((n_cols / self.block_elements) * self.bytes_per_block)
     }
 
+    /// Total bytes for a `[rows, cols]` tensor. Returns `None` when the
+    /// shape doesn't have a clean rows × cols layout or `cols` isn't a
+    /// whole number of blocks. Used for stride validation against
+    /// recorded manifest lengths — catches stale vindexes built with a
+    /// different block size than the current kernel decodes.
+    #[inline]
+    pub fn expected_bytes(&self, shape: &[usize]) -> Option<usize> {
+        if shape.len() != 2 {
+            return None;
+        }
+        let rows = shape[0];
+        let cols = shape[1];
+        Some(rows * self.bytes_per_row(cols)?)
+    }
+
     /// Convenience: dequantise one block and return the f32 vector.
     /// Routes to the registered `dequantize` fn pointer.
     pub fn dequantize_block(&self, bytes: &[u8]) -> Result<Vec<f32>, larql_models::ModelError> {
@@ -159,5 +174,63 @@ mod tests {
         assert_eq!(q4k.bytes_per_row(2048), Some(1152));
         // hidden = 100 not a multiple of 256 → None
         assert_eq!(q4k.bytes_per_row(100), None);
+    }
+
+    #[test]
+    fn expected_bytes_q4k_gemma3_4b_q_proj() {
+        // Gemma 3 4B layer-0 q_proj: shape=[2048, 2560]. Q4_K (144 bytes
+        // per 256-element block, 10 blocks per row, 2048 rows).
+        let q4k = lookup("Q4_K").unwrap();
+        assert_eq!(q4k.expected_bytes(&[2048, 2560]), Some(2_949_120));
+    }
+
+    #[test]
+    fn expected_bytes_q4k_gemma3_4b_k_proj() {
+        // Gemma 3 4B layer-0 k_proj: shape=[1024, 2560]. Half the rows of q.
+        let q4k = lookup("Q4_K").unwrap();
+        assert_eq!(q4k.expected_bytes(&[1024, 2560]), Some(1_474_560));
+    }
+
+    #[test]
+    fn expected_bytes_q6k_v_proj() {
+        // V projection at Q6_K: 210 bytes per 256-element block.
+        let q6k = lookup("Q6_K").unwrap();
+        assert_eq!(q6k.expected_bytes(&[1024, 2560]), Some(2_150_400));
+    }
+
+    #[test]
+    fn expected_bytes_rejects_non_2d_shape() {
+        let q4k = lookup("Q4_K").unwrap();
+        assert_eq!(q4k.expected_bytes(&[]), None);
+        assert_eq!(q4k.expected_bytes(&[100]), None);
+        assert_eq!(q4k.expected_bytes(&[10, 20, 30]), None);
+    }
+
+    #[test]
+    fn expected_bytes_rejects_non_block_aligned_cols() {
+        let q4k = lookup("Q4_K").unwrap();
+        // cols not a multiple of 256 → can't fit clean blocks.
+        assert_eq!(q4k.expected_bytes(&[10, 100]), None);
+    }
+
+    #[test]
+    fn expected_bytes_does_not_match_legacy_148_byte_stride() {
+        // Regression: vindexes built with the legacy 148-byte block_q4_K
+        // layout record `length = rows × cols / 256 × 148` in their
+        // manifest. The current GGUF kernel decodes 144-byte blocks; if
+        // the loader silently accepts the longer length, every read
+        // drifts 4 bytes per superblock and the GPU prefill output is
+        // all-NaN. `expected_bytes` for the 144-byte stride must NOT
+        // equal the legacy length, so the loader's `expected != length`
+        // check fires.
+        let q4k = lookup("Q4_K").unwrap();
+        let legacy_length = 2048 * (2560 / 256) * 148; // 3,031,040
+        let current_expected = q4k.expected_bytes(&[2048, 2560]).unwrap();
+        assert_ne!(
+            current_expected, legacy_length,
+            "144-byte expected ({current_expected}) must differ from legacy 148-byte stride ({legacy_length}) — \
+             otherwise the loader can't tell stale vindexes from current ones"
+        );
+        assert_eq!(current_expected, 2_949_120);
     }
 }

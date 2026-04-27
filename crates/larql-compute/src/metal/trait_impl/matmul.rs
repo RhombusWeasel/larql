@@ -245,8 +245,10 @@ impl MetalBackend {
         scores: &metal::Buffer,
         n: usize,
     ) -> (metal::Buffer, metal::Buffer, usize) {
-        const ARGMAX_TG_SZ: u64 = 256;
-        let argmax_tgs = (n as u64).div_ceil(ARGMAX_TG_SZ);
+        // Same TG width as `encode_topk_partial` — flows from the Rust
+        // constant the templated MSL is built from.
+        let tg_sz = crate::metal::shaders::f32_gemv::PARTIAL_TG_SZ;
+        let argmax_tgs = (n as u64).div_ceil(tg_sz);
         let partial_vals = self.bufs.output(argmax_tgs * 4);
         let partial_idxs = self.bufs.output(argmax_tgs * 4);
         let n_u32 = n as u32;
@@ -257,7 +259,7 @@ impl MetalBackend {
         enc.set_bytes(3, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
         enc.dispatch_thread_groups(
             metal::MTLSize::new(argmax_tgs, 1, 1),
-            metal::MTLSize::new(ARGMAX_TG_SZ, 1, 1),
+            metal::MTLSize::new(tg_sz, 1, 1),
         );
         (partial_vals, partial_idxs, argmax_tgs as usize)
     }
@@ -306,7 +308,7 @@ impl MetalBackend {
     ) -> (metal::Buffer, metal::Buffer, usize) {
         // TG width and per-TG K both flow from the same Rust constants the
         // MSL source is templated from; can't drift.
-        let tg_sz = crate::metal::shaders::f32_gemv::TOPK_TG_SZ;
+        let tg_sz = crate::metal::shaders::f32_gemv::PARTIAL_TG_SZ;
         let k_topk = crate::metal::shaders::f32_gemv::K_TOPK as u64;
         let topk_tgs = (n as u64).div_ceil(tg_sz);
         let partial_vals = self.bufs.output(topk_tgs * k_topk * 4);
