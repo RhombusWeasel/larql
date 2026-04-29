@@ -426,10 +426,10 @@ fn run_moe_block(
         &h_norm, &router_proj, &router_per_expert_scale, &router_norm,
         router_norm_parameter_free, router_input_scalar, num_experts, top_k, hidden, eps, norm_offset,
     );
-    println!("  router_in=raw_h    top_k: {idx_raw:?}  ← HF Gemma 4 convention");
+    println!("  router_in=raw_h    top_k: {idx_raw:?}");
     println!("    weights:                 {}",
         w_raw.iter().map(|w| format!("{w:.4}")).collect::<Vec<_>>().join(" "));
-    println!("  router_in=h_norm   top_k: {idx_norm:?}");
+    println!("  router_in=h_norm   top_k: {idx_norm:?}  ← Metal/GPU convention");
     println!("    weights:                 {}",
         w_norm.iter().map(|w| format!("{w:.4}")).collect::<Vec<_>>().join(" "));
     let same: Vec<usize> = idx_raw.iter().filter(|&&e| idx_norm.contains(&e)).copied().collect();
@@ -771,18 +771,16 @@ fn reference_moe_block(
         dump3("ref h_norm        ", &h_norm);
     }
 
-    // 2. Router input norm — applied to RAW h (not h_norm).
-    //    Per HF Gemma4TextDecoderLayer.forward (modeling_gemma4.py:1380):
-    //    `self.router(hidden_states_flat)` where `hidden_states_flat` is
-    //    the raw post-attention residual, NOT the pre_feedforward_layernorm_2
-    //    output. Experts consume pre_experts_norm(raw_h); router consumes
-    //    raw_h with its own internal RMSNorm applied.
+    // 2. Router input norm — applied to h_norm (matching Metal's
+    //    `cpu_moe_route(&h_norm, ...)` and the routing-convention fix
+    //    in `cpu_moe_forward`). Empirically the trained 26B-A4B weights
+    //    expect this even though HF's modeling_gemma4.py uses raw h.
     let router_in_normed = if !router_norm.is_empty() {
-        naive_rms_norm(h, router_norm, eps, norm_offset)
+        naive_rms_norm(&h_norm, router_norm, eps, norm_offset)
     } else if router_norm_parameter_free {
-        naive_rms_norm(h, &[], eps, 0.0)
+        naive_rms_norm(&h_norm, &[], eps, 0.0)
     } else {
-        h.to_vec()
+        h_norm.clone()
     };
     let mut router_in = router_in_normed;
     if router_input_scalar != 1.0 && router_input_scalar != 0.0 {

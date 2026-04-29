@@ -47,24 +47,27 @@ pub fn cpu_moe_forward(
         return vec![0.0f32; hidden];
     }
 
-    // 1. Pre-experts norm — input for the expert matmuls only.
-    //    Per HF Gemma4TextDecoderLayer.forward (modeling_gemma4.py:1380-1382):
-    //      hidden_states_flat = residual.reshape(...)              # raw post-attn residual
-    //      _, top_k_weights, top_k_index = self.router(hidden_states_flat)
-    //      hidden_states_2 = self.pre_feedforward_layernorm_2(hidden_states_flat)
-    //    Experts get pre_experts_norm(raw_h); router gets raw_h directly.
+    // 1. Pre-experts norm — input for the expert matmuls.
+    //
+    //    The router norm composes ON TOP of this. Empirically the trained
+    //    Gemma 4 26B-A4B weights expect router input = pre_experts_norm(h),
+    //    not raw h, even though HF's modeling_gemma4.py reads the raw
+    //    residual. Switching to the HF convention degrades generation to
+    //    token repetition; this matches Metal's `gpu_moe_dispatch`
+    //    convention so all backends agree.
     let h_norm = rms_norm(h, moe.pre_experts_norm, eps, norm_offset);
 
-    // 2. Router input norm — applied to RAW h (not h_norm). Resolution order:
+    // 2. Router input norm. Resolution order:
     //      1. learned router_norm weight (architectures that ship one),
     //      2. parameter-free RMSNorm (HF Gemma 4 — `Gemma4RMSNorm(with_scale=False)`),
-    //      3. fallback: pass raw h through.
+    //      3. fallback: just use the pre-experts-norm output directly.
+    //    All three apply on top of h_norm so the routing matches Metal.
     let router_in_normed: Vec<f32> = if !moe.router_norm.is_empty() {
-        rms_norm(h, moe.router_norm, eps, norm_offset)
+        rms_norm(&h_norm, moe.router_norm, eps, norm_offset)
     } else if moe.router_norm_parameter_free {
-        rms_norm_no_weight(h, eps)
+        rms_norm_no_weight(&h_norm, eps)
     } else {
-        h.to_vec()
+        h_norm.clone()
     };
 
     // 3. Router scale (learned per-hidden-dim vector) + optional scalar

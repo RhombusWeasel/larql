@@ -459,13 +459,14 @@ fn run_with_moe_shards(
             .map_err(|e| format!("failed to tokenise prompt: {e}"))?;
     eprintln!("[chat] tokenised to {} ids", prompt_ids.len());
 
+    let eos = larql_inference::layer_graph::generate::eos::EosConfig::from_vindex_dir(vindex_path);
     let result = if dispatch == "batch" {
         generate_with_remote_moe_batch(
-            &weights, &tokenizer, prompt_ids, max_tokens, &index, &remote, &*backend,
+            &weights, &tokenizer, prompt_ids, max_tokens, &index, &remote, &*backend, &eos,
         )
     } else {
         generate_with_remote_moe(
-            &weights, &tokenizer, prompt_ids, max_tokens, &index, &remote, &*backend,
+            &weights, &tokenizer, prompt_ids, max_tokens, &index, &remote, &*backend, &eos,
         )
     }
     .map_err(|e| format!("grid generate failed ({dispatch}): {e}"))?;

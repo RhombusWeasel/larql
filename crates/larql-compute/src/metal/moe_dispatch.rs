@@ -596,14 +596,11 @@ impl MetalBackend {
         );
 
         // ── 1. CPU pre-experts norm + router ─────────────────────────────
-        // Per HF Gemma4TextDecoderLayer.forward (modeling_gemma4.py:1380):
-        //   hidden_states_flat = residual.reshape(...)
-        //   _, top_k_weights, top_k_index = self.router(hidden_states_flat)
-        //   hidden_states_2 = self.pre_feedforward_layernorm_2(hidden_states_flat)
-        // Router consumes the RAW post-attention residual; experts consume
-        // pre_experts_norm(residual). Feeding the router pre_experts_norm'd
-        // values double-normalises (router's own RMSNorm runs on top) and
-        // selects the wrong top-K experts at every layer past 0.
+        // Empirical: the trained 26B-A4B weights expect router input =
+        // pre_experts_norm(h_post_attn), not raw h_post_attn — even though
+        // HF's published Gemma4TextDecoderLayer.forward consumes the raw
+        // residual. Switching to the HF convention degrades generation to
+        // token repetition. Match the trained-weights convention here.
         let h_norm = if !moe.pre_experts_norm.is_empty() {
             let rms = (h_post_attn.iter().map(|v| v * v).sum::<f32>() / hidden as f32 + eps).sqrt();
             h_post_attn
@@ -614,7 +611,7 @@ impl MetalBackend {
         } else {
             h_post_attn.to_vec()
         };
-        let (expert_indices, expert_weights) = cpu_moe_route(h_post_attn, moe, eps);
+        let (expert_indices, expert_weights) = cpu_moe_route(&h_norm, moe, eps);
 
         // ── 2. Stage expert weight bytes into pre-allocated Metal buffers ─
         let row_bytes = scratch.row_bytes;

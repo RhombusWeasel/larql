@@ -383,18 +383,17 @@ mod tests {
 
     /// Regression test: `cpu_moe_forward` and `cpu_moe_route` must agree on
     /// the **router input convention** — both should compute the router norm
-    /// on **raw h** (not the pre-experts-normed h).
+    /// on top of the pre-experts-normed h (not raw h).
     ///
-    /// Per HF Gemma4TextDecoderLayer.forward (modeling_gemma4.py:1380-1382),
-    /// the router consumes the raw post-attention residual. Experts consume
-    /// pre_feedforward_layernorm_2(residual). Feeding the router h_norm
-    /// double-normalises (router's own RMSNorm runs on top of pre_experts_norm)
-    /// and selects the wrong top-K experts at every layer past 0 — produces
-    /// fluent but semantically wrong generation on Gemma 4 26B-A4B.
+    /// History: silently picking different top-K experts between the two
+    /// paths produced incoherent text on Gemma 4 26B-A4B. The h_norm
+    /// convention matches Metal's `gpu_moe_dispatch` and the trained
+    /// 26B-A4B weights — even though HF's modeling_gemma4.py uses raw h.
+    /// `larql parity --component moe-block` exposes the divergence.
     ///
     /// The fixture chooses non-trivial `pre_experts_norm` weights so raw-h
-    /// and h_norm produce **different** logits, then asserts that routing on
-    /// raw h is the canonical answer.
+    /// and h_norm produce **different** logits, then asserts the two paths
+    /// pick the **same** top-K (i.e., both route on the same input).
     #[test]
     fn cpu_moe_forward_uses_same_router_input_as_cpu_moe_route() {
         // 4-expert, top-2 fixture. Use non-uniform `pre_experts_norm` so
@@ -463,26 +462,27 @@ mod tests {
             .map(|i| if i == 0 || i == 7 { 1.0 } else { 0.1 })
             .collect();
 
-        // What top-K does `cpu_moe_route` pick on each convention?
+        // What top-K does `cpu_moe_route` pick? It applies router_norm to
+        // **whatever h is passed in**. Metal's `gpu_moe_dispatch` calls
+        // `cpu_moe_route(&h_norm, ...)`, so this is the canonical answer.
         let h_norm = math::rms_norm(&h, &pre_norm, 1e-6, 0.0);
-        let (route_norm, _) = cpu_moe_route(&h_norm, &moe, 1e-6);
+        let (route_indices, _) = cpu_moe_route(&h_norm, &moe, 1e-6);
         let (route_raw, _) = cpu_moe_route(&h, &moe, 1e-6);
 
         // Sanity: the fixture is engineered so the two conventions disagree.
         assert_ne!(
-            route_norm, route_raw,
+            route_indices, route_raw,
             "fixture is broken — h_norm and raw-h routing must give different \
              top-K, otherwise this test can't catch a regression. \
-             route_norm={route_norm:?} route_raw={route_raw:?}"
+             route_norm={route_indices:?} route_raw={route_raw:?}"
         );
 
-        // The HF Gemma 4 invariant: callers (Metal dispatch, gRPC remote,
-        // cpu_moe_forward) all hand `cpu_moe_route` raw h. The router's own
-        // norm (parameter-free RMSNorm on Gemma 4) is then applied once.
+        // Pin the convention that callers (Metal dispatch, gRPC remote,
+        // cpu_moe_forward) currently pass: pre_experts_norm'd h.
         assert_eq!(
-            route_raw.len(),
+            route_indices.len(),
             top_k,
-            "cpu_moe_route on raw h should return top_k={top_k} indices"
+            "cpu_moe_route on h_norm should return top_k={top_k} indices"
         );
     }
 

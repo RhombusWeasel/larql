@@ -20,6 +20,8 @@ use larql_vindex::VectorIndex;
 use crate::ffn::moe_remote::{InflightMoe, MoeRouterWeights, RemoteMoeError, ShardStream};
 use crate::ffn::RemoteMoeBackend;
 use crate::forward::{apply_norm, embed_tokens_pub};
+use crate::layer_graph::generate::detok::Detokenizer;
+use crate::layer_graph::generate::eos::EosConfig;
 use crate::layer_graph::generate::lm_head_topk as lm_topk;
 use crate::layer_graph::pipeline_layer::build_pipeline_layers;
 
@@ -230,6 +232,7 @@ pub fn generate_with_remote_moe(
     index: &VectorIndex,
     remote: &RemoteMoeBackend,
     backend: &dyn ComputeBackend,
+    eos: &EosConfig,
 ) -> Result<GridGenerateResult, RemoteMoeError> {
     let arch = &*weights.arch;
     let norm_offset = arch.norm_weight_offset();
@@ -310,6 +313,12 @@ pub fn generate_with_remote_moe(
     let mut last_hidden_vec: Vec<f32> = vec![0.0f32; hidden];
     let mut current_ids = prompt_ids.clone();
 
+    // Streaming detokeniser: handles SentencePiece `▁` leading-space prefix
+    // and skips special tokens (`<mask>`, `<turn|>`, etc.) so the surface
+    // string is the same as HF's `decode(..., skip_special_tokens=true)`.
+    let mut detok = Detokenizer::new(tokenizer);
+    detok.seed(&prompt_ids);
+
     for (prefill_idx, &tok_id) in prompt_ids.iter().enumerate() {
         let tok_embed = embed_tokens_pub(weights, &[tok_id]);
         let x_tok: Vec<f32> = tok_embed.as_slice().unwrap_or(&[]).to_vec();
@@ -361,15 +370,10 @@ pub fn generate_with_remote_moe(
         .map(|(id, _)| id)
         .unwrap_or(0);
 
-    let first_tok = crate::tokenizer::decode_token(tokenizer, first_id)
-        .unwrap_or_else(|| format!("<{first_id}>"));
+    let first_tok = detok.push(first_id);
+    let first_is_eos = eos.is_eos_with_tokenizer(first_id, &first_tok, tokenizer);
     tokens.push(first_tok);
     current_ids.push(first_id);
-    let first_is_eos = crate::vindex::is_end_of_turn(
-        crate::tokenizer::decode_token(tokenizer, first_id)
-            .unwrap_or_default()
-            .trim(),
-    );
     if first_is_eos || tokens.len() >= max_tokens {
         return Ok(GridGenerateResult {
             tokens,
@@ -530,9 +534,8 @@ pub fn generate_with_remote_moe(
             );
             per_token_timings.push(tok_timings);
         }
-        let tok_str = crate::tokenizer::decode_token(tokenizer, next_id)
-            .unwrap_or_else(|| format!("<{next_id}>"));
-        let is_eos = crate::vindex::is_end_of_turn(tok_str.trim());
+        let tok_str = detok.push(next_id);
+        let is_eos = eos.is_eos_with_tokenizer(next_id, &tok_str, tokenizer);
         tokens.push(tok_str);
         current_ids.push(next_id);
         if is_eos {
@@ -575,6 +578,7 @@ pub fn generate_with_remote_moe_batch(
     index: &VectorIndex,
     remote: &RemoteMoeBackend,
     backend: &dyn ComputeBackend,
+    eos: &EosConfig,
 ) -> Result<GridGenerateResult, RemoteMoeError> {
     let arch = &*weights.arch;
     let norm_offset = arch.norm_weight_offset();
@@ -663,14 +667,15 @@ pub fn generate_with_remote_moe_batch(
     // First token from prefill.
     let mut tokens = Vec::new();
     let mut decode_ms = Vec::new();
+    let mut detok = Detokenizer::new(tokenizer);
+    detok.seed(&prompt_ids);
     let pfa = ndarray::Array2::from_shape_vec((1, hidden), last_hidden_vec.clone())
         .map_err(|e| RemoteMoeError::BadResponse(e.to_string()))?;
     let pfn = apply_norm(weights, &pfa, arch.final_norm_key(), norm_offset);
     let first_id = lm_topk(index, weights, &pfn.row(0).to_owned(), 1, backend)
         .into_iter().next().map(|(id, _)| id).unwrap_or(0);
-    let first_tok = crate::tokenizer::decode_token(tokenizer, first_id)
-        .unwrap_or_else(|| format!("<{first_id}>"));
-    let first_eos = crate::vindex::is_end_of_turn(first_tok.trim());
+    let first_tok = detok.push(first_id);
+    let first_eos = eos.is_eos_with_tokenizer(first_id, &first_tok, tokenizer);
     tokens.push(first_tok);
     current_ids.push(first_id);
     if first_eos || tokens.len() >= max_tokens {
@@ -726,9 +731,8 @@ pub fn generate_with_remote_moe_batch(
             .into_iter().next().map(|(id, _)| id).unwrap_or(0);
 
         decode_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
-        let tok_str = crate::tokenizer::decode_token(tokenizer, next_tok_id)
-            .unwrap_or_else(|| format!("<{next_tok_id}>"));
-        let is_eos = crate::vindex::is_end_of_turn(tok_str.trim());
+        let tok_str = detok.push(next_tok_id);
+        let is_eos = eos.is_eos_with_tokenizer(next_tok_id, &tok_str, tokenizer);
         tokens.push(tok_str);
         current_ids.push(next_tok_id);
         if is_eos { break; }

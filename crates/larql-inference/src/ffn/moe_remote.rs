@@ -740,22 +740,23 @@ impl MoeRouterWeights<'_> {
     pub fn route(&self, h: &[f32], norm_offset: f32, eps: f32) -> (Vec<f32>, Vec<usize>, Vec<f32>) {
         let hidden = h.len();
 
-        // Experts' input norm (used by callers for the expert matmuls only).
-        // Per HF Gemma4TextDecoderLayer.forward, router consumes raw h and
-        // experts consume pre_experts_norm(h). See the matching note in
+        // Experts' input norm (used by callers for the expert matmuls).
+        // Router norm composes on top of h_norm — matches Metal's
+        // `gpu_moe_dispatch` convention. See the note in
         // `larql-compute/src/cpu/ops/moe/forward.rs`.
         let h_norm = rms_norm(h, self.pre_experts_norm, eps, norm_offset);
 
-        // Router input norm — applied to RAW h (not h_norm). Priority:
+        // Router input norm. Priority:
         //   1. learned router_norm weight (architectures that ship one),
         //   2. parameter-free RMSNorm (HF Gemma 4 — `with_scale=False`),
-        //   3. fallback: raw h.
+        //   3. fallback: experts' pre-norm.
+        // All apply on top of h_norm so routing matches Metal.
         let router_in_normed = if !self.router_norm.is_empty() {
-            rms_norm(h, self.router_norm, eps, norm_offset)
+            rms_norm(&h_norm, self.router_norm, eps, norm_offset)
         } else if self.router_norm_parameter_free {
-            rms_norm_no_weight(h, eps)
+            rms_norm_no_weight(&h_norm, eps)
         } else {
-            h.to_vec()
+            h_norm.clone()
         };
 
         let mut router_in: Vec<f32> = if !self.router_scale.is_empty() {
