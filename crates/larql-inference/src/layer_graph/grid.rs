@@ -955,6 +955,7 @@ mod tests {
             &idx,
             &remote,
             &CpuBackend,
+            &EosConfig::builtin(),
         );
         match result {
             Err(RemoteMoeError::BadResponse(msg)) => {

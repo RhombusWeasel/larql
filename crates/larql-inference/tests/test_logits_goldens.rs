@@ -96,43 +96,43 @@ const GOLDENS: &[Golden] = &[
         arch_name: "gemma3-4b-it",
         vindex_name: "gemma3-4b-q4k-v2",
         backend: "metal",
-        top5_token_ids: [256240, 256331, 250251, 249309, 212287],
-        top1_logit: 3632.169922,
+        top5_token_ids: [256240, 250251, 256331, 114202, 254403],
+        top1_logit: 3693.570801,
     },
     Golden {
         arch_name: "gemma3-4b-it",
         vindex_name: "gemma3-4b-q4k-v2",
         backend: "cpu",
-        top5_token_ids: [256240, 256331, 250251, 249309, 212287],
-        top1_logit: 3632.169922,
+        top5_token_ids: [256240, 250251, 256331, 249309, 212287],
+        top1_logit: 3693.570312,
     },
     Golden {
         arch_name: "gemma4-31b-it (dense)",
         vindex_name: "gemma4-31b-q4k",
         backend: "metal",
-        top5_token_ids: [236780, 236772, 236798, 236799, 236814],
-        top1_logit: 2.261745,
+        top5_token_ids: [181225, 129376, 231659, 85000, 258017],
+        top1_logit: 1.355004,
     },
     Golden {
         arch_name: "gemma4-31b-it (dense)",
         vindex_name: "gemma4-31b-q4k",
         backend: "cpu",
-        top5_token_ids: [236780, 236772, 236798, 236799, 236814],
-        top1_logit: 2.261745,
+        top5_token_ids: [236780, 236772, 236798, 236799, 236773],
+        top1_logit: 2.366634,
     },
     Golden {
         arch_name: "llama2-7b-hf (base)",
         vindex_name: "llama2-7b-q4k",
         backend: "metal",
-        top5_token_ids: [263, 278, 697, 3681, 884],
-        top1_logit: 29.988144,
+        top5_token_ids: [697, 3681, 385, 451, 297],
+        top1_logit: 27.334770,
     },
     Golden {
         arch_name: "llama2-7b-hf (base)",
         vindex_name: "llama2-7b-q4k",
         backend: "cpu",
         top5_token_ids: [263, 278, 697, 3681, 884],
-        top1_logit: 29.988144,
+        top1_logit: 29.988192,
     },
     Golden {
         arch_name: "mistral-7b-v0.1 (base)",
@@ -240,7 +240,7 @@ fn capture_top5(
     // (test_cpu_metal_parity passes), and the LM head matvec is the
     // same `f32_gemv` either way. What we're isolating in this test
     // is "did the model's output for this prompt drift?"
-    let h_full = larql_inference::vindex::predict_q4k_hidden(weights, prompt_ids, index);
+    let h_full = larql_inference::vindex::predict_q4k_hidden(weights, prompt_ids, index, None);
     let last_pos = h_full.shape()[0] - 1;
     let h_last = h_full.row(last_pos).to_owned();
 

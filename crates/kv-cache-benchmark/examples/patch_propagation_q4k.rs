@@ -28,8 +28,8 @@ mod runner {
     use std::io::{BufRead, BufReader, Write};
     use std::path::PathBuf;
 
-    use larql_inference::vindex::{predict_q4k_with_ffn, WalkFfn};
-    use larql_inference::{encode_prompt, open_inference_vindex, PredictResult};
+    use larql_inference::vindex::{predict_q4k_hidden_with_ffn, predict_q4k_with_ffn, WalkFfn};
+    use larql_inference::{encode_prompt, hidden_to_raw_logits, open_inference_vindex, PredictResult};
     use larql_vindex::{load_model_weights_q4k, load_vindex_tokenizer, FeatureMeta};
     use ndarray::Array1;
     use serde::{Deserialize, Serialize};
@@ -151,6 +151,7 @@ mod runner {
         let out = json!({
             "experiment": "36_patch_propagation",
             "path": "q4k",
+            "scoring": "exact_target_logprob",
             "vindex": args.vindex,
             "top_k_predictions": args.top_k,
             "feature_top_k": args.feature_top_k,
@@ -390,26 +391,15 @@ mod runner {
         let mut clipped = 0usize;
 
         for &target_id in &answer_ids {
-            let (result, _) = run_q4k_walk(
+            let prob = exact_target_prob(
                 weights,
-                tokenizer,
                 index,
                 &context_ids,
-                top_k,
+                target_id as usize,
                 feature_top_k,
             );
-            let target_surface = tokenizer.decode(&[target_id], true).unwrap_or_default();
-            let prob = result
-                .predictions
-                .iter()
-                .find(|(surface, _)| surface == &target_surface)
-                .map(|(_, p)| *p)
-                .unwrap_or(0.0);
-            if prob == 0.0 {
-                clipped += 1;
-            }
             token_probs.push(prob);
-            token_bits.push(-prob.max(1e-45).log2());
+            token_bits.push(-prob.log2());
             context_ids.push(target_id);
         }
         let total: f64 = token_bits.iter().sum();
@@ -520,5 +510,32 @@ mod runner {
             predict_q4k_with_ffn(weights, tokenizer, token_ids, pred_top_k, index, &walk_ffn);
         let residuals = walk_ffn.take_residuals();
         (result, residuals)
+    }
+
+    fn exact_target_prob(
+        weights: &mut larql_models::ModelWeights,
+        index: &larql_vindex::VectorIndex,
+        token_ids: &[u32],
+        target_id: usize,
+        feature_top_k: usize,
+    ) -> f64 {
+        let weights_ref: &larql_models::ModelWeights =
+            unsafe { &*(weights as *const larql_models::ModelWeights) };
+        let walk_ffn = WalkFfn::new(weights_ref, index, feature_top_k);
+        let h = predict_q4k_hidden_with_ffn(weights, token_ids, index, &walk_ffn);
+        let seq_len = h.shape()[0];
+        let h_last = h.slice(ndarray::s![seq_len - 1..seq_len, ..]).to_owned();
+        let logits = hidden_to_raw_logits(weights, &h_last);
+        let target = logits[target_id] as f64;
+        let max_logit = logits
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max) as f64;
+        let exp_sum: f64 = logits
+            .iter()
+            .map(|&l| ((l as f64) - max_logit).exp())
+            .sum();
+        let logsumexp = max_logit + exp_sum.ln();
+        (target - logsumexp).exp().max(f64::MIN_POSITIVE)
     }
 }

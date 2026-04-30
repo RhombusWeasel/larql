@@ -134,7 +134,17 @@ where
     // delegate to the CPU Q4K per-layer dequant path. It mutates `weights.tensors`
     // per layer and needs &mut; this is the sole reason `generate` itself takes
     // &mut. Metal backends pass straight through and never touch the map here.
-    if !backend_supports_fused_q4_pipeline(backend) {
+    //
+    // Per-Layer Embeddings (Gemma 4 E2B `hidden_size_per_layer_input`) are
+    // also routed to the CPU path: the `per_layer_input_gate` /
+    // `per_layer_projection` / `post_per_layer_input_norm` mechanism is
+    // implemented in `q4k_forward.rs` but not in the Metal pipeline, so the
+    // residual stream would be missing a per-layer per-position contribution
+    // on every layer. Without this routing the model produces multilingual
+    // gibberish ("ened retainingcB variations 유doucara…"); on CPU the same
+    // weights produce coherent reasoning text.
+    let needs_per_layer_embed = weights.arch.has_per_layer_embeddings();
+    if !backend_supports_fused_q4_pipeline(backend) || needs_per_layer_embed {
         return generate_via_cpu_q4k(weights, tokenizer, token_ids, max_tokens, index);
     }
 
@@ -707,7 +717,10 @@ pub fn generate_constrained<M>(
 where
     M: FnMut(&[u32], &mut Vec<f32>),
 {
-    if !backend_supports_fused_q4_pipeline(backend) {
+    // Same PLE delegation as `generate_streaming` — the Metal pipeline
+    // doesn't implement Gemma 4 E2B's per-layer-input gate.
+    let needs_per_layer_embed = weights.arch.has_per_layer_embeddings();
+    if !backend_supports_fused_q4_pipeline(backend) || needs_per_layer_embed {
         return generate_constrained_via_cpu_q4k(
             weights, tokenizer, token_ids, max_tokens, index, mask_fn,
         );

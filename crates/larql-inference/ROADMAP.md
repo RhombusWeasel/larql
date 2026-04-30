@@ -13,6 +13,116 @@ larql bench gemma3-4b-q4k --engine markov-rs,unlimited-context,turbo-quant,apoll
 
 ---
 
+## P0: Mechanistic hooks (lazarus parity)
+
+Driver: replace chuk-mlx as the engine for `chuk-mcp-lazarus`. Lazarus has 77
+inference-time MCP tools (capture, ablate, patch, steer, probe, DLA, KV
+surgery). Larql today only writes to weights (MEMIT, KNN, LQL) — it has no
+mid-forward inspection/intervention API. The whole tool surface collapses to
+one missing primitive: a programmatic forward-hook system.
+
+### M1 — `LayerHook` trait + CPU plumbing (read + write)
+**Status**: In progress
+**File**: `forward/hooks.rs` (new), `forward/layer.rs`, `forward/trace.rs`
+
+Trait shape:
+```rust
+pub trait LayerHook {
+    fn on_pre_layer(&mut self, layer: usize, h: &Array2<f32>) {}
+    fn on_post_attention(&mut self, layer: usize, h: &mut Array2<f32>) {}
+    fn on_attention_weights(&mut self, layer: usize, w: &AttentionWeights) {}
+    fn on_ffn_activation(&mut self, layer: usize, gate: &Array2<f32>) {}
+    fn on_post_layer(&mut self, layer: usize, h: &mut Array2<f32>) {}
+}
+```
+
+Insertion points in `run_layer_with_capture`: pre-layer (h entering),
+post-attention (`h_post_attn`, `&mut`), FFN gate activation (`activation`),
+post-attention-weights (`attn_weights`), post-layer (`h_out`, `&mut`).
+
+The `&mut` on post-attention and post-layer is what unlocks the entire
+intervention surface — ablation, steering, patching, subspace surgery are all
+just `LayerHook` impls.
+
+Plumbing strategy: `run_layer_with_capture` and `trace_forward_full` grow an
+optional `&mut dyn LayerHook` parameter. Existing call sites pass `None`
+(zero overhead — noop when absent). Hot generation paths in `predict.rs`
+remain unchanged for slice 1; M6 wires hooks into the Metal `generate` path.
+
+### M2 — Built-in hooks
+**Status**: Not started
+**File**: `forward/hooks.rs`
+
+- `NoopHook` — never fires, used by tests.
+- `RecordHook { layers: HashSet<usize> }` — captures pre/post-layer residuals
+  and FFN activations; replaces the file-output path of `capture_residuals`.
+- `ZeroAblateHook { layers, positions }` — zeros residual at requested coords.
+- `SteerHook { vectors: HashMap<usize, (Array1<f32>, f32)> }` — adds α·v at
+  specified layer's `on_post_layer`.
+
+### M3 — Activation patching
+**Status**: Not started — blocked on M1
+**File**: `forward/patching.rs` (new)
+
+Two-pass primitive: pass 1 with a `RecordHook` collects the donor residual at
+(layer L, pos p) from prompt A; pass 2 runs prompt B with a `PatchHook` that
+overwrites the same coords. This is the building block for `full_causal_trace`
+(2D position × layer grid) — lazarus's flagship causal tool.
+
+### M4 — Full logit lens
+**Status**: Not started
+**File**: `forward/predict/dense.rs`
+
+Today: `logit_lens_top1(layer)` returns one token. Add:
+- `logit_lens_topk(layer, k) -> Vec<(u32, f32)>`
+- `track_token(layer, target_id) -> f32` — log-prob of a specific token at
+  a specific layer.
+- `track_race(layers, k) -> Vec<Vec<(u32, f32)>>` — top-k per layer in one
+  pass for streaming top-k diagrams.
+
+All three project the same captured residual through final norm + lm_head; no
+new forward passes.
+
+### M5 — KV cache surgery
+**Status**: Not started
+**File**: `attention/decode.rs:KvCache`
+
+Lazarus `prefill_inject` and `kv_inject_test` need to lift K/V from one cache
+into another. Add `get_layer(layer) -> (&[f32], &[f32])`,
+`set_layer(layer, k, v)`, `clone_at_position(other, layer, pos_range)`.
+
+### M6 — Metal generate path
+**Status**: Blocked on M1
+**File**: `layer_graph/generate/gpu.rs`, plus shaders in `larql-compute/src/metal/`
+
+The kernel-fusion design assumes nobody reads intermediates. Strategy: when
+the caller registers a hook for layer L, that layer falls off the fast path
+(CPU readback, run `LayerHook` callbacks, push back to GPU buffers). Layers
+without registered hooks keep the current fused dispatch. The cost model is
+explicit: hooks are free until used; per-layer cost is one
+`MTLBuffer.contents()` round-trip on the layers you ask about.
+
+### M7 — `W_E` / `W_U` + `project_through_unembed`
+**Status**: Not started
+**File**: `forward/predict/dense.rs`, `lib.rs` re-exports
+
+Lazarus tools `head_dla`, `decode_residual`, `embedding_neighbors` need
+direct embedding/unembedding matrix access plus a "project this vector
+through `W_U`, return top-k tokens" helper. Today both matrices are wrapped
+in `VectorIndex` with no public accessor. Add `weights.embed_matrix()` and
+`weights.unembed_matrix()` plus a free function `project_to_vocab_topk(vec, weights, k)`.
+
+### M8 — pyo3 `PyLayerHook`
+**Status**: Blocked on M1
+**File**: `crates/larql-python/src/hooks.rs` (new)
+
+Wrap a Python callable in a `PyLayerHook(PyObject)` that implements
+`LayerHook`. Tensors crossed with `numpy.PyArray2<f32>` (zero-copy on
+CPU path). MCP tools in lazarus are then just Python that registers a
+hook and calls `infer()`.
+
+---
+
 ## P0: Generation quality (blocks demo)
 
 ### Chat template — inference side

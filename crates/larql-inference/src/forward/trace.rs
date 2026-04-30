@@ -1,8 +1,10 @@
 //! Tracing and calibration — capture residuals, activations, and attention weights.
 
 use super::embed::embed_tokens;
+use super::hooks::{LayerHook, NoopHook};
 use super::layer::{
-    apply_layer_scalar, run_attention, run_ffn, run_layer_with_capture, run_layer_with_ffn,
+    apply_layer_scalar, run_attention, run_ffn, run_layer_with_capture,
+    run_layer_with_capture_hooked, run_layer_with_ffn,
 };
 use super::ple::{apply_per_layer_embedding, precompute_per_layer_inputs};
 use super::{LayerAttentionCapture, TraceResult};
@@ -291,6 +293,9 @@ pub fn trace_forward_with_ffn(
 }
 
 /// Run a forward pass capturing residuals, activations, and optionally attention weights.
+///
+/// Backwards-compatible wrapper around [`trace_forward_full_hooked`] using a
+/// [`NoopHook`].
 pub fn trace_forward_full(
     weights: &ModelWeights,
     token_ids: &[u32],
@@ -299,6 +304,38 @@ pub fn trace_forward_full(
     activation_top_k: usize,
     capture_attention: bool,
     ffn: &dyn FfnBackend,
+) -> TraceResult {
+    trace_forward_full_hooked(
+        weights,
+        token_ids,
+        capture_layers,
+        capture_activations,
+        activation_top_k,
+        capture_attention,
+        ffn,
+        &mut NoopHook,
+    )
+}
+
+/// Hook-aware sibling of [`trace_forward_full`]. Fires the hook's callbacks
+/// at every layer (not just `capture_layers`) — hooks decide for themselves
+/// which layers they care about.
+///
+/// Use this for any inference-time intervention: pass a [`super::hooks::SteerHook`],
+/// [`super::hooks::ZeroAblateHook`], a custom [`LayerHook`] impl, or a
+/// [`super::hooks::CompositeHook`] combining several. The `TraceResult`
+/// returned reflects the **post-intervention** residuals if the hook mutated
+/// them.
+#[allow(clippy::too_many_arguments)]
+pub fn trace_forward_full_hooked(
+    weights: &ModelWeights,
+    token_ids: &[u32],
+    capture_layers: &[usize],
+    capture_activations: bool,
+    activation_top_k: usize,
+    capture_attention: bool,
+    ffn: &dyn FfnBackend,
+    hook: &mut dyn LayerHook,
 ) -> TraceResult {
     let seq_len = token_ids.len();
     let max_layer = *capture_layers.iter().max().unwrap_or(&0);
@@ -314,7 +351,7 @@ pub fn trace_forward_full(
         let need_activation = capture_activations && is_capture_layer;
         let need_attention = capture_attention && is_capture_layer;
 
-        let (h_new, activation, attn_weights, _) = match run_layer_with_capture(
+        let (h_new, activation, attn_weights, _) = match run_layer_with_capture_hooked(
             weights,
             &h,
             layer,
@@ -323,6 +360,7 @@ pub fn trace_forward_full(
             need_attention,
             ple_inputs.get(layer),
             None,
+            hook,
         ) {
             Some(result) => result,
             None => continue,
@@ -514,5 +552,88 @@ mod tests {
             residuals.iter().any(|(l, _)| *l == 0),
             "should have layer 0 residual"
         );
+    }
+
+    // ── trace_forward_full_hooked ─────────────────────────────────────────────
+
+    #[test]
+    fn hooked_trace_with_noop_matches_baseline() {
+        let weights = shared_weights();
+        let ffn = WeightFfn { weights };
+        let tokens = vec![0u32, 1, 2];
+        let layers = vec![0, 1];
+
+        let baseline = trace_forward_full(&weights, &tokens, &layers, false, 0, false, &ffn);
+        let hooked = trace_forward_full_hooked(
+            &weights,
+            &tokens,
+            &layers,
+            false,
+            0,
+            false,
+            &ffn,
+            &mut crate::forward::NoopHook,
+        );
+
+        assert_eq!(baseline.residuals.len(), hooked.residuals.len());
+        for ((bl, br), (hl, hr)) in baseline.residuals.iter().zip(hooked.residuals.iter()) {
+            assert_eq!(bl, hl, "layer indices should match");
+            for (b, h) in br.iter().zip(hr.iter()) {
+                assert!((b - h).abs() < 1e-6, "noop hook must not perturb residuals");
+            }
+        }
+    }
+
+    #[test]
+    fn hooked_trace_zero_ablate_propagates_through_remaining_layers() {
+        let weights = shared_weights();
+        let ffn = WeightFfn { weights };
+        let tokens = vec![0u32, 1, 2];
+        let layers: Vec<usize> = (0..weights.num_layers).collect();
+
+        // Ablate layer 0 entirely; residuals at layers >0 must end up zero
+        // since downstream layers see a zero residual entering them.
+        let mut ablate = crate::forward::ZeroAblateHook::for_layers([0usize]);
+        let result = trace_forward_full_hooked(
+            &weights, &tokens, &layers, false, 0, false, &ffn, &mut ablate,
+        );
+
+        let layer0 = result
+            .residuals
+            .iter()
+            .find(|(l, _)| *l == 0)
+            .expect("layer 0 captured");
+        assert!(
+            layer0.1.iter().all(|v| *v == 0.0),
+            "ZeroAblateHook should zero post-layer residual at layer 0"
+        );
+    }
+
+    #[test]
+    fn hooked_trace_record_captures_internal_state() {
+        let weights = shared_weights();
+        let ffn = WeightFfn { weights };
+        let tokens = vec![0u32, 1];
+
+        let mut record = crate::forward::RecordHook::for_layers([0usize, 1]);
+        let _ = trace_forward_full_hooked(
+            &weights, &tokens, &[0, 1], false, 0, false, &ffn, &mut record,
+        );
+
+        assert!(
+            record.pre_layer.contains_key(&0) && record.pre_layer.contains_key(&1),
+            "RecordHook should capture pre_layer at requested layers"
+        );
+        assert!(
+            record.post_attention.contains_key(&0),
+            "RecordHook should capture post_attention"
+        );
+        assert!(
+            record.post_layer.contains_key(&1),
+            "RecordHook should capture post_layer"
+        );
+        // Shape sanity: pre_layer at L1 should be (seq_len, hidden_size).
+        let pre1 = record.pre_layer.get(&1).unwrap();
+        assert_eq!(pre1.shape(), &[tokens.len(), weights.hidden_size]);
     }
 }

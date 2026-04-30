@@ -201,6 +201,9 @@ enum DevCommand {
     /// Map attention OV circuits to FFN gate features.
     OvGate(ov_gate_cmd::OvGateArgs),
 
+    /// Measure OV pre-W_O rate-distortion statistics.
+    OvRd(ov_rd_cmd::OvRdArgs),
+
     /// Discover attention → FFN circuits from weight decomposition.
     CircuitDiscover(circuit_discover_cmd::CircuitDiscoverArgs),
 
@@ -411,6 +414,7 @@ const LEGACY_DEV_NAMES: &[&str] = &[
     "qk-rank",
     "qk-modes",
     "ov-gate",
+    "ov-rd",
     "circuit-discover",
     "attn-bottleneck",
     "ffn-bench",
@@ -517,6 +521,7 @@ fn run_dev(cmd: DevCommand) -> Result<(), Box<dyn std::error::Error>> {
         DevCommand::QkRank(a) => qk_rank_cmd::run(a),
         DevCommand::QkModes(a) => qk_modes_cmd::run(a),
         DevCommand::OvGate(a) => ov_gate_cmd::run(a),
+        DevCommand::OvRd(a) => ov_rd_cmd::run(a),
         DevCommand::CircuitDiscover(a) => circuit_discover_cmd::run(a),
         DevCommand::AttnBottleneck(a) => attn_bottleneck_cmd::run(a),
         DevCommand::FfnBottleneck(a) => ffn_bottleneck_cmd::run(a),

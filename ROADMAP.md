@@ -53,6 +53,30 @@ Swap expert 42 at layer 18 for a custom one. Observe the model's behaviour chang
 
 ---
 
+## P0 — Mechanistic surface (lazarus parity)
+
+Driver: replace the chuk-mlx engine in `chuk-mcp-lazarus` with larql. Lazarus
+exposes ~77 inference-time MCP tools (capture, ablate, patch, steer, probe,
+DLA, KV-surgery). Larql is currently strong on weight-level edits (MEMIT, KNN,
+LQL) and weak on inference-time inspection/intervention. The 77 tools collapse
+to one missing primitive: a **programmatic forward-hook system**. Once that
+lands the rest is mostly Python wrappers.
+
+| # | Item | Crate | Status |
+|---|------|-------|--------|
+| M1 | `LayerHook` trait + CPU plumbing (read + write) | larql-inference | in progress |
+| M2 | `RecordHook`, `ZeroAblateHook`, `SteerHook` built on M1 | larql-inference | not started |
+| M3 | Activation patching (cross-prompt residual swap) | larql-inference | not started |
+| M4 | Full logit lens — `logit_lens_topk(layer, k)`, `track_token(layer, id)` | larql-inference | not started |
+| M5 | `KvCache::{get_layer, set_layer, clone_at_position}` | larql-inference | not started |
+| M6 | Hooks on Metal `generate` path (per-layer opt-in fall-off) | larql-inference + larql-compute | blocked on M1 |
+| M7 | Expose `W_E` / `W_U` + `project_through_unembed` helper | larql-inference | not started |
+| M8 | pyo3 `PyLayerHook` (Python callable → `&mut dyn LayerHook`) | larql-python | blocked on M1 |
+
+Detail in `larql-inference/ROADMAP.md` § Mechanistic hooks (lazarus parity).
+
+---
+
 ## Critical path (P0 — what blocks the demo)
 
 Items in order. Each depends on the one above it.

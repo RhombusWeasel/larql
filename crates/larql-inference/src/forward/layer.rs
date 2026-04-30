@@ -4,6 +4,7 @@
 //! FFN, per-layer embeddings, and layer scalar multiplication.
 
 use super::apply_norm;
+use super::hooks::LayerHook;
 use super::ple::apply_per_layer_embedding;
 use crate::attention::{AttentionWeights, SharedKV};
 use crate::ffn::FfnBackend;
@@ -188,6 +189,9 @@ pub fn run_layer_with_ffn(
 }
 
 /// Run a single transformer layer, optionally capturing attention weights.
+///
+/// Backwards-compatible wrapper: behaves identically to the pre-hook version
+/// by passing a [`super::hooks::NoopHook`].
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub(super) fn run_layer_with_capture(
@@ -205,12 +209,62 @@ pub(super) fn run_layer_with_capture(
     Option<AttentionWeights>,
     Option<SharedKV>,
 )> {
-    let (h_post_attn, attn_weights) =
+    run_layer_with_capture_hooked(
+        weights,
+        h,
+        layer,
+        ffn,
+        capture_activation,
+        capture_attention,
+        ple_input,
+        shared_kv,
+        &mut super::hooks::NoopHook,
+    )
+}
+
+/// Hook-aware sibling of [`run_layer_with_capture`]. Fires the [`LayerHook`]
+/// callbacks at four points inside the layer: pre-layer, post-attention
+/// (mut), attention-weights / FFN-activation if captured, post-layer (mut).
+///
+/// The two `&mut` callbacks (post-attention and post-layer) are what enable
+/// activation patching, ablation, and steering.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub(super) fn run_layer_with_capture_hooked(
+    weights: &ModelWeights,
+    h: &Array2<f32>,
+    layer: usize,
+    ffn: &dyn FfnBackend,
+    capture_activation: bool,
+    capture_attention: bool,
+    ple_input: Option<&Array2<f32>>,
+    shared_kv: Option<&SharedKV>,
+    hook: &mut dyn LayerHook,
+) -> Option<(
+    Array2<f32>,
+    Option<Array2<f32>>,
+    Option<AttentionWeights>,
+    Option<SharedKV>,
+)> {
+    hook.on_pre_layer(layer, h);
+
+    let (mut h_post_attn, attn_weights) =
         run_attention_inner(weights, h, layer, capture_attention, shared_kv)?;
+    if let Some(ref w) = attn_weights {
+        hook.on_attention_weights(layer, w);
+    }
+    hook.on_post_attention(layer, &mut h_post_attn);
+
     let kv_out = None;
     let (h_post_ffn, activation) = run_ffn(weights, &h_post_attn, layer, ffn, capture_activation);
+    if let Some(ref act) = activation {
+        hook.on_ffn_activation(layer, act);
+    }
+
     let mut h_out = apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_input);
     apply_layer_scalar(weights, &mut h_out, layer);
+    hook.on_post_layer(layer, &mut h_out);
+
     Some((h_out, activation, attn_weights, kv_out))
 }
 
