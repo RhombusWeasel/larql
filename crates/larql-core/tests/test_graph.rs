@@ -176,6 +176,19 @@ fn test_exists() {
 }
 
 #[test]
+fn test_get_edge_exact_triple() {
+    let mut g = Graph::new();
+    g.add_edge(Edge::new("France", "capital-of", "Paris").with_confidence(0.89));
+    g.add_edge(Edge::new("France", "capital-of", "Lyon").with_confidence(0.25));
+
+    let edge = g.get_edge("France", "capital-of", "Paris").unwrap();
+    assert_eq!(edge.object, "Paris");
+    assert!((edge.confidence - 0.89).abs() < 0.001);
+    assert!(g.get_edge("France", "capital-of", "Berlin").is_none());
+    assert!(g.get_edge("France", "currency", "Paris").is_none());
+}
+
+#[test]
 fn test_walk() {
     let mut g = Graph::new();
     g.add_edge(Edge::new("France", "capital-of", "Paris").with_confidence(0.89));
@@ -232,6 +245,18 @@ fn test_search_max_results() {
     // "Entity" token matches all 20 edges; max_results caps at 5
     let results = g.search("Entity", 5);
     assert_eq!(results.len(), 5);
+}
+
+#[test]
+fn test_search_tie_order_is_insertion_order() {
+    let mut g = Graph::new();
+    g.add_edge(Edge::new("Entity C", "rel", "Target"));
+    g.add_edge(Edge::new("Entity A", "rel", "Target"));
+    g.add_edge(Edge::new("Entity B", "rel", "Target"));
+
+    let results = g.search("Entity", 10);
+    let subjects: Vec<_> = results.iter().map(|e| e.subject.as_str()).collect();
+    assert_eq!(subjects, vec!["Entity C", "Entity A", "Entity B"]);
 }
 
 #[test]
@@ -363,21 +388,31 @@ fn test_single_component() {
 #[test]
 fn test_list_relations() {
     let mut g = Graph::new();
-    g.add_edge(Edge::new("France", "capital-of", "Paris"));
     g.add_edge(Edge::new("France", "currency", "Euro"));
+    g.add_edge(Edge::new("France", "capital-of", "Paris"));
     g.add_edge(Edge::new("Germany", "capital-of", "Berlin"));
 
-    let mut rels = g.list_relations();
-    rels.sort();
-    assert_eq!(rels, vec!["capital-of", "currency"]);
+    assert_eq!(g.list_relations(), vec!["capital-of", "currency"]);
 }
 
 #[test]
 fn test_list_entities() {
     let mut g = Graph::new();
-    g.add_edge(Edge::new("France", "capital-of", "Paris"));
+    g.add_edge(Edge::new("Paris", "located-in", "France"));
+    g.add_edge(Edge::new("Germany", "capital-of", "Berlin"));
 
-    let mut entities = g.list_entities();
-    entities.sort();
-    assert_eq!(entities, vec!["France", "Paris"]);
+    assert_eq!(
+        g.list_entities(),
+        vec!["Berlin", "France", "Germany", "Paris"]
+    );
+}
+
+#[test]
+fn test_nodes_are_sorted_by_name() {
+    let mut g = Graph::new();
+    g.add_edge(Edge::new("Paris", "located-in", "France"));
+    g.add_edge(Edge::new("Germany", "capital-of", "Berlin"));
+
+    let names: Vec<_> = g.nodes().into_iter().map(|n| n.name).collect();
+    assert_eq!(names, vec!["Berlin", "France", "Germany", "Paris"]);
 }

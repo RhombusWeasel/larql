@@ -218,6 +218,35 @@ pub fn run_layer_with_zeroed_pre_o_heads(
     Some((h_out, kv_out))
 }
 
+/// Run a single transformer layer while replacing one pre-W_O attention head.
+///
+/// This supports static-injection gates: a head can be replaced by global,
+/// position, prompt-type, or token-role means while the rest of the block runs
+/// through the normal residual path.
+pub fn run_layer_with_replaced_pre_o_head(
+    weights: &ModelWeights,
+    h: &Array2<f32>,
+    layer: usize,
+    ffn: &dyn FfnBackend,
+    head: usize,
+    replacement: &Array2<f32>,
+    ple_input: Option<&Array2<f32>>,
+    shared_kv: Option<&SharedKV>,
+) -> Option<(Array2<f32>, Option<SharedKV>)> {
+    let (h_post_attn, kv_out) = crate::attention::run_attention_block_replace_pre_o_head(
+        weights,
+        h,
+        layer,
+        head,
+        replacement,
+        shared_kv,
+    )?;
+    let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+    let mut h_out = apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_input);
+    apply_layer_scalar(weights, &mut h_out, layer);
+    Some((h_out, kv_out))
+}
+
 /// Run a single transformer layer, optionally capturing attention weights.
 ///
 /// Backwards-compatible wrapper: behaves identically to the pre-hook version

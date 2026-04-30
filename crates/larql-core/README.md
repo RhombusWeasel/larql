@@ -22,6 +22,7 @@ graph.add_edge(
 
 // Query
 let capitals = graph.select("France", Some("capital"));
+let capital = graph.get_edge("France", "capital", "Paris").unwrap();
 let (dest, path) = graph.walk("France", &["capital", "river"]).unwrap();
 assert_eq!(dest, "Seine");
 
@@ -43,6 +44,10 @@ save_json(&graph, "knowledge.larql.json").unwrap();
 | `Schema` | Optional relation type registry and node type inference rules |
 | `Node` | Computed entity with degree info and inferred type |
 | `SourceType` | Edge origin: Parametric, Document, Installed, Wikidata, Manual, Unknown |
+
+`list_entities()`, `list_relations()`, `nodes()`, search tie-breaks, and
+connected components are deterministic. Exact triple lookup is available via
+`get_edge(subject, relation, object)`.
 
 ## Algorithms
 
@@ -130,7 +135,7 @@ larql-core/src/
 ## Testing
 
 ```bash
-cargo test -p larql-core                                  # 176 tests
+cargo test -p larql-core                                  # 180 tests
 cargo test -p larql-core --no-default-features --features msgpack
 cargo clippy -p larql-core --tests -- -D warnings
 cargo llvm-cov -p larql-core --summary-only
@@ -159,9 +164,10 @@ cargo run -p larql-core --example algorithm_demo          # Algorithm examples
 | Packed binary serialize / deserialize (100K) | 26ms / 267ms |
 | stats (100K edges) | 72ms |
 
-### Test Coverage (176 tests)
+### Test Coverage (180 tests)
 
 - Graph: construction, queries, walk, search, subgraph, stats, dedupe
+- Accessors: deterministic entities, relations, nodes, search tie-breaks, exact edge lookup
 - Edge: builder pattern, equality, hashing, compact serialization
 - Schema: type rules, inference, JSON roundtrip
 - Algorithms: shortest path, multiedge reconstruction, PageRank, BFS/DFS, merge, diff, filter

@@ -58,7 +58,8 @@ pub use kv_generate::{
     generate_cached_with_window,
 };
 pub use layer::{
-    run_attention_public, run_ffn, run_layer_with_ffn, run_layer_with_zeroed_pre_o_heads,
+    run_attention_public, run_ffn, run_layer_with_ffn, run_layer_with_replaced_pre_o_head,
+    run_layer_with_zeroed_pre_o_heads,
 };
 pub use lens::{logit_lens_topk, track_race, track_token};
 pub use memit::{run_memit, run_memit_with_target_opt, MemitFact, MemitFactResult, MemitResult};

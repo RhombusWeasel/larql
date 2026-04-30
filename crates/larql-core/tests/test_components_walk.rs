@@ -38,6 +38,21 @@ fn components_finds_two_components() {
     assert_eq!(comps.len(), 2, "should find 2 disconnected components");
     // Largest first
     assert!(comps[0].len() >= comps[1].len());
+    assert_eq!(
+        comps[0],
+        vec!["Berlin", "Europe", "France", "Germany", "Paris"]
+    );
+    assert_eq!(comps[1], vec!["Asia", "Japan", "Tokyo"]);
+}
+
+#[test]
+fn components_equal_size_order_is_deterministic() {
+    let mut g = Graph::new();
+    g.add_edge(Edge::new("Z", "to", "Y"));
+    g.add_edge(Edge::new("B", "to", "A"));
+
+    let comps = connected_components(&g);
+    assert_eq!(comps, vec![vec!["A", "B"], vec!["Y", "Z"]]);
 }
 
 #[test]

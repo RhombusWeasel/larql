@@ -25,6 +25,8 @@ engine.
   coverage with `--no-default-features --features msgpack`.
 - Current release benchmark snapshot is recorded in `README.md` from
   `cargo run --release -p larql-core --example bench_graph`.
+- P1 has started: deterministic accessor ordering and exact edge lookup are
+  shipped.
 
 ---
 
@@ -47,9 +49,9 @@ regressions now covered by tests.
 
 | Item | Area | Detail |
 |---|---|---|
-| Deterministic ordered accessors | `core::graph` | `list_entities`, `list_relations`, `nodes`, `search`, and component enumeration often come from hash maps/sets. Add sorted variants or make current outputs deterministic where caller-facing tests and CLI output rely on order. |
+| Deterministic ordered accessors | `core::graph`, `algo::components` | Done. `list_entities`, `list_relations`, `nodes`, search tie-breaks, and connected component ordering are deterministic. |
 | Fallible graph mutation API | `core::graph` | `add_edge` silently drops duplicate triples. Add `try_add_edge` or `insert_edge` returning `Inserted`, `Duplicate`, or `Replaced`, while keeping `add_edge` as the convenient legacy path. |
-| Explicit multiedge lookup | `core::graph` | Add helpers for exact triple lookup returning `Option<&Edge>` and subject/object relation iteration that do not require callers to scan `select()` results. |
+| Explicit multiedge lookup | `core::graph` | Partially done. Exact triple lookup is available through `get_edge(subject, relation, object) -> Option<&Edge>`. Still open: richer subject/object relation iterators. |
 | Configurable keyword tokenizer | `core::graph` | Search lowercases and splits on whitespace/hyphen only. Add a small tokenizer abstraction or normalization options for punctuation, relation aliases, and case/diacritic handling. |
 | Error types per subsystem | `core::graph`, `io`, `engine` | `GraphError::Deserialize(String)` is too broad. Split parse, format, unsupported-version, corrupt-offset, and IO context enough for CLI/server diagnostics. |
 

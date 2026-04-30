@@ -180,6 +180,15 @@ impl Graph {
             .contains(&Triple(subject.into(), relation.into(), object.into()))
     }
 
+    /// Get an edge by its exact (subject, relation, object) triple.
+    pub fn get_edge(&self, subject: &str, relation: &str, object: &str) -> Option<&Edge> {
+        self.adjacency
+            .get(subject)?
+            .iter()
+            .find(|(rel, obj, _)| rel == relation && obj == object)
+            .map(|(_, _, idx)| &self.edges[*idx])
+    }
+
     /// Multi-hop walk following a chain of relations.
     ///
     /// At each hop, picks the edge with the **highest confidence** when multiple
@@ -218,7 +227,7 @@ impl Graph {
         }
 
         let mut ranked: Vec<(usize, usize)> = scores.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         ranked.truncate(max_results);
         ranked.iter().map(|(idx, _)| &self.edges[*idx]).collect()
     }
@@ -265,29 +274,38 @@ impl Graph {
 
     pub fn nodes(&self) -> Vec<Node> {
         self.ensure_nodes();
-        self.nodes
+        let mut nodes: Vec<Node> = self
+            .nodes
             .borrow()
             .as_ref()
             .map(|n| n.values().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        nodes.sort_by(|a, b| a.name.cmp(&b.name));
+        nodes
     }
 
     pub fn list_relations(&self) -> Vec<String> {
-        self.edges
+        let mut relations: Vec<String> = self
+            .edges
             .iter()
             .map(|e| e.relation.clone())
             .collect::<HashSet<_>>()
             .into_iter()
-            .collect()
+            .collect();
+        relations.sort();
+        relations
     }
 
     pub fn list_entities(&self) -> Vec<String> {
         self.ensure_nodes();
-        self.nodes
+        let mut entities: Vec<String> = self
+            .nodes
             .borrow()
             .as_ref()
             .map(|n| n.keys().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        entities.sort();
+        entities
     }
 
     /// Count edges, optionally filtered by relation and/or source.

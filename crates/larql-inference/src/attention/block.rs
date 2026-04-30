@@ -36,7 +36,7 @@ pub fn run_attention_block_with_kv_out(
     Array2<f32>,
 )> {
     let (h_post, attn_proj, attn_w, k, v, _pre_o) =
-        run_attention_block_core(weights, h, layer, capture_attention, shared_kv, None)?;
+        run_attention_block_core(weights, h, layer, capture_attention, shared_kv, None, None)?;
     Some((h_post, attn_proj, attn_w, k, v))
 }
 
@@ -50,7 +50,7 @@ pub fn run_attention_block_shared(
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Array2<f32>, Option<AttentionWeights>)> {
     let (h_post, attn_proj, attn_w, _, _, _) =
-        run_attention_block_core(weights, h, layer, capture_attention, shared_kv, None)?;
+        run_attention_block_core(weights, h, layer, capture_attention, shared_kv, None, None)?;
     Some((h_post, attn_proj, attn_w))
 }
 
@@ -63,7 +63,7 @@ pub fn run_attention_block_with_pre_o(
     layer: usize,
 ) -> Option<(Array2<f32>, Array2<f32>)> {
     let (h_post, _, _, _, _, pre_o) =
-        run_attention_block_core(weights, h, layer, false, None, None)?;
+        run_attention_block_core(weights, h, layer, false, None, None, None)?;
     Some((h_post, pre_o))
 }
 
@@ -79,7 +79,35 @@ pub fn run_attention_block_zero_pre_o_heads(
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Option<SharedKV>)> {
     let (h_post, _, _, k_rope, v_final, _) =
-        run_attention_block_core(weights, h, layer, false, shared_kv, Some(heads))?;
+        run_attention_block_core(weights, h, layer, false, shared_kv, Some(heads), None)?;
+    let kv_out = if shared_kv.is_none() {
+        Some((k_rope, v_final))
+    } else {
+        None
+    };
+    Some((h_post, kv_out))
+}
+
+/// Run attention while replacing one pre-O-projection query head before W_O.
+///
+/// `replacement` must have shape `[seq_len, head_dim]`.
+pub fn run_attention_block_replace_pre_o_head(
+    weights: &crate::model::ModelWeights,
+    h: &Array2<f32>,
+    layer: usize,
+    head: usize,
+    replacement: &Array2<f32>,
+    shared_kv: Option<&SharedKV>,
+) -> Option<(Array2<f32>, Option<SharedKV>)> {
+    let (h_post, _, _, k_rope, v_final, _) = run_attention_block_core(
+        weights,
+        h,
+        layer,
+        false,
+        shared_kv,
+        None,
+        Some((head, replacement)),
+    )?;
     let kv_out = if shared_kv.is_none() {
         Some((k_rope, v_final))
     } else {
@@ -98,6 +126,7 @@ fn run_attention_block_core(
     capture_attention: bool,
     shared_kv: Option<&SharedKV>,
     zero_pre_o_heads: Option<&[usize]>,
+    replace_pre_o_head: Option<(usize, &Array2<f32>)>,
 ) -> Option<(
     Array2<f32>,
     Array2<f32>,
@@ -266,6 +295,16 @@ fn run_attention_block_core(
             let end = start + head_dim;
             attn_out.slice_mut(s![.., start..end]).fill(0.0);
         }
+    }
+    if let Some((head, replacement)) = replace_pre_o_head {
+        if head >= num_q || replacement.nrows() != seq_len || replacement.ncols() != head_dim {
+            return None;
+        }
+        let start = head * head_dim;
+        let end = start + head_dim;
+        attn_out
+            .slice_mut(s![.., start..end])
+            .assign(&replacement.view());
     }
     dump_f32("attn_out", &attn_out);
 

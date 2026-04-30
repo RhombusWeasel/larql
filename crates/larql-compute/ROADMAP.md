@@ -1,5 +1,59 @@
 # Roadmap — larql-compute
 
+## Open: Metal MoE expert kernel — accuracy bug at inter=704
+
+**Status**: Open as of 2026-04-30. Workaround in place (CPU experts default).
+
+The Metal MoE expert dispatch produces numerically wrong outputs for
+Gemma 4 26B-A4B-it's MoE shape (`inter=704`, `hidden=2816`, `top_k=8`).
+Affects all three Metal entry points equally:
+
+- `MetalBackend::gpu_moe_dispatch_with_scratch` (in-process MoE decode path)
+- `MetalBackend::run_experts_preselected_metal` (server old path — byte-copy + one big dispatch)
+- `MetalBackend::run_experts_prestaged_metal` (server new path — pre-cached per-expert buffers + per-expert dispatch)
+
+Symptoms (vs CPU reference per `LARQL_METAL_VS_CPU_DEBUG=1` in
+`larql-server::routes::expert::run_experts_metal_batch`):
+
+| Layer | K | max\|Δ\| | \|metal\| | \|cpu\| | cos |
+|-------|---|----------|-----------|---------|-----|
+| L00   | 2 | 5.5e-2   | 0.011     | 0.015   | 0.72 |
+| L02   | 6 | 5.6e+0   | 0.74      | 0.97    | 0.76 |
+| L05   | 3 | 5.0e+0   | 0.29      | 0.35    | 0.81 |
+
+Pattern: cos ≈ 0.7 every layer, |metal| ≈ 70% of |cpu|. Not just a scaling
+bug (cos < 1.0 means direction is wrong too) but consistent across calls.
+End-to-end output: `"What is the capital of France?"` → "answer is in the
+context of France" via Metal vs "**Paris**" via CPU.
+
+**Same shaders are correct for dense FFN.** `q4k_ffn_gate_up`,
+`geglu_gelu_tanh`, `q4k_matvec` all pass per-layer parity at cos ≥ 0.9999
+on Gemma 3 4B (inter=10240) and Gemma 4 31B dense (inter=21504). The bug
+is specific to the MoE dispatch pattern at inter=704 — possibly the
+small inter / unusual padding ratio (inter_padded=768, so 64 trailing
+zeros per slot in act_buf), or something about the per-expert offset
+math when N = K × inter is moderate and K > 1.
+
+**Workaround** (`larql-server`): default to CPU expert dispatch even on
+`--features metal-experts` builds. `LARQL_USE_METAL_EXPERTS=1` opts back
+in for kernel-debug runs.
+
+**To fix:**
+
+1. Extend `larql parity --component moe-expert` with a `metal` backend
+   (call `run_experts_preselected_metal` with K=1) so CPU vs Metal can be
+   diffed for a single expert with synthetic input. Establishes whether
+   the bug is single-expert or multi-expert.
+2. If single-expert: bisect the kernel chain — gate-only → gate+act →
+   gate+act+down — to localise which stage diverges.
+3. If multi-expert only: investigate the `q4k_ffn_gate_up` dispatch when
+   `n_rows = K × inter` for small inter; check that per-row weight pointer
+   math doesn't lose precision or step into a tile-boundary edge case.
+
+Once fixed, expect the gRPC grid to jump from 3.5 tok/s → ~9-11 tok/s
+(measured during the bug investigation: server compute is 95% of token
+time, Metal experts give 3-4× speedup vs CPU experts).
+
 ## Current state (2026-04-28, M3 Max, real vindex)
 
 | Engine | tok/s | ms/tok | Notes |
@@ -1042,3 +1096,4 @@ Single kernel per layer: norm → QKV → attention → O → residual → norm 
 | **Cooperative SIMD norms** | **2026-04-09** | **O(N²)→O(N) in rms_norm/residual_norm — saved ~10ms** |
 | **Ollama EXCEEDED** | **2026-04-09** | **8.5ms / 117 tok/s = 0.83x Ollama (17% faster)** |
 | Fused Q4_K geglu+down disabled by default — `LARQL_FUSED_DOWN=1` opt-in | 2026-04-30 | The `q4k_geglu_silu_down` / `q4k_geglu_gelu_tanh_down` shaders pass their unit tests but produce all-NaN at the prefill output for production-shape weights (Gemma 3 4B q4k-downq4k → 2560/2560 NaN; Gemma 4 31B q4k → empty output). Separated path (existing GEGLU dispatch + `q4k_matvec`) is correct for the same shapes. Default flipped in `metal::stages::ffn::encode_gated`; perf parity to be re-tested if/when the fused kernel is fixed |
+| Metal MoE expert kernel — accuracy bug at inter=704 | 2026-04-30 | See top-of-file "Open" section. cos≈0.7 vs CPU reference for Gemma 4 26B-A4B-it MoE; same shaders are correct for dense FFN. Workaround: server defaults to CPU expert dispatch (`LARQL_USE_METAL_EXPERTS=1` to opt back in). Once fixed: ~3-4× grid speedup (3.5 tok/s → ~10 tok/s) since server compute is 95% of token wall time |

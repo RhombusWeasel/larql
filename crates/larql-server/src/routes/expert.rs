@@ -379,12 +379,21 @@ pub fn run_experts_metal_batch(
     use larql_compute::{MetalBackend, MoeScratch};
     use std::time::Instant;
     let timing_enabled = std::env::var("LARQL_MOE_TIMING").is_ok();
-    // Runtime escape hatch: when LARQL_DISABLE_METAL_EXPERTS=1 the streaming
-    // handler falls through to the per-expert rayon CPU path even on a build
-    // that linked the Metal backend.  Useful when client and server share a
-    // single GPU (loopback dev box) — running the experts on CPU avoids
-    // contention with the client's attention + dense FFN GPU work.
-    if std::env::var("LARQL_DISABLE_METAL_EXPERTS").is_ok() {
+    // 2026-04-30 ACCURACY ISSUE: the Metal MoE expert dispatch (both
+    // `run_experts_preselected_metal` and `run_experts_prestaged_metal`,
+    // and the in-process `gpu_moe_dispatch_with_scratch`) produces
+    // numerically wrong expert outputs for Gemma 4 26B-A4B-it (inter=704,
+    // hidden=2816, top_k=8). Cosine similarity vs CPU reference ≈ 0.7;
+    // |metal| consistently ~70% of |cpu|. Same model produces "Paris"
+    // via CPU experts and "answer is in the context of France" via Metal
+    // experts. Bug appears to be in the q4k_ffn_gate_up + GELU + q4k_matvec
+    // chain when applied to the 704-wide intermediate dim — the same
+    // shaders work correctly for dense FFN at inter=2560/10240/21504.
+    // Until the kernel is fixed, default to CPU expert dispatch even on
+    // a build that linked the Metal backend.  Set LARQL_USE_METAL_EXPERTS=1
+    // to opt back in (e.g. for kernel-debugging runs).
+    let use_metal = std::env::var("LARQL_USE_METAL_EXPERTS").is_ok();
+    if !use_metal || std::env::var("LARQL_DISABLE_METAL_EXPERTS").is_ok() {
         return Ok(None);
     }
     let t_start = Instant::now();
@@ -478,18 +487,26 @@ pub fn run_experts_metal_batch(
     let t_bufs = t_buf_start.elapsed();
 
     let t_gpu_start = Instant::now();
-    let result = backend.run_experts_prestaged_metal(
+    // 2026-04-30: switched from `run_experts_prestaged_metal` (per-expert
+    // pre-cached buffers, per-expert dispatch) back to
+    // `run_experts_preselected_metal` (byte-copy into shared scratch,
+    // ONE big dispatch for all K experts). The prestaged variant produces
+    // numerically wrong expert outputs (cos≈0.7 vs CPU reference, |metal|
+    // consistently ~70% of |cpu|) — the per-expert dispatch loop in
+    // `q4k_ffn_gate_up` apparently doesn't see the per-expert bound buffers
+    // / output offsets the way the all-experts-at-once dispatch does. The
+    // preselected variant matches the in-process `gpu_moe_dispatch_with_scratch`
+    // dispatch pattern that's been proven correct end-to-end. Speedup over
+    // CPU is preserved; we lose only the per-call memcpy elimination.
+    let _ = (&expert_bufs, &filtered_weights);
+    let result = backend.run_experts_preselected_metal(
         &h_norm,
-        &expert_bufs,
-        &filtered_weights,
+        expert_ids,
+        expert_weights,
         &scratch,
+        get_expert_bytes,
     );
     let t_gpu = t_gpu_start.elapsed();
-    // Suppress the unused-closure warning for the legacy code path —
-    // `get_expert_bytes` was used by `run_experts_preselected_metal` before
-    // we switched to the prestaged path, kept here as a fallback for
-    // experts where the mmap lookup itself failed (we just skipped them).
-    let _ = get_expert_bytes;
 
     // LARQL_METAL_VS_CPU_DEBUG=1 — recompute via CPU and print element-wise
     // max diff. Used to localise the metal-experts accuracy bug. Slow

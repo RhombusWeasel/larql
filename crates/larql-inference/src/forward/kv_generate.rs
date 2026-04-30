@@ -573,8 +573,7 @@ mod tests {
         let tokenizer = make_test_tokenizer(weights.vocab_size);
         let ffn = WeightFfn { weights: &weights };
 
-        let baseline =
-            generate_cached(&weights, &tokenizer, &ffn, &[0u32, 1, 2], 4, |_, _| {});
+        let baseline = generate_cached(&weights, &tokenizer, &ffn, &[0u32, 1, 2], 4, |_, _| {});
 
         let hooked = generate_cached_hooked(
             &weights,

@@ -11,15 +11,10 @@ pub fn connected_components(graph: &Graph) -> Vec<Vec<String>> {
     let mut visited = std::collections::HashSet::new();
     let mut components = Vec::new();
 
-    // Collect all node names
-    let mut all_nodes = std::collections::HashSet::new();
-    for edge in graph.edges() {
-        all_nodes.insert(edge.subject.clone());
-        all_nodes.insert(edge.object.clone());
-    }
+    let all_nodes = graph.list_entities();
 
-    for node in &all_nodes {
-        if visited.contains(node) {
+    for node in all_nodes {
+        if visited.contains(&node) {
             continue;
         }
 
@@ -52,7 +47,7 @@ pub fn connected_components(graph: &Graph) -> Vec<Vec<String>> {
         components.push(component);
     }
 
-    components.sort_by_key(|c| std::cmp::Reverse(c.len()));
+    components.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     components
 }
 

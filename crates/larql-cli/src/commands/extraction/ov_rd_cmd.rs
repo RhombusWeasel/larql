@@ -6,7 +6,8 @@ use larql_inference::attention::run_attention_block_with_pre_o;
 use larql_inference::attention::SharedKV;
 use larql_inference::forward::ple::precompute_per_layer_inputs;
 use larql_inference::forward::{
-    embed_tokens_pub, run_layer_with_ffn, run_layer_with_zeroed_pre_o_heads,
+    embed_tokens_pub, run_layer_with_ffn, run_layer_with_replaced_pre_o_head,
+    run_layer_with_zeroed_pre_o_heads,
 };
 use larql_inference::{encode_prompt, hidden_to_raw_logits, WeightFfn};
 use larql_vindex::{
@@ -29,6 +30,9 @@ enum OvRdCommand {
 
     /// Gate 1: zero selected pre-W_O heads and measure final-logit KL.
     ZeroAblate(ZeroAblateArgs),
+
+    /// Static replacement gate: zero/global/position/stratum pre-W_O means.
+    StaticReplace(StaticReplaceArgs),
 }
 
 #[derive(Args)]
@@ -83,6 +87,29 @@ struct ZeroAblateArgs {
     /// Number of highest-variance Stage-0 heads to test.
     #[arg(long, default_value_t = 8)]
     top_heads: usize,
+
+    /// Limit prompts for bounded gate runs.
+    #[arg(long)]
+    max_prompts: Option<usize>,
+}
+
+#[derive(Args)]
+struct StaticReplaceArgs {
+    /// Self-contained Q4K vindex directory.
+    #[arg(long)]
+    index: PathBuf,
+
+    /// JSONL prompt file. Each line must include at least {"prompt": "..."}.
+    #[arg(long)]
+    prompts: PathBuf,
+
+    /// Output directory.
+    #[arg(long)]
+    out: PathBuf,
+
+    /// Explicit heads as layer:head comma list, e.g. 11:3,11:0,0:4.
+    #[arg(long)]
+    heads: String,
 
     /// Limit prompts for bounded gate runs.
     #[arg(long)]
@@ -152,6 +179,89 @@ impl RunningHeadStats {
             rms_norm: second_moment.sqrt(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct MeanAccumulator {
+    count: u64,
+    sum: Vec<f64>,
+}
+
+impl MeanAccumulator {
+    fn new(dim: usize) -> Self {
+        Self {
+            count: 0,
+            sum: vec![0.0; dim],
+        }
+    }
+
+    fn add(&mut self, values: &[f32]) {
+        self.count += 1;
+        for (dst, &value) in self.sum.iter_mut().zip(values.iter()) {
+            *dst += value as f64;
+        }
+    }
+
+    fn mean(&self) -> Vec<f32> {
+        if self.count == 0 {
+            return vec![0.0; self.sum.len()];
+        }
+        let n = self.count as f64;
+        self.sum.iter().map(|v| (*v / n) as f32).collect()
+    }
+}
+
+#[derive(Debug)]
+struct StaticHeadAccumulator {
+    global: MeanAccumulator,
+    positions: Vec<MeanAccumulator>,
+    strata: HashMap<String, MeanAccumulator>,
+}
+
+impl StaticHeadAccumulator {
+    fn new(head_dim: usize) -> Self {
+        Self {
+            global: MeanAccumulator::new(head_dim),
+            positions: Vec::new(),
+            strata: HashMap::new(),
+        }
+    }
+
+    fn add(&mut self, position: usize, stratum: &str, values: &[f32]) {
+        self.global.add(values);
+        while self.positions.len() <= position {
+            self.positions
+                .push(MeanAccumulator::new(self.global.sum.len()));
+        }
+        self.positions[position].add(values);
+        self.strata
+            .entry(stratum.to_string())
+            .or_insert_with(|| MeanAccumulator::new(self.global.sum.len()))
+            .add(values);
+    }
+
+    fn finish(&self) -> StaticHeadMeans {
+        StaticHeadMeans {
+            count: self.global.count,
+            head_dim: self.global.sum.len(),
+            global: self.global.mean(),
+            positions: self.positions.iter().map(MeanAccumulator::mean).collect(),
+            strata: self
+                .strata
+                .iter()
+                .map(|(key, value)| (key.clone(), value.mean()))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StaticHeadMeans {
+    count: u64,
+    head_dim: usize,
+    global: Vec<f32>,
+    positions: Vec<Vec<f32>>,
+    strata: HashMap<String, Vec<f32>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -238,6 +348,66 @@ struct ZeroAblationReport {
     heads: Vec<ZeroHeadReport>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum StaticReplacementKind {
+    Zero,
+    Global,
+    Position,
+    Stratum,
+}
+
+impl StaticReplacementKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Zero => "zero",
+            Self::Global => "global_mean",
+            Self::Position => "position_mean",
+            Self::Stratum => "stratum_mean",
+        }
+    }
+}
+
+const STATIC_REPLACEMENT_KINDS: [StaticReplacementKind; 4] = [
+    StaticReplacementKind::Zero,
+    StaticReplacementKind::Global,
+    StaticReplacementKind::Position,
+    StaticReplacementKind::Stratum,
+];
+
+#[derive(Debug, Serialize)]
+struct StaticReplacementReport {
+    index: String,
+    prompt_file: String,
+    prompts_seen: usize,
+    selected_heads: Vec<HeadId>,
+    heads: Vec<StaticHeadReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct StaticHeadReport {
+    layer: usize,
+    head: usize,
+    train_samples: u64,
+    modes: Vec<StaticModeReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct StaticModeReport {
+    replacement_kind: String,
+    patch_location: String,
+    runtime_class: String,
+    prompts: usize,
+    mean_kl: f64,
+    p95_kl: f64,
+    max_kl: f64,
+    mean_delta_cross_entropy_bits: f64,
+    top1_agreement: f64,
+    top5_contains_baseline_top1: f64,
+    strata: Vec<ZeroStratumReport>,
+    worst_examples: Vec<ZeroPromptReport>,
+    per_prompt: Vec<ZeroPromptReport>,
+}
+
 #[derive(Debug)]
 struct ZeroHeadAccumulator {
     prompts: Vec<ZeroPromptReport>,
@@ -321,10 +491,85 @@ impl ZeroHeadAccumulator {
     }
 }
 
+#[derive(Debug)]
+struct StaticModeAccumulator {
+    prompts: Vec<ZeroPromptReport>,
+    by_stratum: HashMap<String, Vec<ZeroPromptReport>>,
+}
+
+impl StaticModeAccumulator {
+    fn new() -> Self {
+        Self {
+            prompts: Vec::new(),
+            by_stratum: HashMap::new(),
+        }
+    }
+
+    fn add(&mut self, prompt: ZeroPromptReport) {
+        let stratum = prompt.stratum.clone();
+        self.prompts.push(prompt.clone());
+        self.by_stratum.entry(stratum).or_default().push(prompt);
+    }
+
+    fn finish(self, kind: StaticReplacementKind) -> StaticModeReport {
+        let kl_values: Vec<f64> = self.prompts.iter().map(|p| p.kl).collect();
+        let mean_delta_cross_entropy_bits = mean(
+            &self
+                .prompts
+                .iter()
+                .map(|p| p.delta_cross_entropy_bits)
+                .collect::<Vec<_>>(),
+        );
+        let mut worst_examples = self.prompts.clone();
+        worst_examples.sort_by(|a, b| b.kl.partial_cmp(&a.kl).unwrap_or(std::cmp::Ordering::Equal));
+        worst_examples.truncate(10);
+        let mut strata: Vec<_> = self
+            .by_stratum
+            .into_iter()
+            .map(|(stratum, prompts)| {
+                let values: Vec<f64> = prompts.iter().map(|p| p.kl).collect();
+                ZeroStratumReport {
+                    stratum,
+                    prompts: prompts.len(),
+                    mean_kl: mean(&values),
+                    max_kl: values.iter().copied().fold(0.0, f64::max),
+                    top1_agreement: bool_rate(prompts.iter().map(|p| p.top1_agree)),
+                    top5_contains_baseline_top1: bool_rate(
+                        prompts.iter().map(|p| p.baseline_top1_in_ablated_top5),
+                    ),
+                }
+            })
+            .collect();
+        strata.sort_by(|a, b| a.stratum.cmp(&b.stratum));
+        StaticModeReport {
+            replacement_kind: kind.as_str().to_string(),
+            patch_location: "before_W_O".to_string(),
+            runtime_class: match kind {
+                StaticReplacementKind::Zero => "negligible_test",
+                _ => "static_injection_lookup_add",
+            }
+            .to_string(),
+            prompts: self.prompts.len(),
+            mean_kl: mean(&kl_values),
+            p95_kl: percentile(kl_values.clone(), 0.95),
+            max_kl: kl_values.iter().copied().fold(0.0, f64::max),
+            mean_delta_cross_entropy_bits,
+            top1_agreement: bool_rate(self.prompts.iter().map(|p| p.top1_agree)),
+            top5_contains_baseline_top1: bool_rate(
+                self.prompts.iter().map(|p| p.baseline_top1_in_ablated_top5),
+            ),
+            strata,
+            worst_examples,
+            per_prompt: self.prompts,
+        }
+    }
+}
+
 pub fn run(args: OvRdArgs) -> Result<(), Box<dyn std::error::Error>> {
     match args.command {
         OvRdCommand::Capture(capture) => run_capture(capture),
         OvRdCommand::ZeroAblate(zero) => run_zero_ablate(zero),
+        OvRdCommand::StaticReplace(static_replace) => run_static_replace(static_replace),
     }
 }
 
@@ -549,6 +794,137 @@ fn run_zero_ablate(args: ZeroAblateArgs) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+fn run_static_replace(args: StaticReplaceArgs) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(&args.out)?;
+
+    eprintln!("Loading vindex: {}", args.index.display());
+    let start = Instant::now();
+    let mut cb = SilentLoadCallbacks;
+    let mut index = VectorIndex::load_vindex(&args.index, &mut cb)?;
+    index.load_attn_q4k(&args.index)?;
+    index.load_interleaved_q4k(&args.index)?;
+    let mut weights = load_model_weights_q4k(&args.index, &mut cb)?;
+    let tokenizer = load_vindex_tokenizer(&args.index)?;
+    if weights.arch.is_hybrid_moe() {
+        return Err("ov-rd static-replace currently supports dense FFN vindexes only".into());
+    }
+    eprintln!(
+        "  {} layers, hidden_size={}, q_heads={}, head_dim={} ({:.1}s)",
+        weights.num_layers,
+        weights.hidden_size,
+        weights.num_q_heads,
+        weights.head_dim,
+        start.elapsed().as_secs_f64()
+    );
+
+    let selected_heads = parse_head_spec(&args.heads)?;
+    if selected_heads.is_empty() {
+        return Err("no heads selected for static replacement".into());
+    }
+    let prompts = load_prompts(&args.prompts, args.max_prompts)?;
+    eprintln!("Selected heads: {:?}", selected_heads);
+    eprintln!("Prompts: {}", prompts.len());
+
+    eprintln!("Pass 1/2: fitting static pre-W_O means");
+    let means = fit_static_means(&mut weights, &index, &tokenizer, &prompts, &selected_heads)?;
+
+    eprintln!("Pass 2/2: evaluating static replacements");
+    let mut accumulators: HashMap<(HeadId, &'static str), StaticModeAccumulator> = HashMap::new();
+    for head in &selected_heads {
+        for kind in STATIC_REPLACEMENT_KINDS {
+            accumulators.insert((*head, kind.as_str()), StaticModeAccumulator::new());
+        }
+    }
+
+    for (prompt_idx, record) in prompts.iter().enumerate() {
+        let label = record
+            .id
+            .as_deref()
+            .or(record.stratum.as_deref())
+            .unwrap_or("prompt");
+        eprintln!("  [{}/{}] {}", prompt_idx + 1, prompts.len(), label);
+
+        let token_ids = encode_prompt(&tokenizer, &*weights.arch, &record.prompt)?;
+        if token_ids.is_empty() {
+            continue;
+        }
+        let stratum = record.stratum.as_deref().unwrap_or("unknown");
+        let baseline_hidden =
+            larql_inference::vindex::predict_q4k_hidden(&mut weights, &token_ids, &index, None);
+        let baseline_logits = final_logits(&weights, &baseline_hidden);
+        let baseline_logp = log_softmax(&baseline_logits);
+        let baseline_top1 = argmax(&baseline_logits);
+
+        for head in &selected_heads {
+            let head_means = means.get(head).ok_or_else(|| {
+                format!("missing fitted means for L{} H{}", head.layer, head.head)
+            })?;
+            for kind in STATIC_REPLACEMENT_KINDS {
+                let replacement =
+                    build_static_replacement(kind, token_ids.len(), head_means, stratum)?;
+                let replaced_hidden = forward_q4k_replace_pre_o_head(
+                    &mut weights,
+                    &token_ids,
+                    &index,
+                    *head,
+                    &replacement,
+                )?;
+                let replaced_logits = final_logits(&weights, &replaced_hidden);
+                let replaced_logp = log_softmax(&replaced_logits);
+                let kl = kl_logp(&baseline_logp, &replaced_logp);
+                let replaced_top1 = argmax(&replaced_logits);
+                let replaced_top5 = top_k_indices(&replaced_logits, 5);
+                accumulators
+                    .get_mut(&(*head, kind.as_str()))
+                    .expect("static accumulator missing")
+                    .add(ZeroPromptReport {
+                        id: label.to_string(),
+                        stratum: stratum.to_string(),
+                        kl,
+                        delta_cross_entropy_bits: kl / std::f64::consts::LN_2,
+                        baseline_top1,
+                        ablated_top1: replaced_top1,
+                        top1_agree: baseline_top1 == replaced_top1,
+                        baseline_top1_in_ablated_top5: replaced_top5.contains(&baseline_top1),
+                    });
+            }
+        }
+    }
+
+    let mut head_reports = Vec::new();
+    for head in &selected_heads {
+        let mut modes = Vec::new();
+        for kind in STATIC_REPLACEMENT_KINDS {
+            let acc = accumulators
+                .remove(&(*head, kind.as_str()))
+                .expect("static accumulator missing at finish");
+            modes.push(acc.finish(kind));
+        }
+        let train_samples = means.get(head).map(|m| m.count).unwrap_or(0);
+        head_reports.push(StaticHeadReport {
+            layer: head.layer,
+            head: head.head,
+            train_samples,
+            modes,
+        });
+    }
+
+    let report = StaticReplacementReport {
+        index: args.index.display().to_string(),
+        prompt_file: args.prompts.display().to_string(),
+        prompts_seen: prompts.len(),
+        selected_heads,
+        heads: head_reports,
+    };
+
+    let out_path = args.out.join("gate_static_replacement.json");
+    let file = std::fs::File::create(&out_path)?;
+    serde_json::to_writer_pretty(file, &report)?;
+    eprintln!("Wrote {}", out_path.display());
+
+    Ok(())
+}
+
 fn add_pre_o_stats(
     stats: &mut [RunningHeadStats],
     pre_o: &Array2<f32>,
@@ -694,6 +1070,165 @@ fn forward_q4k_zero_pre_o_head(
             remove_layer_tensors(weights, inserted);
             return Err(format!(
                 "forward failed at layer {layer} while ablating L{} H{}",
+                head.layer, head.head
+            )
+            .into());
+        }
+
+        remove_layer_tensors(weights, inserted);
+    }
+
+    Ok(h)
+}
+
+fn fit_static_means(
+    weights: &mut larql_inference::ModelWeights,
+    index: &VectorIndex,
+    tokenizer: &tokenizers::Tokenizer,
+    prompts: &[PromptRecord],
+    heads: &[HeadId],
+) -> Result<HashMap<HeadId, StaticHeadMeans>, Box<dyn std::error::Error>> {
+    let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
+    for head in heads {
+        heads_by_layer.entry(head.layer).or_default().push(*head);
+    }
+
+    let mut accumulators: HashMap<HeadId, StaticHeadAccumulator> = HashMap::new();
+    for head in heads {
+        let head_dim = weights.arch.head_dim_for_layer(head.layer);
+        accumulators.insert(*head, StaticHeadAccumulator::new(head_dim));
+    }
+
+    for (prompt_idx, record) in prompts.iter().enumerate() {
+        let label = record
+            .id
+            .as_deref()
+            .or(record.stratum.as_deref())
+            .unwrap_or("prompt");
+        eprintln!("  fit [{}/{}] {}", prompt_idx + 1, prompts.len(), label);
+        let token_ids = encode_prompt(tokenizer, &*weights.arch, &record.prompt)?;
+        if token_ids.is_empty() {
+            continue;
+        }
+        let stratum = record.stratum.as_deref().unwrap_or("unknown");
+        let mut h = embed_tokens_pub(weights, &token_ids);
+        let ple_inputs = precompute_per_layer_inputs(weights, &h, &token_ids);
+
+        for layer in 0..weights.num_layers {
+            let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+            if let Some(layer_heads) = heads_by_layer.get(&layer) {
+                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
+                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let head_dim = weights.arch.head_dim_for_layer(layer);
+                for head in layer_heads {
+                    let start = head.head * head_dim;
+                    let end = start + head_dim;
+                    let acc = accumulators
+                        .get_mut(head)
+                        .expect("static mean accumulator missing");
+                    for pos in 0..pre_o.nrows() {
+                        let row = pre_o.slice(s![pos, start..end]);
+                        if let Some(values) = row.as_slice() {
+                            acc.add(pos, stratum, values);
+                        }
+                    }
+                }
+            }
+
+            {
+                let ffn = WeightFfn { weights };
+                if let Some((h_new, _, _)) =
+                    run_layer_with_ffn(weights, &h, layer, &ffn, false, ple_inputs.get(layer), None)
+                {
+                    h = h_new;
+                }
+            }
+            remove_layer_tensors(weights, inserted);
+        }
+    }
+
+    Ok(accumulators
+        .into_iter()
+        .map(|(head, acc)| (head, acc.finish()))
+        .collect())
+}
+
+fn build_static_replacement(
+    kind: StaticReplacementKind,
+    seq_len: usize,
+    means: &StaticHeadMeans,
+    stratum: &str,
+) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+    let mut values = Vec::with_capacity(seq_len * means.head_dim);
+    for pos in 0..seq_len {
+        let row = match kind {
+            StaticReplacementKind::Zero => None,
+            StaticReplacementKind::Global => Some(&means.global),
+            StaticReplacementKind::Position => means.positions.get(pos).or(Some(&means.global)),
+            StaticReplacementKind::Stratum => means.strata.get(stratum).or(Some(&means.global)),
+        };
+        if let Some(row) = row {
+            values.extend_from_slice(row);
+        } else {
+            values.extend(std::iter::repeat(0.0).take(means.head_dim));
+        }
+    }
+    Ok(Array2::from_shape_vec((seq_len, means.head_dim), values)?)
+}
+
+fn forward_q4k_replace_pre_o_head(
+    weights: &mut larql_inference::ModelWeights,
+    token_ids: &[u32],
+    index: &VectorIndex,
+    head: HeadId,
+    replacement: &Array2<f32>,
+) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+    let mut h = embed_tokens_pub(weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
+    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
+
+    for layer in 0..weights.num_layers {
+        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+        let step = {
+            let shared_kv = weights
+                .arch
+                .kv_shared_source_layer(layer)
+                .and_then(|src| kv_cache.get(&src));
+            let ffn = WeightFfn { weights };
+            if layer == head.layer {
+                run_layer_with_replaced_pre_o_head(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    head.head,
+                    replacement,
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+            } else {
+                run_layer_with_ffn(
+                    weights,
+                    &h,
+                    layer,
+                    &ffn,
+                    false,
+                    ple_inputs.get(layer),
+                    shared_kv,
+                )
+                .map(|(h_new, _, kv_out)| (h_new, kv_out))
+            }
+        };
+
+        if let Some((h_new, kv_out)) = step {
+            h = h_new;
+            if let Some(kv) = kv_out {
+                kv_cache.insert(layer, kv);
+            }
+        } else {
+            remove_layer_tensors(weights, inserted);
+            return Err(format!(
+                "forward failed at layer {layer} while replacing L{} H{}",
                 head.layer, head.head
             )
             .into());
