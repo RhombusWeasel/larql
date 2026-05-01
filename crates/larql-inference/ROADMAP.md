@@ -226,6 +226,88 @@ pass. Connect so MoE router runs locally against the vindex before dispatching.
 
 ---
 
+## P0: CPU MoE expert path — close the bandwidth-bound gap (Gemma 4 26B-A4B)
+
+**Why this is P0**: The grid currently runs at **2.3 tok/s** loopback on 26B-A4B
+(2 shards same M3 Max). Server compute = 95% of token wall time (250 ms/tok);
+network = 2%. Theoretical CPU bandwidth floor for 4B active params at Q4_K is
+~10 ms/tok = ~100 tok/s on M3 Max LPDDR5X (~400 GB/s peak), conservatively
+~25 tok/s at 50 GB/s effective. We are **40-100× over the bandwidth floor** —
+the gap is structural in the CPU expert path, not in kernel quality. Metal
+experts measured 3.7× (→ 9.4 tok/s) but stay shipped-off pending the
+`inter=704` accuracy bug (see `larql-compute/ROADMAP.md`). Closing this gap
+unblocks shipping CPU-only without waiting on the Metal kernel fix and lifts
+the Metal-on path proportionally once that lands.
+
+**Target**: 25 tok/s CPU-only on Gemma 4 26B-A4B grid loopback (~10× current).
+
+### M-CPU-1 — stop the `to_vec()` copy on cache hit
+**Status**: ✅ Done 2026-05-01  
+**File**: `crates/larql-compute/src/cpu/ops/moe/expert.rs`  
+`run_single_expert_into` was doing `let gate_up_w_f32 = v.to_vec()` on every
+call, copying ~12 MB *even on cache hit*. Replaced with an
+`Option<ExpertF32>` (Arc) held for the call's lifetime; `gate_w` / `up_w`
+slice into the cached payload directly. No behavioural change; tests pass.
+
+### M-CPU-2 — K=8 per-layer experts run in parallel + fold/reduce accumulator
+**Status**: ✅ Done 2026-05-01  
+**File**: `crates/larql-server/src/routes/expert.rs`  
+Confirmed the production gRPC path (`run_experts_cpu_batch`) already uses
+rayon `par_iter` over the K active experts with per-rayon-thread
+`ExpertScratch`. Refactored from `collect Vec<(Vec<f32>, weight)> + serial
+sum` to `par_iter.fold(per-worker hidden-acc).reduce(...)`, eliminating the
+per-expert 11 KB Vec allocation (~2.7 MB/token at 30 layers × K=8). Also
+parallelised the HTTP `handle_expert_batch` endpoint (was serial `iter().map`).
+
+### M-CPU-3 — `LARQL_MOE_CACHE_ENTRIES` default raised 64 → 256
+**Status**: ✅ Done 2026-05-01  
+**File**: `crates/larql-compute/src/cpu/ops/moe/cache.rs`  
+Default cap covers one full token's working set (30 layers × top-K=8 = 240
+experts) with headroom. Eviction-driven p99 outliers gone (11.62 → 2.42 ms
+on `cpu_moe_forward` floor). RSS cost: +2 GB per shard (9.7 → 13.6 GB on
+single-shard 26B-A4B bench). Long-term answer is M-CPU-4 (kill the cache
+entirely via direct Q4_K matvec); cap=256 is the right default until then.
+
+### M-CPU-4 — NEON-vectorised Q4_K matvec (load-bearing item)
+**Status**: Not started — landed in `larql-compute/ROADMAP.md` as a parallel item  
+**File**: `crates/larql-compute/src/cpu/ops/q4_common.rs::q4k_matvec_into`  
+**Why this is the structural fix**: M-CPU-1/2/3 cut the per-call floor 1.8×
+(3.52 → 1.94 ms) but the multi-layer sweep barely moved (221 → 205 ms, -7%).
+Diagnostic: warm matmul on cached f32 should be 1.94 × 30 = 58 ms, but actual
+sweep is 205 ms. The 147 ms gap is **DRAM bandwidth pressure** — 240 cached
+experts × 24 MB f32 = **5.7 GB walked per token**, dwarfing L3. Direct Q4_K
+matvec reads ~12 MB Q4_K bytes per expert (4× smaller, straight from mmap),
+eliminating the f32 cache entirely. Mirror llama.cpp `ggml_vec_dot_q4_K_q8_K`:
+quantise activation to Q8_K once per expert call, then NEON dot-product (`vdotq_s32`
+on Apple Silicon, AVX2 `_mm256_maddubs_epi16` on x86) against the 144-byte
+Q4_K super-blocks. Once shipped, flip `LARQL_Q4K_DIRECT` default ON and shrink
+or kill the cache. Expected: pulls CPU MoE within 2-4× of the BW floor (~25-50
+tok/s on grid loopback).
+
+### M-CPU-5 — bench harness + per-fix tok/s attribution
+**Status**: ✅ Done 2026-05-01  
+**File**: `crates/larql-server/examples/bench_expert_server.rs` (+ pre-existing
+`unit_filter` fixture compile fix; two-shard mode has a separate pre-existing
+expert-127 off-by-one).  
+Single-shard bench on `output/gemma4-26b-a4b-q4k.vindex` (M3 Max, 2026-05-01):
+
+| Metric | cap=64 | cap=256 (new default) | Δ |
+|---|---|---|---|
+| `forward_moe` warm 1-layer HTTP RTT | 2.53 ms | 2.43 ms | -4% |
+| `cpu_moe_forward` warm floor (mean) | 3.52 ms | **1.94 ms** | **-45%** |
+| `cpu_moe_forward` p99 (eviction outliers) | 11.62 ms | 2.42 ms | **-79%** |
+| 30-layer sweep | 221 ms | 205 ms | -7% |
+| Steady RSS | 11.4 GB | 13.6 GB | +19% |
+
+The per-call floor improvement is real; the sweep regression vs the
+ROADMAP-published 56 ms (from 2026-04-26) is on current code regardless of
+cap, indicating a code drift between then and now that should be bisected
+separately. The point of the bench: it falsifies "more cache = more tok/s"
+as the path to target, and confirms M-CPU-4 (NEON direct-Q4K, no f32 cache)
+as the only structural answer.
+
+---
+
 ## P0: Engine performance parity
 
 ### TurboQuant Metal K/V checkpoint compression

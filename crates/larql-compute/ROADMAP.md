@@ -1,5 +1,43 @@
 # Roadmap — larql-compute
 
+## Open: NEON Q4_K matvec — unblocks `LARQL_Q4K_DIRECT` default for CPU MoE
+
+**Status**: Open as of 2026-05-01. Tracked from `larql-inference/ROADMAP.md`
+M-CPU-4. Highest-leverage CPU-side item for Gemma 4 26B-A4B grid throughput.
+
+**File**: `crates/larql-compute/src/cpu/ops/q4_common.rs::q4k_matvec_into`
+
+**Why now**: Grid runs at 2.3 tok/s on 26B-A4B; 95% of token wall time is CPU
+expert math; ~40-100× over the bandwidth-bound floor. The in-code comment in
+`crates/larql-compute/src/cpu/ops/moe/expert.rs:178` already flags the path:
+the `LARQL_Q4K_DIRECT` direct-Q4_K matvec path is the right default once a
+NEON-vectorised version exists. Today the scalar inner loop loses to BLAS
+sgemv on cached f32 weights (BLAS uses AMX), so we pay a 1.5 GB f32 dequant
+cache that doesn't fit the 240-experts/token working set anyway.
+
+**Approach**: mirror llama.cpp `ggml_vec_dot_q4_K_q8_K` shape — quantise the
+activation to Q8_K once per expert call (`hidden=2816`, single 256-elem
+super-block per expert), then NEON dot-product against the 144-byte Q4_K
+super-blocks. Two intrinsics paths:
+- `aarch64` (Apple Silicon, ARM Linux): `vdotq_s32` for SDOT-capable CPUs
+  (M1+, all Apple Silicon), fallback to `vmlal_s8` for older.
+- `x86_64`: AVX2 `_mm256_maddubs_epi16` mirroring llama.cpp's `vec_dot_q4_K_q8_K_avx2`.
+
+**Once shipped**: flip `LARQL_Q4K_DIRECT` default to ON in
+`expert.rs::run_single_expert_into`, kill or shrink the f32 dequant cache
+(M-CPU-3), and rebench. Expected: pulls the CPU MoE path within 2-4× of the
+bandwidth floor (~25-50 tok/s on 26B-A4B grid loopback).
+
+**Validation**:
+- Parity test against current scalar `q4k_matvec_into` on synthetic Q4_K
+  weights (round-trip must be bit-exact, not within-noise — both compute the
+  same dot product).
+- Larger parity test on real per-layer expert bytes from the 26B-A4B vindex.
+- Bench: `cargo bench --bench q4k_matvec` reports GB/s of weight read for
+  scalar vs NEON paths at hidden=2816, inter=704.
+
+---
+
 ## Open: Metal MoE expert kernel — accuracy bug at inter=704
 
 **Status**: Open as of 2026-04-30. Workaround in place (CPU experts default).

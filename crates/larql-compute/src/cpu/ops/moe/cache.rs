@@ -17,10 +17,22 @@
 //! dequant runs exactly once per cached entry.
 //!
 //! Sizing: `LARQL_MOE_CACHE_ENTRIES` env var caps the entry count
-//! (default 64). 64 × ~24 MB ≈ 1.5 GB at Gemma 4 26B-A4B Q4_K dimensions.
-//! For workloads with high expert diversity (many distinct prompts, large
-//! `top_k`, or models with more experts) raise this to 128 or 256 to cover
-//! the working set. Set to 0 to disable caching entirely.
+//! (default 256). At Gemma 4 26B-A4B sizes (~24 MB per cached expert)
+//! that's ~6 GB resident per shard at steady state.
+//!
+//! Why 256: per-token working set is `num_moe_layers × top_k` distinct
+//! expert calls. On 26B-A4B that's 30 × 8 = 240. Cap=64 (the prior
+//! default) thrashed at near-100% miss rate because every token visits
+//! 240 experts but the cache only held 64 — by the time the next token
+//! came back to layer 0, the experts had been evicted. Cap=256 gives
+//! one full token's working set plus headroom, taking the steady-state
+//! hit rate from ~0% to >90% for prompts with stable routing (most
+//! chat-style workloads).
+//!
+//! For multi-prompt servers with high routing diversity, raise this
+//! further (512 / 1024) — RSS scales linearly. Set to 0 to disable
+//! caching entirely (right answer once the NEON-vectorised direct-Q4K
+//! matvec lands; see compute ROADMAP).
 //!
 //! Format dispatch (BF16 / Q4_K / F32) is on the dequant path, not the
 //! cache key — same bytes always dequant to the same f32 vector regardless
@@ -107,10 +119,13 @@ impl Inner {
 fn cell() -> &'static RwLock<Inner> {
     static CELL: OnceLock<RwLock<Inner>> = OnceLock::new();
     CELL.get_or_init(|| {
+        // Default 256: covers one token's working set on Gemma 4 26B-A4B
+        // (30 MoE layers × top_k=8 = 240 distinct experts per token).
+        // Prior default of 64 thrashed at ~100% miss rate. See module doc.
         let cap = std::env::var("LARQL_MOE_CACHE_ENTRIES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(64);
+            .unwrap_or(256);
         RwLock::new(Inner::new(cap))
     })
 }

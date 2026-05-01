@@ -194,11 +194,12 @@ fn main() {
         // For one-shard mode, "owns all experts". For two-shard mode, owns the
         // first half — but we set this *after* peeking at num_experts below.
         expert_filter: None,
+        unit_filter: None,
     };
 
     let path_str = args[1].clone();
     let (model_a, load_a_ms) =
-        time_ms(|| load_single_vindex(&path_str, opts_a).expect("load vindex"));
+        time_ms(|| load_single_vindex(&path_str, opts_a.clone()).expect("load vindex"));
     let after_load_a = checkpoint("after vindex load (shard A)", started, baseline);
     println!("  Shard A load: {:.0} ms", load_a_ms);
 
@@ -397,7 +398,7 @@ fn main() {
         drop(model_a);
         let opts_a2 = LoadVindexOptions {
             expert_filter: Some((0, mid - 1)),
-            ..opts_a
+            ..opts_a.clone()
         };
         let m = load_single_vindex(&path_str, opts_a2).expect("re-load shard A");
         m.get_or_load_weights().ok();
@@ -426,7 +427,7 @@ fn main() {
     let url_b = if two_shard {
         let opts_b = LoadVindexOptions {
             expert_filter: Some((mid, num_experts - 1)),
-            ..opts_a
+            ..opts_a.clone()
         };
         let (model_b, load_b_ms) = time_ms(|| load_single_vindex(&path_str, opts_b).unwrap());
         let _ = checkpoint("after vindex load (shard B)", started, baseline);

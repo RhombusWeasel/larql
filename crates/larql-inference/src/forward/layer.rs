@@ -247,6 +247,29 @@ pub fn run_layer_with_replaced_pre_o_head(
     Some((h_out, kv_out))
 }
 
+/// Run a single transformer layer while subtracting selected pre-W_O head
+/// contributions after W_O projection and before the attention residual path.
+///
+/// This should match [`run_layer_with_zeroed_pre_o_heads`] up to numerical
+/// noise, and is used as a diagnostic for W_O block indexing.
+pub fn run_layer_with_subtracted_pre_o_heads(
+    weights: &ModelWeights,
+    h: &Array2<f32>,
+    layer: usize,
+    ffn: &dyn FfnBackend,
+    heads: &[usize],
+    ple_input: Option<&Array2<f32>>,
+    shared_kv: Option<&SharedKV>,
+) -> Option<(Array2<f32>, Option<SharedKV>)> {
+    let (h_post_attn, kv_out) = crate::attention::run_attention_block_subtract_pre_o_heads(
+        weights, h, layer, heads, shared_kv,
+    )?;
+    let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+    let mut h_out = apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_input);
+    apply_layer_scalar(weights, &mut h_out, layer);
+    Some((h_out, kv_out))
+}
+
 /// Run a single transformer layer, optionally capturing attention weights.
 ///
 /// Backwards-compatible wrapper: behaves identically to the pre-hook version

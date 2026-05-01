@@ -5,7 +5,7 @@
 //! shard. The BF16 expert weights are dequantized on demand so only the
 //! selected experts pay the conversion cost.
 
-use super::cache::cached_dequant;
+use super::cache::{cached_dequant, ExpertF32};
 use super::math::{gelu_tanh, matmul_vec, matmul_vec_into, rms_norm, silu};
 use crate::cpu::ops::q4_common::q4k_matvec_into;
 
@@ -184,8 +184,12 @@ pub fn run_single_expert_into<'s>(
     let q4k_path = q4k_direct && matches!(format, crate::QuantFormat::Q4_K);
 
     let gate_w_size = inter * hidden;
-    let gate_up_w_f32 = if q4k_path {
-        Vec::new()
+    // f32 path: hold the cached Arc for the duration of the call so the
+    // gate_w / up_w slices below borrow into the cache's payload directly.
+    // The previous `v.to_vec()` here copied ~12 MB per call on cache hit,
+    // which dominated the per-expert wall time at Gemma 4 26B-A4B sizes.
+    let gate_up_w_arc: Option<ExpertF32> = if q4k_path {
+        None
     } else {
         let v = cached_dequant(gate_up_bytes, format, 2 * inter * hidden);
         if v.is_empty() {
@@ -194,7 +198,7 @@ pub fn run_single_expert_into<'s>(
             }
             return &scratch.out;
         }
-        v.to_vec()
+        Some(v)
     };
     let t_cache_gu = if timing { Some(t.elapsed()) } else { None };
     if timing { t = std::time::Instant::now(); }
@@ -237,6 +241,11 @@ pub fn run_single_expert_into<'s>(
     }
 
     // Default path: f32 dequant cache + BLAS sgemv (Apple AMX / OpenBLAS).
+    // `gate_up_w_arc` is Some when q4k_path is false (we returned early on
+    // miss above); slice into the cached Arc without copying.
+    let gate_up_w_f32: &[f32] = gate_up_w_arc
+        .as_deref()
+        .expect("gate_up_w_arc populated on f32 path");
     let gate_w = &gate_up_w_f32[..gate_w_size];
     let up_w = &gate_up_w_f32[gate_w_size..2 * gate_w_size];
     matmul_vec_into(&mut scratch.gate_out, h_norm, gate_w, inter, hidden);

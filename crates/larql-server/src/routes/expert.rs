@@ -150,74 +150,89 @@ pub fn run_experts_cpu_batch(
         larql_inference::QuantFormat::BF16
     };
 
+    // Resolve (gate_up, down) bytes for one expert.  Pulled out of the
+    // rayon closure so the closure body is small and the legacy BF16 path
+    // doesn't fight the borrow checker on `weights` / `arch`.
+    let resolve_bytes = |eid: usize| -> Option<(&[u8], &[u8])> {
+        if weights.has_per_layer_ffn() {
+            weights.get_layer_entry_bytes(layer, eid)
+        } else {
+            let gu_key = arch.packed_experts_gate_up_key(layer)?;
+            let dn_key = arch.packed_experts_down_key(layer)?;
+            let gu_all = weights.get_packed_bytes(&gu_key)?;
+            let dn_all = weights.get_packed_bytes(&dn_key)?;
+            let gu_stride = 2 * inter * hidden * 2; // BF16 = 2 bytes
+            let dn_stride = hidden * inter * 2;
+            let gu_start = eid * gu_stride;
+            let dn_start = eid * dn_stride;
+            if gu_start + gu_stride > gu_all.len() || dn_start + dn_stride > dn_all.len() {
+                return None;
+            }
+            Some((
+                &gu_all[gu_start..gu_start + gu_stride],
+                &dn_all[dn_start..dn_start + dn_stride],
+            ))
+        }
+    };
+
+    // Fold the K experts directly into a per-worker hidden-sized accumulator,
+    // then reduce across workers.  Replaces the prior pattern of collecting
+    // K (Vec<f32>, weight) partials and serially summing them — that path
+    // forced an 11 KB Vec allocation per expert per layer (≈2.7 MB/token at
+    // 30 MoE layers × top-K=8) and serialized the final accumulation on one
+    // thread.
     use rayon::prelude::*;
-    let partials: Vec<(Vec<f32>, f32)> = expert_ids
+    let out = expert_ids
         .par_iter()
         .zip(expert_weights.par_iter())
         .filter(|(_, &w)| w != 0.0)
-        .filter_map(|(&eid, &w)| {
-            // Resolve the expert's bytes (per-layer Q4_K mmap or legacy
-            // packed BF16).  Mirrors run_expert's logic but inlined so we
-            // can drive the scratch-based fast path here.
-            let (gu_bytes, dn_bytes) = if weights.has_per_layer_ffn() {
-                weights.get_layer_entry_bytes(layer, eid)?
-            } else {
-                let gu_key = arch.packed_experts_gate_up_key(layer)?;
-                let dn_key = arch.packed_experts_down_key(layer)?;
-                let gu_all = weights.get_packed_bytes(&gu_key)?;
-                let dn_all = weights.get_packed_bytes(&dn_key)?;
-                let gu_stride = 2 * inter * hidden * 2; // BF16 = 2 bytes
-                let dn_stride = hidden * inter * 2;
-                let gu_start = eid * gu_stride;
-                let dn_start = eid * dn_stride;
-                if gu_start + gu_stride > gu_all.len() || dn_start + dn_stride > dn_all.len() {
-                    return None;
+        .fold(
+            || vec![0.0f32; hidden],
+            |mut acc, (&eid, &w)| {
+                let Some((gu_bytes, dn_bytes)) = resolve_bytes(eid) else {
+                    return acc;
+                };
+                SCRATCH.with(|cell| {
+                    let mut borrow = cell.borrow_mut();
+                    let scratch = borrow
+                        .get_or_insert_with(|| ExpertScratch::new(hidden, inter, inter_padded));
+                    // Resize-on-shape-change: a single server might host multiple
+                    // models with different shapes (rare, but cheap to handle).
+                    if scratch.gate_out.len() != inter
+                        || scratch.act.len() != inter_padded
+                        || scratch.out.len() != hidden
+                    {
+                        *scratch = ExpertScratch::new(hidden, inter, inter_padded);
+                    }
+                    let h2 = run_single_expert_into(
+                        scratch, &h_norm, gu_bytes, dn_bytes, inter, format, activation,
+                    );
+                    for (a, &v) in acc.iter_mut().zip(h2.iter()) {
+                        *a += w * v;
+                    }
+                });
+                acc
+            },
+        )
+        .reduce(
+            || vec![0.0f32; hidden],
+            |mut a, b| {
+                for (x, &y) in a.iter_mut().zip(b.iter()) {
+                    *x += y;
                 }
-                (
-                    &gu_all[gu_start..gu_start + gu_stride],
-                    &dn_all[dn_start..dn_start + dn_stride],
-                )
-            };
-
-            let out = SCRATCH.with(|cell| {
-                let mut borrow = cell.borrow_mut();
-                let scratch =
-                    borrow.get_or_insert_with(|| ExpertScratch::new(hidden, inter, inter_padded));
-                // Resize-on-shape-change: a single server might host multiple
-                // models with different shapes (rare, but cheap to handle).
-                if scratch.gate_out.len() != inter
-                    || scratch.act.len() != inter_padded
-                    || scratch.out.len() != hidden
-                {
-                    *scratch = ExpertScratch::new(hidden, inter, inter_padded);
-                }
-                let h2 = run_single_expert_into(
-                    scratch, &h_norm, gu_bytes, dn_bytes, inter, format, activation,
-                );
-                h2.to_vec() // last unavoidable allocation per expert call
-            });
-            Some((out, w))
-        })
-        .collect();
+                a
+            },
+        );
 
     let t_par = t_norm_start.elapsed() - t_norm;
-    let t_sum_start = Instant::now();
-    let mut out = vec![0.0f32; hidden];
-    for (expert_out, weight) in &partials {
-        for (acc, &v) in out.iter_mut().zip(expert_out.iter()) {
-            *acc += weight * v;
-        }
-    }
-    let t_sum = t_sum_start.elapsed();
     if timing_enabled {
-        let n_active = partials.len();
         eprintln!(
-            "[run_experts_cpu] layer={layer} K={n_active} arch={:.2}ms norm={:.2}ms \
-             par_iter={:.2}ms sum={:.2}ms total={:.2}ms",
+            "[run_experts_cpu] layer={layer} K={} arch={:.2}ms norm={:.2}ms \
+             par_fold={:.2}ms total={:.2}ms",
+            expert_ids.len(),
             t_arch.as_secs_f32() * 1000.0,
             t_norm.as_secs_f32() * 1000.0,
             t_par.as_secs_f32() * 1000.0,
-            t_sum.as_secs_f32() * 1000.0,
             t_start.elapsed().as_secs_f32() * 1000.0,
         );
     }
@@ -743,8 +758,9 @@ pub async fn handle_expert_batch(
     };
 
     let result_items = tokio::task::spawn_blocking(move || {
+        use rayon::prelude::*;
         items
-            .iter()
+            .par_iter()
             .map(|item| {
                 run_expert(&state, item.layer, item.expert_id, &item.residual).map(|output| {
                     ExpertResultItem {

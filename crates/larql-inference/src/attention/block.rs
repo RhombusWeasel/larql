@@ -35,8 +35,16 @@ pub fn run_attention_block_with_kv_out(
     Array2<f32>,
     Array2<f32>,
 )> {
-    let (h_post, attn_proj, attn_w, k, v, _pre_o) =
-        run_attention_block_core(weights, h, layer, capture_attention, shared_kv, None, None)?;
+    let (h_post, attn_proj, attn_w, k, v, _pre_o) = run_attention_block_core(
+        weights,
+        h,
+        layer,
+        capture_attention,
+        shared_kv,
+        None,
+        None,
+        None,
+    )?;
     Some((h_post, attn_proj, attn_w, k, v))
 }
 
@@ -49,8 +57,16 @@ pub fn run_attention_block_shared(
     capture_attention: bool,
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Array2<f32>, Option<AttentionWeights>)> {
-    let (h_post, attn_proj, attn_w, _, _, _) =
-        run_attention_block_core(weights, h, layer, capture_attention, shared_kv, None, None)?;
+    let (h_post, attn_proj, attn_w, _, _, _) = run_attention_block_core(
+        weights,
+        h,
+        layer,
+        capture_attention,
+        shared_kv,
+        None,
+        None,
+        None,
+    )?;
     Some((h_post, attn_proj, attn_w))
 }
 
@@ -63,7 +79,7 @@ pub fn run_attention_block_with_pre_o(
     layer: usize,
 ) -> Option<(Array2<f32>, Array2<f32>)> {
     let (h_post, _, _, _, _, pre_o) =
-        run_attention_block_core(weights, h, layer, false, None, None, None)?;
+        run_attention_block_core(weights, h, layer, false, None, None, None, None)?;
     Some((h_post, pre_o))
 }
 
@@ -79,7 +95,7 @@ pub fn run_attention_block_zero_pre_o_heads(
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Option<SharedKV>)> {
     let (h_post, _, _, k_rope, v_final, _) =
-        run_attention_block_core(weights, h, layer, false, shared_kv, Some(heads), None)?;
+        run_attention_block_core(weights, h, layer, false, shared_kv, Some(heads), None, None)?;
     let kv_out = if shared_kv.is_none() {
         Some((k_rope, v_final))
     } else {
@@ -107,7 +123,30 @@ pub fn run_attention_block_replace_pre_o_head(
         shared_kv,
         None,
         Some((head, replacement)),
+        None,
     )?;
+    let kv_out = if shared_kv.is_none() {
+        Some((k_rope, v_final))
+    } else {
+        None
+    };
+    Some((h_post, kv_out))
+}
+
+/// Run attention while explicitly subtracting selected query-head
+/// contributions from the O-projected tensor before the attention residual path.
+///
+/// This is numerically equivalent to zeroing those pre-W_O heads, but it checks
+/// the head-to-W_O block indexing independently.
+pub fn run_attention_block_subtract_pre_o_heads(
+    weights: &crate::model::ModelWeights,
+    h: &Array2<f32>,
+    layer: usize,
+    heads: &[usize],
+    shared_kv: Option<&SharedKV>,
+) -> Option<(Array2<f32>, Option<SharedKV>)> {
+    let (h_post, _, _, k_rope, v_final, _) =
+        run_attention_block_core(weights, h, layer, false, shared_kv, None, None, Some(heads))?;
     let kv_out = if shared_kv.is_none() {
         Some((k_rope, v_final))
     } else {
@@ -127,6 +166,7 @@ fn run_attention_block_core(
     shared_kv: Option<&SharedKV>,
     zero_pre_o_heads: Option<&[usize]>,
     replace_pre_o_head: Option<(usize, &Array2<f32>)>,
+    subtract_pre_o_heads: Option<&[usize]>,
 ) -> Option<(
     Array2<f32>,
     Array2<f32>,
@@ -310,6 +350,19 @@ fn run_attention_block_core(
 
     // O projection
     let mut attn_projected = dot_proj(&attn_out, w_o);
+    if let Some(heads) = subtract_pre_o_heads {
+        for &head in heads {
+            if head >= num_q {
+                return None;
+            }
+            let start = head * head_dim;
+            let end = start + head_dim;
+            let head_out = attn_out.slice(s![.., start..end]);
+            let w_o_head = w_o.slice(s![.., start..end]);
+            let contribution = dot_proj(&head_out, &w_o_head);
+            attn_projected -= &contribution;
+        }
+    }
     if let Some(bias) = arch
         .attn_o_bias_key(layer)
         .and_then(|k| weights.vectors.get(&k))
