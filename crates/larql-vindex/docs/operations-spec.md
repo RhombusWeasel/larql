@@ -214,6 +214,8 @@ Patches are lightweight, shareable diffs that modify a vindex without changing t
       "target": "bleeding",
       "confidence": 0.85,
       "gate_vector_b64": "<base64 encoded f32 × hidden_size>",
+      "up_vector_b64":   "<base64 encoded f32 × hidden_size>",
+      "down_vector_b64": "<base64 encoded f32 × hidden_size>",
       "down_meta": {"t": "bleeding", "i": 12847, "c": 4.2}
     },
     {
@@ -221,6 +223,8 @@ Patches are lightweight, shareable diffs that modify a vindex without changing t
       "layer": 27,
       "feature": 9515,
       "gate_vector_b64": "<base64 encoded f32 × hidden_size>",
+      "up_vector_b64":   "<base64 encoded f32 × hidden_size>",
+      "down_vector_b64": "<base64 encoded f32 × hidden_size>",
       "down_meta": {"t": "Paris", "i": 8921, "c": 5.1}
     },
     {
@@ -233,7 +237,7 @@ Patches are lightweight, shareable diffs that modify a vindex without changing t
 }
 ```
 
-**Size:** A single fact is ~10 KB (one gate vector at 2,560 × 4 bytes ≈ 10 KB + metadata). A 1,000-fact patch is ~10 MB. Compared to the full model at 8 GB, this is 1/800th the size.
+**Size:** A single fact carries up to three vectors (gate + up + down, each `hidden_size × f32`) ≈ 30 KB + metadata. Compose-mode `INSERT` writes all three so the `.vlp` round-trips losslessly through `apply_patch` → `COMPILE INTO VINDEX`; a metadata-only `update` typically omits the vector fields. A 1,000-fact patch is ~30 MB at most. Compared to the full model at 8 GB, this is still 1/250th the size. The `up_vector_b64` and `down_vector_b64` fields are optional — `.vlp` files written before they were introduced still parse, with both fields defaulting to `None`.
 
 ### 2.2 LQL Patch Operations
 
@@ -485,9 +489,23 @@ pub struct VindexPatch {
 }
 
 pub enum PatchOp {
-    Insert { layer, feature, relation, entity, target, confidence, gate_vector, down_meta },
-    Update { layer, feature, gate_vector, down_meta },
+    Insert {
+        layer, feature, relation, entity, target, confidence,
+        // Per-component overrides — each carried as Option<base64-f32>.
+        // Compose-mode INSERT writes all three; older patches that only
+        // had `gate_vector_b64` still parse (up/down default to None).
+        gate_vector_b64, up_vector_b64, down_vector_b64,
+        down_meta,
+    },
+    Update {
+        layer, feature,
+        gate_vector_b64, up_vector_b64, down_vector_b64,
+        down_meta,
+    },
     Delete { layer, feature, reason },
+    // Architecture B residual-key KNN ops:
+    InsertKnn { layer, entity, relation, target, target_id, confidence, key_vector_b64 },
+    DeleteKnn { entity },
 }
 
 pub struct PatchedVindex {

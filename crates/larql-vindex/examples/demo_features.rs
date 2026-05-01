@@ -296,6 +296,11 @@ fn main() {
         author: Some("demo".into()),
         tags: vec!["medical".into()],
         operations: vec![
+            // Compose-mode INSERT writes gate + up + down overrides
+            // together; persisting all three in the .vlp lets a
+            // round-trip through save/load reconstruct the install
+            // (gate alone misses the up/down components a
+            // `COMPILE INTO VINDEX` pass would need to bake).
             larql_vindex::PatchOp::Insert {
                 layer: 0,
                 feature: 4,
@@ -306,8 +311,12 @@ fn main() {
                 gate_vector_b64: Some(larql_vindex::patch::core::encode_gate_vector(&[
                     0.0, 0.0, 0.0, 10.0,
                 ])),
-                up_vector_b64: None,
-                down_vector_b64: None,
+                up_vector_b64: Some(larql_vindex::patch::core::encode_gate_vector(&[
+                    0.0, 0.0, 0.0, 1.5,
+                ])),
+                down_vector_b64: Some(larql_vindex::patch::core::encode_gate_vector(&[
+                    0.0, 0.0, 0.5, 0.0,
+                ])),
                 down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                     top_token: "headache".into(),
                     top_token_id: 200,
@@ -361,6 +370,14 @@ fn main() {
             .feature_meta(0, 4)
             .map(|m| m.top_token.clone())
             .unwrap_or_else(|| "(none)".into())
+    );
+    // Gate + up + down overrides round-tripped through the .vlp:
+    let has_gate = patched.overrides_gate_at(0, 4).is_some();
+    let has_up = patched.up_override_at(0, 4).is_some();
+    let has_down = patched.down_override_at(0, 4).is_some();
+    println!(
+        "    F4 overrides: gate={} up={} down={}",
+        has_gate, has_up, has_down
     );
 
     // KNN with patch

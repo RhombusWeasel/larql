@@ -180,8 +180,26 @@ exercises the per-expert HTTP path end-to-end:
 ```bash
 cargo run --release -p larql-server --example bench_expert_server -- \
   output/gemma4-26b-a4b-q4k.vindex
-# Optional --ffn-only / --two-shard flags.
 ```
+
+Flags (all combinable):
+
+| Flag | Effect |
+|------|--------|
+| `--ffn-only` | Skip the f16 gate-vector warmup (faster boot, lazy decode). |
+| `--two-shard` | Spin up 2 in-process shards instead of 1. |
+| `--uds` | Bind a Unix domain socket alongside TCP and route the bench client through it (compares ~150 µs/call savings vs TCP loopback). |
+| `--wire f32\|f16` | Wire format for the layer-batch endpoint. f16 halves wire bytes; on loopback the f32↔f16 conversion CPU cancels the saving (use on real LAN). Default f32. |
+
+Reference numbers on M3 Max (single in-process shard, layer 15, top-K=8;
+30-layer sweep is 1 decode-step's worth of MoE blocks):
+
+| Config | `forward_moe` warm | 30-layer sweep |
+|---|---|---|
+| TCP HTTP + f32 (default) | 0.82 ms | 23.8 ms |
+| **UDS + f32** | **0.74 ms** | **21.4 ms** ← best on loopback |
+| TCP HTTP + f16 | 1.05 ms | 29.6 ms (f16 conv CPU dominates on loopback) |
+| UDS + f16 | 0.71 ms | 21.7 ms |
 
 Reference numbers on M3 Max with the per-layer Q4_K layout
 (`forward_moe` warm 1.91 ms, 30-layer sweep 56 ms, steady RSS 9.7 GB)
@@ -974,7 +992,7 @@ larql-server/
 ## Testing
 
 ```bash
-# Unit + integration tests (~494 tests across lib + 14 test files)
+# Unit + integration tests (501 tests across lib + 14 test files; all green)
 cargo test -p larql-server
 
 # Synthetic demos (no real vindex)
@@ -1059,6 +1077,44 @@ which CPU optimisations win on real LAN-class RTT). Concrete recipe TBD;
 the building blocks (sharding flags, gRPC streaming with overlap, f16
 wire opt-in for bandwidth-constrained links) are all in place from the
 2026-05-01 perf session.
+
+## What's coming
+
+The full forward-looking work is in `ROADMAP.md`. Headline items most
+likely to affect how you use the server:
+
+- **N0. OpenAI API compatibility** — `/v1/chat/completions`,
+  `/v1/completions`, `/v1/responses` (stateful), `/v1/embeddings`
+  (OpenAI-shape wrapper), `/v1/models`. Streaming via SSE, tool calls,
+  JSON-schema response_format. Once landed, every existing OpenAI
+  client (Python `openai` SDK, JS `openai`, LangChain, LlamaIndex,
+  Cursor, Continue, Aider, eval harnesses, dashboards) becomes a
+  larql client unmodified.
+- **N1. Stateful chat sessions** — KV-cache as a first-class resource
+  (`POST /v1/sessions`, `/v1/sessions/{id}/append`). Today every
+  `/v1/infer` re-prefills from scratch; with sessions the KV-cache
+  stays resident across turns. Pairs with N0.3 (Responses API).
+- **N2. Async batch inference job queue** — `/v1/jobs` for
+  throughput-bound workloads (RAG document processing, evals,
+  embedding pre-compute) that don't share the SLO of real-time chat.
+- **N3. LoRA / adapter hot-loading per session** — multi-tenant
+  serving, hundreds of adapters in RAM next to one base model.
+- **N4. Multimodal API surface** — vision tower endpoint for Gemma 3/4
+  + Llama 3.2 vision variants (vindex extractor already handles the
+  weights; only the API surface is missing).
+- **N5. Federated knowledge graph over multiple vindexes** — unique
+  capability the larql architecture enables: ask "describe France
+  using Gemma's knowledge AND Llama's knowledge AND a custom vindex"
+  in one call. No other LLM serving stack can do this.
+- **N6. Live blue-green vindex deployment** — load v2 alongside v1,
+  weighted traffic ramp, side-by-side metrics for canary rollout.
+- **F-FLY. Remote multi-shard deployment on fly.io** — the validation
+  step for the 2026-05-01 HTTP perf optimisations on real LAN-class
+  RTT (loopback can't tell us how f16 wire / TCP_NODELAY behave on a
+  real network).
+
+A code-quality cleanup pass (Q1.1–Q1.10 — split `routes/expert.rs`,
+centralise env flags, lift remaining magic numbers) is also queued.
 
 ## License
 

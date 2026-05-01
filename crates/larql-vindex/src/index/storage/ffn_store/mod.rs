@@ -737,3 +737,81 @@ impl VectorIndex {
 
 mod fp4;
 mod q4k_cache;
+
+#[cfg(test)]
+mod ffn_layer_byte_offset_tests {
+    //! `ffn_layer_byte_offset` is the load-bearing prefix-sum that lets
+    //! the legacy f32 FFN accessors handle layouts where
+    //! `layers[].num_features` varies (MoE shards). Pre-fix it was
+    //! `layer * num_features(layer)`, which silently mis-addressed every
+    //! layer past the first whenever feature counts weren't constant.
+
+    use super::*;
+    use crate::index::core::VectorIndex;
+    use ndarray::Array2;
+
+    /// Build an in-memory VectorIndex whose `num_features(layer)` reads
+    /// from the heap gate-vectors fallback (no mmap needed). Each gate
+    /// matrix has shape `[num_features[l], hidden]`.
+    fn index_with_layers(num_features: &[usize], hidden: usize) -> VectorIndex {
+        let gate_vectors: Vec<Option<Array2<f32>>> = num_features
+            .iter()
+            .map(|&n| Some(Array2::zeros((n, hidden))))
+            .collect();
+        let down_meta = vec![None; num_features.len()];
+        VectorIndex::new(gate_vectors, down_meta, num_features.len(), hidden)
+    }
+
+    #[test]
+    fn constant_features_collapses_to_layer_times_size() {
+        // Dense path: every layer has the same num_features. The prefix
+        // sum equals `layer * num_features * hidden * 4 * mults`, so
+        // existing dense vindex files keep their byte layout.
+        let v = index_with_layers(&[8, 8, 8, 8], 4);
+        for layer in 0..4 {
+            for mults in [1, 3] {
+                let expected = layer * 8 * 4 * 4 * mults;
+                assert_eq!(
+                    v.ffn_layer_byte_offset(layer, mults),
+                    expected,
+                    "layer={layer} mults={mults}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn variable_features_uses_prefix_sum() {
+        // MoE path: feature counts differ per layer. Layer L starts at
+        // `sum_{l<L} num_features(l) * hidden * 4 * mults` — *not*
+        // `L * num_features(L) * hidden * 4 * mults`. Pre-fix code
+        // computed the latter and silently mis-addressed L1+.
+        let v = index_with_layers(&[10, 20, 30], 4);
+
+        // mults=1 (down_features.bin, up_features.bin):
+        // L0 → 0
+        // L1 → 10*4*4 = 160
+        // L2 → (10+20)*4*4 = 480
+        assert_eq!(v.ffn_layer_byte_offset(0, 1), 0);
+        assert_eq!(v.ffn_layer_byte_offset(1, 1), 160);
+        assert_eq!(v.ffn_layer_byte_offset(2, 1), 480);
+
+        // mults=3 (interleaved.bin, gate+up+down per layer):
+        // L0 → 0
+        // L1 → 10*4*4*3 = 480
+        // L2 → (10+20)*4*4*3 = 1440
+        assert_eq!(v.ffn_layer_byte_offset(0, 3), 0);
+        assert_eq!(v.ffn_layer_byte_offset(1, 3), 480);
+        assert_eq!(v.ffn_layer_byte_offset(2, 3), 1440);
+    }
+
+    #[test]
+    fn matches_pre_fix_math_for_first_layer() {
+        // Layer 0 is always offset 0 regardless of the prefix sum vs
+        // `layer * size` formula — the regression only shows up at
+        // layer >= 1. This test pins that L0 doesn't shift.
+        let v = index_with_layers(&[7, 11, 13], 5);
+        assert_eq!(v.ffn_layer_byte_offset(0, 1), 0);
+        assert_eq!(v.ffn_layer_byte_offset(0, 3), 0);
+    }
+}

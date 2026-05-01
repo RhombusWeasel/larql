@@ -111,6 +111,391 @@ GB at 2026-04-26). The 2026-05-01 session took 1.91 ms → 0.80 ms
 
 ---
 
+## Great new functionality (next big-ticket items)
+
+The numbered F0..F23 items below are mostly **incremental polish**
+(metrics, shutdown drain, RBAC, OpenAPI, etc.) — necessary but not
+load-bearing for new use cases. The items in this section are
+**new capabilities** that would unlock production deployment shapes
+the server can't currently serve. Ranked by how much they expand
+the addressable surface, not by implementation effort.
+
+### N0. OpenAI API compatibility (Chat Completions, Completions, Responses, Embeddings)
+
+**Status**: Not started. Supersedes the older F10 ("OpenAI-compat
+`/v1/chat/completions`") which scoped only the chat endpoint
+shallowly. **Highest-leverage item in this section** — every
+existing OpenAI client (Python `openai` SDK, JS `openai`, LangChain,
+LlamaIndex, Cursor, Continue, Aider, hundreds of agent frameworks,
+every dashboard/eval harness in the ecosystem) becomes a larql client
+the day this lands. Without it we're a niche-internal tool;
+with it we're a drop-in target.
+
+**Scope** — five endpoints, mapped onto our existing inference path:
+
+#### N0.1 `POST /v1/chat/completions` (Chat Completions API)
+
+The current standard. Most clients still talk this even after the
+Responses API launched. Non-streaming + streaming via SSE.
+
+```
+Request:  {model, messages: [{role, content, tool_calls?, tool_call_id?}],
+           temperature?, top_p?, max_tokens?, stream?, tools?, tool_choice?,
+           response_format?, seed?, stop?, n?, frequency_penalty?,
+           presence_penalty?, logprobs?, top_logprobs?, user?}
+Response: {id, object: "chat.completion", created, model,
+           choices: [{index, message: {role: "assistant", content,
+                       tool_calls?}, finish_reason, logprobs?}],
+           usage: {prompt_tokens, completion_tokens, total_tokens}}
+SSE chunk: {id, object: "chat.completion.chunk", created, model,
+            choices: [{index, delta: {role?, content?, tool_calls?},
+                       finish_reason?}]}
+SSE terminator: `data: [DONE]\n\n`
+```
+
+Translation layer:
+- `messages` → render via existing `chat::render_user_prompt` (per
+  family chat template) → `encode_prompt` → `generate_streaming`.
+- `stream: true` → wrap `generate_streaming`'s `on_token` callback in
+  an SSE encoder; emit one chunk per token.
+- `tools` → constrained-decoding mask routing the model toward valid
+  tool-call JSON. Depends on N0.6 (JSON schema → grammar).
+- `response_format: {type: "json_object"}` or
+  `response_format: {type: "json_schema", json_schema: {...}}` → same
+  constrained-decoding hook.
+- `stop` strings → augment the existing `EosConfig` for the duration
+  of the call.
+- `seed` → pass through to `SamplingConfig` (already supported).
+
+#### N0.2 `POST /v1/completions` (Legacy Completions API)
+
+Older but still widely used (especially by older eval harnesses and
+embedding/reranker pipelines that haven't migrated). Simpler shape:
+
+```
+Request:  {model, prompt: string | string[], max_tokens?, temperature?,
+           top_p?, stream?, logprobs?, echo?, stop?, n?, best_of?,
+           seed?, suffix?}
+Response: {id, object: "text_completion", created, model,
+           choices: [{text, index, finish_reason, logprobs?}],
+           usage: {...}}
+```
+
+Strictly easier than N0.1 — no chat template, no tool calls, no
+multi-message context. Maps directly to `encode_prompt` +
+`generate_streaming`. Could ship first as a smoke-test of the
+overall translation layer.
+
+#### N0.3 `POST /v1/responses` (Responses API — newer, stateful)
+
+OpenAI's 2025 successor to chat completions. Designed for stateful
+multi-turn agents with built-in tool execution + reasoning content.
+Pairs naturally with **N1 (stateful chat sessions)** — the
+`previous_response_id` field references prior turns whose KV-cache
+the server kept resident.
+
+```
+Request:  {model, input: string | InputItem[], previous_response_id?,
+           instructions?, tools?, tool_choice?, response_format?,
+           reasoning?, store?, metadata?, parallel_tool_calls?}
+
+InputItem variants: text input ({type: "message", role, content}),
+                    function-call output ({type: "function_call_output",
+                    call_id, output}), file references, etc.
+
+Response: {id, object: "response", created_at, status: "completed"|...,
+           model, output: [
+             {type: "message", role: "assistant", content: [{type: "output_text", text}]},
+             {type: "function_call", call_id, name, arguments},
+             {type: "reasoning", content},  // for o1 / DeepSeek-R1 style models
+           ],
+           usage: {input_tokens, output_tokens, reasoning_tokens, total_tokens},
+           previous_response_id}
+```
+
+Implementation path:
+- Without N1: each call is a fresh prefill (server-side response storage
+  optional via `store: true` — return `id` for retrieval but don't
+  reuse KV-cache).
+- With N1: `previous_response_id` → look up the session's KV-cache,
+  continue from that state (zero re-prefill on the prior turns).
+- Reasoning content (DeepSeek-R1 / Gemma-thinking-style models): emit
+  thinking traces as a separate `output[]` entry.
+
+#### N0.4 `POST /v1/embeddings` (Embeddings API)
+
+Existing `/v1/embed` endpoint already does this work; just needs an
+OpenAI-shape wrapper.
+
+```
+Request:  {model, input: string | string[] | int[] | int[][],
+           encoding_format?: "float" | "base64", dimensions?}
+Response: {object: "list", data: [{object: "embedding", embedding: [...],
+           index}], model, usage: {prompt_tokens, total_tokens}}
+```
+
+Two important nuances:
+- `input` accepts strings (we tokenise) or pre-tokenised arrays
+  (we embed directly via existing `/v1/embed`).
+- `encoding_format: "base64"` returns embeddings as
+  base64-encoded f32 little-endian bytes — ~33% smaller wire than
+  the JSON float array form. Many production clients default to
+  base64.
+
+#### N0.5 `GET /v1/models` (already exists, needs OpenAI shape)
+
+Current response shape doesn't match OpenAI's. Reshape:
+
+```
+{object: "list", data: [
+   {id, object: "model", created, owned_by: "larql", parent?, ...}
+]}
+```
+
+Trivial — existing route just needs the wrapper.
+
+#### N0.6 Constrained decoding (JSON schema + GBNF grammar)
+
+`response_format: {type: "json_schema"}` and `tools` both require
+the decoder to emit only tokens that keep the output grammar-valid.
+Today the inference-side decoder has a regex/grammar hook
+(`EosConfig` / sampling pipeline already supports "stop strings");
+need to extend with a real GBNF parser + JSON Schema → GBNF compiler.
+
+Implementation is well-trodden — port from llama.cpp's `grammar.cpp` /
+`grammar-parser.cpp` (well-defined spec; ~1000 LOC). Tracked
+separately as F17 in this ROADMAP, but N0 makes it load-bearing.
+
+#### Cross-cutting concerns
+
+- **Streaming framing**: SSE format is `data: {json}\n\n` per chunk,
+  terminated by `data: [DONE]\n\n`. axum has `axum::response::sse`
+  out of the box.
+- **Authentication**: the existing `--api-key` Bearer token mechanism
+  works as-is; OpenAI clients send `Authorization: Bearer sk-...`.
+- **Model identity**: `model` field in the request maps to a vindex
+  ID. For single-model servers, ignore. For multi-model, route via
+  the existing model-id mux.
+- **Usage tokens**: track `prompt_tokens` (count from
+  `encode_prompt`'s output) and `completion_tokens` (count tokens
+  generated). Trivial bookkeeping.
+- **Error envelope**: OpenAI uses `{error: {message, type, param,
+  code}}` — slightly different from our `{error: "..."}`. Add an
+  OpenAI-shape error mapper at the route layer.
+- **Rate limit headers**: `x-ratelimit-limit-requests`,
+  `x-ratelimit-remaining-requests`, etc. — pairs with our existing
+  `--rate-limit` machinery.
+
+#### Build order recommendation
+
+1. **N0.5 + N0.4 + N0.2** (Models + Embeddings + Completions) —
+   smallest, no streaming, validates the OpenAI shape + auth.
+   Makes the server immediately usable for embedding-only and
+   text-completion workloads.
+2. **N0.1 non-streaming** (Chat Completions, no tools, no
+   constrained output yet) — covers ~80% of real chat usage.
+3. **N0.1 streaming** (SSE) — every chat UI assumes this.
+4. **N0.6** (constrained decoding) — unblocks tools + structured
+   output.
+5. **N0.1 with tools + JSON mode** — production-grade chat.
+6. **N0.3 (Responses API)** — pairs with N1 for stateful continuation.
+
+#### Implementation surface (rough)
+
+- N0.5: ~30 LOC (just a wrapper)
+- N0.4: ~150 LOC (translate input format, base64 encoding)
+- N0.2: ~250 LOC (legacy completions, simpler)
+- N0.1 non-streaming: ~400 LOC
+- N0.1 streaming SSE: +200 LOC
+- N0.6 GBNF + JSON Schema: ~1200 LOC (port from llama.cpp)
+- N0.1 with tools + JSON mode: +300 LOC (depends on N0.6)
+- N0.3 Responses API (stateless): ~500 LOC
+- N0.3 stateful (with N1): +200 LOC on top
+
+**Total**: ~3200 LOC, shippable in slices. The first 5-day slice
+(items 1-3 above) is enough to make larql-server a viable target for
+most existing clients.
+
+#### Files
+
+New `routes/openai/` directory — one file per endpoint. Shared
+`routes/openai/types.rs` for the request/response schemas (use
+`serde` to match the OpenAI shape exactly; let serde-rename do the
+heavy lifting for camelCase conversions). Wire into
+`routes/mod.rs::single_model_router` alongside the existing routes;
+multi-model routing via `model` field in the request body.
+
+#### Why this beats every other N item on leverage
+
+- N1 (sessions) is great but only useful if you have a client to use
+  it with. **N0 brings every existing client.**
+- N4 (multimodal) is an addressable-market expansion, not a
+  client-acquisition unlock.
+- N5 (federated knowledge graph) is unique but needs a custom
+  client until OpenAI adds federated DESCRIBE to their spec (never).
+- N0 is the move that makes everything else discoverable. Ship it
+  first.
+
+---
+
+### N1. Stateful chat sessions (KV-cache as a first-class resource)
+
+**Why this is the biggest gap.** Every production LLM API today is
+session-aware: client sends the new turn, server remembers prior context
+via KV-cache. larql-server's `/v1/infer` is single-shot — every request
+re-prefills from scratch. For a 4 K context that's ~100 ms of wasted
+compute per turn; for 16 K it's seconds. We're not competitive with
+vLLM / TGI / OpenAI for any chat workload.
+
+The pieces exist or are tracked piecemeal — F7 (KV-cache prefix
+sharing), F22 (persistent patches as a precedent for session
+persistence), the chat session machinery already in
+`larql-inference::layer_graph::generate::chat_session` — but no
+end-to-end story.
+
+**Proposal**:
+- `POST /v1/sessions` → returns `{session_id}` + initial state
+- `POST /v1/sessions/{id}/append` → adds user message, generates assistant
+  reply, returns SSE stream. KV-cache stays resident.
+- `GET /v1/sessions/{id}` → describes current state (msg count, token
+  count, model, adapter, last activity).
+- `DELETE /v1/sessions/{id}` → frees KV-cache.
+- Eviction policy: per-session TTL, total-RSS budget, LRU under
+  pressure. Surfaces in `/v1/stats.sessions`.
+- Pairs with **N3 (LoRA hot-load)** — sessions can pin a specific adapter.
+
+**Implementation surface**: ~600 LOC. New `routes/sessions.rs`,
+new `state::SessionStore`, hook into the existing `generate_streaming`
++ `Detokenizer` machinery. Roughly half the work is the eviction /
+budget management — non-trivial but well-scoped.
+
+### N2. Asynchronous batch inference job queue
+
+**Why**: Real-time chat is one model; **bulk inference** (RAG document
+processing, embedding pre-compute, reranker scoring, evaluation
+harnesses) is another. They have very different SLOs. A batch job
+submitter doesn't care about per-token latency; it cares about
+throughput, cost, and being able to run while the cluster is otherwise
+idle. Today users have to wrap `/v1/infer` in their own retry/queue
+glue.
+
+**Proposal**:
+- `POST /v1/jobs` → submit `{prompts: [...], model_id, params}` →
+  returns `{job_id}`.
+- `GET /v1/jobs/{id}` → status + partial results.
+- `POST /v1/jobs/{id}/cancel`.
+- Optional `webhook_url` in the submit body for completion callback.
+- Worker pool: independent rayon thread pool, capped concurrency,
+  prioritises real-time `/v1/infer` traffic (job worker yields when a
+  real-time request arrives).
+- Persistence: jobs survive restarts (write-ahead log to disk).
+
+**Pairs with**: F12 (batched infer in same request), F22 (persistent
+state). Together those two are the building blocks; this item is the
+asynchronous wrapper.
+
+**Implementation surface**: ~800 LOC. New `routes/jobs.rs`, new
+`worker::Pool`, persistence to a `jobs/` directory. The hardest piece
+is the priority scheduler — getting it wrong means batch starves
+real-time or vice versa.
+
+### N3. LoRA / adapter hot-loading per session
+
+**Why**: Multi-tenant production. Today every tenant either gets the
+same base model or has to spin up a separate process. Real production
+serving (Anthropic, OpenAI, Together, Replicate) supports per-request
+adapter swap. Adapters are 10-100 MB vs the 16 GB base model —
+hot-loading hundreds of them is feasible if we have the surface.
+
+**Proposal**:
+- `POST /v1/adapters/load` → `{adapter_id, source: "hf://..."|"file://..."|"http://...",
+  model_id}` → loads into RAM.
+- `GET /v1/adapters` → list loaded adapters with size + last-used.
+- `DELETE /v1/adapters/{id}` → evict.
+- Inference / sessions take an optional `adapter_id` field — applies
+  the LoRA delta to gate/up/down/q/k/v/o matmuls per layer per call.
+- Eviction: LRU + total-RSS budget, configurable.
+
+**Pairs with**: N1 (sessions pin adapters). Independent enough to ship
+first if N1 is too heavy.
+
+**Implementation surface**: ~500 LOC. The LoRA forward-pass plumbing
+already exists at the inference-crate level (per
+`larql-inference/ROADMAP.md` § F4 LoRA loading). The server piece is
+the lifecycle + RSS management.
+
+### N4. Multimodal API surface (vision tower, mixed image+text infer)
+
+**Why**: Gemma 3/4 ships vision variants; Llama 3.2 too. The vindex
+extractor already handles vision tower weights (per
+`larql-inference/ROADMAP.md → vision`). We're missing the API
+surface — there's no way to send an image to the server today.
+
+**Proposal**:
+- `POST /v1/embed/image` → multipart upload → vision tower forward →
+  returns `{embedding: [...], hidden_size}`.
+- `POST /v1/infer` accepts `images: [base64, ...]` field; server
+  routes through the vision tower then concatenates with text tokens
+  for the language decoder.
+- `POST /v1/sessions/{id}/append` accepts images for multimodal chat.
+
+**Implementation surface**: ~400 LOC server-side once the inference
+crate's vision forward path is exposed (currently tracked separately).
+Big use-case unlock: docVQA, ChartQA, image classification, image
+embedding service.
+
+### N5. Federated knowledge graph over multiple vindexes
+
+**Why**: The DESCRIBE/WALK/SELECT trio makes a vindex a queryable
+knowledge graph. Multi-model serving (`--dir`) puts multiple
+graphs side-by-side — but each is queried independently. There's no
+way to ask "describe France using Gemma's knowledge AND Llama's
+knowledge AND my custom vindex". This is a unique capability the
+larql architecture enables that nothing else (vLLM, TGI, OpenAI) can
+do, and it's invisible.
+
+**Proposal**:
+- `GET /v1/federated/describe?entity=X&models=gemma,llama,custom` →
+  merges edges across vindexes, sourcing each edge with its origin
+  model.
+- `POST /v1/federated/select` with cross-model joins ("entities
+  Gemma calls capitals AND Llama calls capitals").
+- New LQL syntax: `DESCRIBE "France" USING gemma, llama;` already
+  hinted in the REPL doc (`USE REMOTE`); the server-side surface is
+  the missing half.
+- Surfacing model disagreement is a research-grade capability:
+  "Gemma says Paris is the capital of France with score 1436;
+  Llama says Lyon with score 320. Confidence-weighted merge?"
+
+**Implementation surface**: ~600 LOC. New `routes/federated.rs`,
+extends multi-model serving to do cross-model fan-out + merge.
+
+### N6. Live blue-green vindex deployment
+
+**Why**: Production model rollouts. Today swapping a vindex requires
+restart (modulo F8 hot-swap, which is admin-only and atomic). True
+blue-green wants: load v2 alongside v1, route X% of traffic, observe
+metric drift, ramp or rollback.
+
+**Proposal**:
+- `POST /v1/admin/deploy` → load `v2.vindex` alongside the active
+  `v1.vindex`, returns `{green_id}`.
+- `POST /v1/admin/traffic` → set weighted routing
+  (`{"v1": 0.9, "v2": 0.1}`).
+- `GET /v1/stats.deployment` → per-vindex per-endpoint p50/p99/error
+  rate side-by-side. Pairs with F3 metrics.
+- `POST /v1/admin/promote/{id}` → atomically swap routing to 100%
+  green; old vindex becomes stale-evictable.
+
+**Pairs with**: F8 (admin endpoints), F3 (metrics for traffic
+comparison). N6 is the **product** built on top of those primitives.
+
+**Implementation surface**: ~700 LOC. New `routes/admin/deploy.rs`,
+extends `AppState` to hold multiple model versions, weighted routing
+logic in the request entry points.
+
+---
+
 ## P0: Active
 
 ### F-FLY. Remote multi-shard deployment on fly.io
@@ -384,6 +769,198 @@ split.
 
 ## P1: Active
 
+### Q1. Code-quality review (2026-05-01) — modularity + magic literals
+
+Audit findings from the larql-server review session. None of these are
+correctness bugs; they're structural debt that's accumulated as the
+crate grew from browse-only HTTP server to a multi-protocol grid +
+remote-MoE backend. Listed in priority order — the first three would
+materially improve readability, the rest are polish.
+
+#### Q1.1 Split `routes/expert.rs` (1049 LOC, 6 distinct concerns)
+
+The file now mixes legacy single-expert dispatch, legacy batch,
+new layer-batch (f32 + f16), Metal expert dispatch, CPU expert
+dispatch, two warmup helpers, and a test mod. Each piece has its
+own well-defined surface. Proposed split (preserves all public
+APIs):
+
+```
+routes/expert/
+├── mod.rs            — pub re-exports + handler routing constants
+├── single.rs         — run_expert + handle_expert (POST /v1/expert/{layer}/{id})
+├── batch_legacy.rs   — handle_expert_batch (POST /v1/expert/batch — pre-2026-05-01 wire)
+├── layer_batch.rs    — handle_experts_layer_batch{,_f16} + decode helpers
+├── cpu.rs            — run_experts_cpu_batch (CPU rayon dispatch)
+├── metal.rs          — run_experts_metal_batch (#[cfg(feature = "metal-experts")])
+└── warmup.rs         — warmup_hnsw_unit_cache + warmup_metal_expert_cache
+```
+
+Effort: ~2 hours. No new tests required; existing
+`tests/test_expert_endpoint.rs` covers the public surface.
+
+#### Q1.2 Centralise env-var flags into `src/env_flags.rs`
+
+8 distinct `LARQL_*` env vars are read at scattered call sites
+(17 raw `std::env::var(...)` references). Several do thread-local
+caching individually; the pattern is duplicated. Proposed:
+
+```rust
+// src/env_flags.rs
+pub mod env {
+    pub const MOE_TIMING: &str = "LARQL_MOE_TIMING";        // 6 callsites
+    pub const HTTP_TIMING: &str = "LARQL_HTTP_TIMING";       // 2 callsites
+    pub const NO_WARMUP: &str = "LARQL_NO_WARMUP";           // 2 callsites
+    pub const USE_LEGACY_CPU: &str = "LARQL_USE_LEGACY_CPU"; // 1
+    pub const USE_METAL_EXPERTS: &str = "LARQL_USE_METAL_EXPERTS";
+    pub const DISABLE_METAL_EXPERTS: &str = "LARQL_DISABLE_METAL_EXPERTS";
+    pub const DISABLE_Q4K_DIRECT: &str = "LARQL_DISABLE_Q4K_DIRECT";
+    pub const METAL_VS_CPU_DEBUG: &str = "LARQL_METAL_VS_CPU_DEBUG";
+    pub const MOE_BATCH_MODE: &str = "LARQL_MOE_BATCH_MODE";
+}
+
+/// Cached at first read; re-reads on each call would syscall.  Used
+/// from the hot per-call paths in routes/expert.rs and grpc_expert.rs.
+pub fn moe_timing_enabled() -> bool { /* TLS-cached `is_ok` */ }
+pub fn http_timing_enabled() -> bool { /* ... */ }
+// ... one accessor per flag
+```
+
+Pairs with **README.md → "Environment variables"** which is the
+documentation surface for these. The env_flags module becomes the
+single source of truth referenced by both code and README.
+
+Effort: ~1 hour. Mostly find-and-replace.
+
+#### Q1.3 Reduce `routes/walk_ffn.rs::handle_walk_ffn` (397 LOC)
+
+The handler is split into 6-7 small helpers (`validate_owned`,
+`run_full_output`, `run_features_only`, etc.) — that work landed in
+the 2026-04-26 review. But the handler body still does:
+content-type detection, body deserialise (JSON or binary),
+delegation, response encode (JSON or binary), error envelope. The
+binary/JSON content-type bifurcation is the same pattern in
+`routes/expert.rs::handle_expert_batch` (already extracted helpers
+there) and could be a shared utility:
+
+```rust
+// src/wire.rs
+pub enum WireFormat { Binary, Json }
+impl WireFormat { pub fn from_content_type(headers: &HeaderMap) -> Self { ... } }
+```
+
+Effort: ~1.5 hours. Reduces walk_ffn handler to ~150 LOC, expert
+handlers benefit similarly.
+
+#### Q1.4 Body-size limit constants
+
+Three places literal `64 * 1024 * 1024`:
+- `routes/mod.rs:30` `EXPERT_BATCH_BODY_LIMIT` ✓ (already const)
+- `routes/embed.rs:216` (embed) and `routes/walk_ffn.rs:503` —
+  bare literals
+- `routes/embed.rs:315` has `256 * 1024 * 1024` for logits
+  (different class — wider residual dim)
+
+Proposed: lift to `src/http.rs`:
+
+```rust
+pub const REQUEST_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+pub const REQUEST_BODY_LIMIT_LARGE_BYTES: usize = 256 * 1024 * 1024;
+```
+
+Effort: ~10 min.
+
+#### Q1.5 `"application/json"` literal — use `mime` const or `http.rs` const
+
+Three sites still embed the bare string (`routes/expert.rs:825`,
+`routes/walk_ffn.rs:559`, `routes/embed.rs:543`). axum re-exports
+`mime::APPLICATION_JSON` via `axum::http::header`. Either use that
+or add `JSON_CONTENT_TYPE` to `http.rs` for consistency with
+`BINARY_FFN_CONTENT_TYPE`.
+
+Effort: ~10 min.
+
+#### Q1.6 Default-value constants in `main.rs` Cli struct
+
+CLI default values are inline string literals
+(`#[arg(long, default_value = "8080")]`). Lift to consts at the top
+of `main.rs`:
+
+```rust
+const DEFAULT_PORT: u16 = 8080;
+const DEFAULT_MAX_CONCURRENT: usize = 100;
+const DEFAULT_HNSW_EF_SEARCH: usize = 200;
+const DEFAULT_SESSION_TTL_SECS: u64 = 3600;  // also used by SessionManager::new
+const DEFAULT_DESCRIBE_CACHE_TTL_SECS: u64 = 0;
+```
+
+`#[arg(long, default_value_t = DEFAULT_PORT)]` with the `_t` form
+takes a typed value. Both are searchable; the typed const is also
+referenceable from elsewhere (e.g., the `SessionManager::new(3600)`
+in main.rs:346 currently re-encodes the same `3600`).
+
+Effort: ~30 min.
+
+#### Q1.7 `announce.rs` reconnect / heartbeat magic durations
+
+```rust
+let mut backoff = Duration::from_secs(1);                // initial
+backoff = (backoff * 2).min(Duration::from_secs(60));    // cap
+let mut interval = tokio::time::interval(Duration::from_secs(10));  // heartbeat
+```
+
+Lift to module consts:
+```rust
+const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+```
+
+Effort: ~5 min. Pure naming.
+
+#### Q1.8 Reduce `main.rs::main` (405 LOC)
+
+The entry point does: argv parsing, multi-vs-single mode detection,
+vindex loading (per model), warmup, app construction, listener
+setup (TCP + UDS + TLS), grid announce kick-off, then `await`s the
+listener. Most of this orchestration belongs in
+`bootstrap.rs` (which already has `load_single_vindex`,
+`discover_vindexes`, `parse_layer_range`). Proposed extraction:
+
+```
+src/bootstrap.rs::serve(cli: Cli) -> Result<(), BoxError>
+```
+
+`main.rs::main` shrinks to ~30 lines (parse Cli, init tracing,
+call `bootstrap::serve(cli).await`). Makes the binary entry point
+trivial and the orchestration testable from `bootstrap`'s existing
+unit-test harness.
+
+Effort: ~2 hours. Moderate care needed to avoid breaking the
+warmup ordering + grid-join lifecycle.
+
+#### Q1.9 Reduce `routes/embed.rs::handle_embed_single_inner` (301 LOC)
+
+Same shape as walk_ffn: handler does content-type dispatch + body
+parse + delegate + response encode. Same fix — share the
+content-type detection helper from Q1.3.
+
+Effort: rolls into Q1.3.
+
+#### Q1.10 Reduce `routes/stream.rs::handle_stream_infer` (327 LOC)
+
+WebSocket-based streaming infer is a substantial state machine.
+Less of a "modularity" issue than a "this is inherently complex"
+issue. Worth a once-over for sub-state extraction (separate `enum
+ClientMessage`, separate token-emit loop) but lower priority than
+the routes/expert.rs split.
+
+Effort: ~3 hours. Defer until N0.1 (OpenAI Chat Completions SSE)
+forces a similar shape — the two could share streaming
+infrastructure.
+
+---
+
 ### F6. Replica round-robin + retry on shard failure
 **Files**: `crates/larql-router/src/grid.rs`.
 Router picks first owning shard; no load-balancing across replicas, no retry
@@ -410,11 +987,14 @@ A K=8 batch on Gemma 4 26B-A4B is ~90 KB JSON per call. The
 `application/x-larql-ffn` binary format already exists for `walk-ffn`; mirror
 it for `expert/batch`. Expected 3–5× wire reduction.
 
-### F10. OpenAI-compat `/v1/chat/completions`
-**Files**: new `crates/larql-server/src/routes/openai.rs`.
-Map to `/v1/infer` with stream support. Lets every OpenAI client work
-unmodified — single biggest reach win for adoption. Includes
-`/v1/completions` (legacy) and `/v1/embeddings` (mapped to embed-service).
+### F10. OpenAI-compat `/v1/chat/completions` — superseded by N0
+
+This item scoped only the chat completions endpoint shallowly. See
+**N0** in the "Great new functionality" section above for the full
+plan: chat completions + completions + responses + embeddings +
+models, with streaming, tools, structured output, and constrained
+decoding. F10 is left here for cross-references; the work happens
+under N0.
 
 ### F11. Expert topology endpoint
 **Files**: new `crates/larql-server/src/routes/topology.rs`.

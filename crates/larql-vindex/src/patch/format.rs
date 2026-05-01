@@ -4,7 +4,15 @@
 //! This module owns the on-the-wire representation: `VindexPatch`,
 //! `PatchOp` (Insert/Update/Delete + arch-B InsertKnn/DeleteKnn),
 //! `PatchDownMeta`, save/load, and the base64 helpers used to embed
-//! gate/key vectors inside the JSON.
+//! gate/key/up/down vectors inside the JSON.
+//!
+//! `Insert` / `Update` carry up to three optional component vectors —
+//! `gate_vector_b64`, `up_vector_b64`, `down_vector_b64`. Compose-mode
+//! `INSERT` writes all three so the round-trip
+//! `apply_patch` → `COMPILE INTO VINDEX` reproduces the install. The
+//! up / down fields are `#[serde(default)]`, so `.vlp` files written
+//! before they were introduced still parse with both defaulting to
+//! `None`.
 //!
 //! Runtime application of patches lives in `super::overlay`
 //! (`PatchedVindex`).
@@ -492,5 +500,108 @@ mod tests {
     fn load_missing_file_returns_error() {
         let result = VindexPatch::load(std::path::Path::new("/nonexistent/path.vlp"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn save_load_round_trip_preserves_gate_up_down_vectors() {
+        // Compose-mode INSERT writes all three vectors; the .vlp must
+        // round-trip them. Regression for the lossy-patch bug where only
+        // gate was serialised and re-applying the file dropped up + down.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("with_vectors.vlp");
+
+        let gate = vec![1.0f32, 0.5, -0.5];
+        let up = vec![0.1f32, 0.2, 0.3];
+        let down = vec![-1.0f32, 0.0, 1.0];
+        let ops = vec![PatchOp::Insert {
+            layer: 7,
+            feature: 13,
+            relation: Some("capital".into()),
+            entity: "France".into(),
+            target: "Paris".into(),
+            confidence: Some(0.9),
+            gate_vector_b64: Some(encode_gate_vector(&gate)),
+            up_vector_b64: Some(encode_gate_vector(&up)),
+            down_vector_b64: Some(encode_gate_vector(&down)),
+            down_meta: None,
+        }];
+        let patch = VindexPatch {
+            version: 1,
+            base_model: "test".into(),
+            base_checksum: None,
+            created_at: String::new(),
+            description: None,
+            author: None,
+            tags: vec![],
+            operations: ops,
+        };
+        patch.save(&path).unwrap();
+        let loaded = VindexPatch::load(&path).unwrap();
+        match &loaded.operations[0] {
+            PatchOp::Insert {
+                gate_vector_b64,
+                up_vector_b64,
+                down_vector_b64,
+                ..
+            } => {
+                assert_eq!(
+                    decode_gate_vector(gate_vector_b64.as_ref().unwrap()).unwrap(),
+                    gate
+                );
+                assert_eq!(
+                    decode_gate_vector(up_vector_b64.as_ref().unwrap()).unwrap(),
+                    up
+                );
+                assert_eq!(
+                    decode_gate_vector(down_vector_b64.as_ref().unwrap()).unwrap(),
+                    down
+                );
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn load_legacy_patch_without_up_down_vectors() {
+        // .vlp files written before up_vector_b64 / down_vector_b64 were
+        // added must still parse — both fields default to None. This
+        // pins the backward-compatibility contract: removing
+        // `#[serde(default)]` on either field would silently break
+        // existing patch files.
+        let json = r#"{
+          "version": 1,
+          "base_model": "test",
+          "created_at": "2026-01-01",
+          "operations": [
+            {
+              "op": "insert",
+              "layer": 0,
+              "feature": 1,
+              "entity": "France",
+              "target": "Paris",
+              "gate_vector_b64": null
+            }
+          ]
+        }"#;
+        let patch: VindexPatch = serde_json::from_str(json).unwrap();
+        match &patch.operations[0] {
+            PatchOp::Insert {
+                gate_vector_b64,
+                up_vector_b64,
+                down_vector_b64,
+                ..
+            } => {
+                assert!(gate_vector_b64.is_none());
+                assert!(
+                    up_vector_b64.is_none(),
+                    "missing up_vector_b64 should default to None"
+                );
+                assert!(
+                    down_vector_b64.is_none(),
+                    "missing down_vector_b64 should default to None"
+                );
+            }
+            _ => panic!("expected Insert"),
+        }
     }
 }

@@ -50,7 +50,7 @@ use larql_inference::{
     vindex::{WalkFfn, WalkFfnConfig},
     FfnBackend, InferenceModel, WeightFfn,
 };
-use larql_vindex::{FeatureMeta, GateIndex, SilentLoadCallbacks, VectorIndex};
+use larql_vindex::{FeatureMeta, GateIndex, SilentLoadCallbacks, StorageBucket, VectorIndex};
 
 // ── Corpus ─────────────────────────────────────────────────────────────
 
@@ -70,7 +70,6 @@ const PROMPTS: &[(&str, &str)] = &[
 ];
 
 const PARIS_KEY: &str = "paris";
-const PARIS_PROB_BUDGET: f64 = 5e-3;
 
 // ── Bounds ─────────────────────────────────────────────────────────────
 
@@ -95,6 +94,12 @@ struct PathBound {
     /// Per-observation rel_L2 ceiling, where rel_L2 = L2 / max(‖primary‖, EPS).
     /// Magnitude-invariant; doesn't blow up on outlier-magnitude residuals.
     rel_l2: f32,
+    /// End-to-end gate on the Paris-anchor prompt: |walk_prob − dense_prob|
+    /// at the top-1 token must be ≤ this. The Paris prompt is the
+    /// fixed sampler-stability check across all paths; per-bucket budgets
+    /// reflect that quantized/FP4 paths can drift further on softmax
+    /// while still preserving model behavior (top-1 + ranking).
+    paris_prob_budget: f64,
 }
 
 const BOUND_EXACT: PathBound = PathBound {
@@ -106,23 +111,56 @@ const BOUND_EXACT: PathBound = PathBound {
     // (= measured × 4). Don't tighten this in isolation — wait until the
     // Q4K and FP4 baselines land and apply the same rule per bucket.
     rel_l2: 1e-2,
+    paris_prob_budget: 5e-3,
 };
 
 const BOUND_QUANTIZED: PathBound = PathBound {
     kind: "quantized",
     min_cos: 0.99,
-    rel_l2: 5e-3,
+    // Quantized rel_L2 ceiling is loose by design — cos is the meaningful
+    // assertion for this bucket. The two metrics aren't independent: for
+    // similar-magnitude vectors, rel_L2 ≈ √(2(1-cos)), so cos = 0.99
+    // implies rel_L2 ≈ 0.14, and the f16-style 1e-2 ceiling would be
+    // mathematically impossible here. Canonical Q4K measurement on Gemma
+    // 3 4B is rel_L2 = 1.205e-1 (worst at L10/code/1, interleaved_q4k
+    // path); 4× headroom puts the ceiling at ~5e-1. See
+    // walk_path_audit_gemma3_4b_q4k_baseline.md for the derivation.
+    rel_l2: 5e-1,
+    // Matches walk_correctness.rs Q4K-down threshold (0.035) with margin
+    // for prompts more sensitive to softmax redistribution than Paris.
+    // If walk_correctness later tightens its Q4K-down gate, revisit this
+    // budget so the two thresholds stay in sync.
+    paris_prob_budget: 5e-2,
 };
 
 const BOUND_FP4: PathBound = PathBound {
     kind: "fp4",
     min_cos: 0.98,
     rel_l2: 1e-2,
+    // Provisional pending FP4 baseline measurement on
+    // gemma3-4b-fp4a.vindex; same reasoning as quantized — FP4 dequant
+    // moves softmax further than f16-class noise. Tighten via
+    // measure-then-tighten when the FP4 baseline lands.
+    paris_prob_budget: 5e-2,
 };
 
-/// Map a path *name* to the right bound. Keep the matching loose so paths
-/// with sub-labels (`sparse:gemv_full_k`, `interleaved_q4:metal`, …) all
-/// land on the right bucket.
+/// Map a [`StorageBucket`] to its assertion bound. This is the source of
+/// truth for "what's the right floor for this bucket"; paths set their
+/// `bound` field by calling this on the bucket they're walking against.
+fn bound_for_bucket(bucket: StorageBucket) -> PathBound {
+    match bucket {
+        StorageBucket::Exact => BOUND_EXACT,
+        StorageBucket::Quantized => BOUND_QUANTIZED,
+        StorageBucket::Fp4 => BOUND_FP4,
+    }
+}
+
+/// Fallback only — prefer `PathSpec.bound` (set explicitly per spec in
+/// `enumerate_paths`). Kept as a path-name → default-bucket primitive in
+/// case a future caller needs to look up a bucket without a `PathSpec`.
+/// Loose prefix-matching so paths with sub-labels (`sparse:gemv_full_k`,
+/// `interleaved_q4:metal`, …) all land on the right bucket.
+#[allow(dead_code)]
 fn bound_for(path: &str) -> PathBound {
     if path.starts_with("fp4_storage") {
         BOUND_FP4
@@ -413,6 +451,13 @@ struct PathSpec {
     mask: PathMask,
     /// Sparse-K config (`Some`) or dense ladder (`None`).
     sparse_k: Option<usize>,
+    /// Assertion bound for this path. Set explicitly per spec — for paths
+    /// whose precision is fixed by the path itself (e.g. `interleaved` is
+    /// always f32; `interleaved_q4k` is always Q4K), this is hardcoded to
+    /// the right bucket. For `sparse`, which dispatches through the
+    /// unified `ffn_row_*` chain and walks whatever data the vindex
+    /// carries, the bucket is determined by `index.primary_storage_bucket()`.
+    bound: PathBound,
 }
 
 /// Probe the live vindex and return the paths that are actually testable.
@@ -423,11 +468,15 @@ fn enumerate_paths(index: &VectorIndex) -> Vec<PathSpec> {
 
     // sparse:* — config-forced walk_ffn_sparse over whatever the unified
     // ffn_row_* dispatch picks. Always available since it doesn't depend
-    // on any has_* flag.
+    // on any has_* flag. Bucket is *vindex-dependent*: on an f16 vindex
+    // sparse walks f32 features (Exact); on a Q4K vindex sparse walks
+    // Q4K via q4k_ffn_row_dot (Quantized). primary_storage_bucket()
+    // encapsulates that mapping so future storage formats inherit it.
     out.push(PathSpec {
         name: "sparse",
         mask: PathMask::default(),
         sparse_k: Some(usize::MAX),
+        bound: bound_for_bucket(index.primary_storage_bucket()),
     });
 
     // fp4_storage:sparse — only if the vindex carries FP4 storage.
@@ -440,6 +489,7 @@ fn enumerate_paths(index: &VectorIndex) -> Vec<PathSpec> {
                 ..PathMask::default()
             },
             sparse_k: None,
+            bound: BOUND_FP4,
         });
     }
 
@@ -451,7 +501,9 @@ fn enumerate_paths(index: &VectorIndex) -> Vec<PathSpec> {
         );
     }
 
-    // interleaved (f32) — mask fp4 + q4 above it.
+    // interleaved (f32) — mask fp4 + q4 above it. Always Exact: this
+    // path reads f32 interleaved data directly, regardless of what
+    // other storage variants the vindex carries.
     if index.has_interleaved() {
         out.push(PathSpec {
             name: "interleaved",
@@ -461,10 +513,12 @@ fn enumerate_paths(index: &VectorIndex) -> Vec<PathSpec> {
                 ..PathMask::default()
             },
             sparse_k: None,
+            bound: BOUND_EXACT,
         });
     }
 
-    // full_mmap — mask everything above it.
+    // full_mmap — mask everything above it. Always Exact: walks f32
+    // mmap'd gate/up/down.
     if index.has_full_mmap_ffn() {
         out.push(PathSpec {
             name: "full_mmap",
@@ -475,10 +529,12 @@ fn enumerate_paths(index: &VectorIndex) -> Vec<PathSpec> {
                 ..PathMask::default()
             },
             sparse_k: None,
+            bound: BOUND_EXACT,
         });
     }
 
-    // interleaved_q4k:dequant — mask everything above it.
+    // interleaved_q4k:dequant — mask everything above it. Always
+    // Quantized: dequants Q4K bytes per layer.
     if index.has_interleaved_q4k() {
         out.push(PathSpec {
             name: "interleaved_q4k",
@@ -490,10 +546,13 @@ fn enumerate_paths(index: &VectorIndex) -> Vec<PathSpec> {
                 ..PathMask::default()
             },
             sparse_k: None,
+            bound: BOUND_QUANTIZED,
         });
     }
 
     // exact — mask everything above it. Needs has_down_features=true.
+    // Always Exact: gate/up from safetensors (f32), down from features
+    // (f32).
     if index.has_down_features() {
         out.push(PathSpec {
             name: "exact",
@@ -506,6 +565,7 @@ fn enumerate_paths(index: &VectorIndex) -> Vec<PathSpec> {
                 ..PathMask::default()
             },
             sparse_k: None,
+            bound: BOUND_EXACT,
         });
     }
 
@@ -1112,7 +1172,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut runs: Vec<PathRun> = Vec::with_capacity(paths.len());
     for spec in &paths {
         let t0 = Instant::now();
-        let bound = bound_for(spec.name);
+        let bound = spec.bound;
 
         let mut per_layer: Vec<Option<LayerSummary>> = (0..num_layers).map(|_| None).collect();
         let mut dispatch_counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -1224,7 +1284,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // Verdict: cos ≥ bound.min_cos, rel_L2 ≤ bound.rel_l2, all prompts
-        // top-1 match, Paris prob delta ≤ PARIS_PROB_BUDGET. Multiple
+        // top-1 match, Paris prob delta ≤ bound.paris_prob_budget. Multiple
         // failures collected together so the first run gives a complete
         // picture instead of failing fast and hiding the rest.
         let mut fail_reasons: Vec<String> = Vec::new();
@@ -1253,10 +1313,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if let Some(p) = per_prompt.get(PARIS_KEY) {
-            if p.prob_delta > PARIS_PROB_BUDGET {
+            if p.prob_delta > bound.paris_prob_budget {
                 fail_reasons.push(format!(
                     "Paris prob delta {:.3e} exceeds {:.0e}",
-                    p.prob_delta, PARIS_PROB_BUDGET
+                    p.prob_delta, bound.paris_prob_budget
                 ));
             }
         }

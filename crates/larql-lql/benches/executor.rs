@@ -102,6 +102,8 @@ fn make_bench_vindex_dir(tag: &str) -> PathBuf {
         down_top_k: 1,
         has_model_weights: false,
         model_config: None,
+        fp4: None,
+        ffn_layout: None,
     };
     index.save_vindex(&dir, &mut config).unwrap();
 

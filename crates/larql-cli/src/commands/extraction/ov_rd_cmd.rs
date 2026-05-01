@@ -270,6 +270,11 @@ struct OraclePqArgs {
     #[arg(long)]
     address_probes: bool,
 
+    /// Add a mixed simple-key address probe that picks the best discrete key
+    /// independently for each PQ group on the training split.
+    #[arg(long)]
+    address_mixed_key_probe: bool,
+
     /// Evaluate how sensitive Mode D is to address corruption.
     ///
     /// This keeps a prefix of oracle PQ groups and replaces the rest with
@@ -278,6 +283,11 @@ struct OraclePqArgs {
     /// can pass the KL gate.
     #[arg(long)]
     address_corruption_sweep: bool,
+
+    /// Evaluate one-group-at-a-time address importance by replacing each group
+    /// with its train-set majority code while all other groups remain oracle.
+    #[arg(long)]
+    address_group_importance: bool,
 
     /// Limit prompts for bounded oracle runs.
     #[arg(long)]
@@ -766,7 +776,9 @@ struct OraclePqReport {
     pq_iters: usize,
     mode_d_check: bool,
     address_probes: bool,
+    address_mixed_key_probe: bool,
     address_corruption_sweep: bool,
+    address_group_importance: bool,
     selected_heads: Vec<HeadId>,
     heads: Vec<OraclePqHeadReport>,
 }
@@ -818,6 +830,8 @@ struct OraclePqPointReport {
     address_probes: Vec<AddressProbeReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     address_corruption_sweep: Vec<AddressCorruptionReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    address_group_importance: Vec<AddressGroupImportanceReport>,
     mean_pre_wo_l2: f64,
     mean_wo_visible_l2: f64,
     per_prompt: Vec<OraclePqPromptReport>,
@@ -826,6 +840,8 @@ struct OraclePqPointReport {
 #[derive(Debug, Serialize)]
 struct AddressProbeReport {
     name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    selected_group_keys: Vec<String>,
     prompts: usize,
     positions: usize,
     group_accuracy: f64,
@@ -857,6 +873,21 @@ struct AddressProbePromptReport {
 struct AddressCorruptionReport {
     label: String,
     oracle_groups_kept: usize,
+    prompts: usize,
+    positions: usize,
+    group_accuracy: f64,
+    exact_address_accuracy: f64,
+    mean_kl: f64,
+    p95_kl: f64,
+    max_kl: f64,
+    top1_agreement: f64,
+    top5_contains_baseline_top1: f64,
+    worst_examples: Vec<AddressProbePromptReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct AddressGroupImportanceReport {
+    replaced_group: usize,
     prompts: usize,
     positions: usize,
     group_accuracy: f64,
@@ -905,6 +936,7 @@ struct OraclePqPointAccumulator {
     prompts: Vec<OraclePqPromptReport>,
     address_probe_accumulators: HashMap<String, AddressProbeAccumulator>,
     address_corruption_accumulators: HashMap<usize, AddressProbeAccumulator>,
+    address_group_importance_accumulators: HashMap<usize, AddressProbeAccumulator>,
 }
 
 impl OraclePqPointAccumulator {
@@ -913,6 +945,7 @@ impl OraclePqPointAccumulator {
             prompts: Vec::new(),
             address_probe_accumulators: HashMap::new(),
             address_corruption_accumulators: HashMap::new(),
+            address_group_importance_accumulators: HashMap::new(),
         }
     }
 
@@ -920,10 +953,15 @@ impl OraclePqPointAccumulator {
         self.prompts.push(prompt);
     }
 
-    fn add_address_probe(&mut self, name: &str, prompt: AddressProbePromptReport) {
+    fn add_address_probe(
+        &mut self,
+        name: &str,
+        selected_group_keys: &[String],
+        prompt: AddressProbePromptReport,
+    ) {
         self.address_probe_accumulators
             .entry(name.to_string())
-            .or_insert_with(|| AddressProbeAccumulator::new(name))
+            .or_insert_with(|| AddressProbeAccumulator::new_with_keys(name, selected_group_keys))
             .add(prompt);
     }
 
@@ -936,6 +974,19 @@ impl OraclePqPointAccumulator {
             .entry(oracle_groups_kept)
             .or_insert_with(|| {
                 AddressProbeAccumulator::new(&format!("oracle_groups_kept_{oracle_groups_kept}"))
+            })
+            .add(prompt);
+    }
+
+    fn add_address_group_importance(
+        &mut self,
+        replaced_group: usize,
+        prompt: AddressProbePromptReport,
+    ) {
+        self.address_group_importance_accumulators
+            .entry(replaced_group)
+            .or_insert_with(|| {
+                AddressProbeAccumulator::new(&format!("replaced_group_{replaced_group}"))
             })
             .add(prompt);
     }
@@ -1045,6 +1096,11 @@ impl OraclePqPointAccumulator {
                 .into_iter()
                 .map(|(oracle_groups_kept, acc)| acc.finish_corruption(oracle_groups_kept))
                 .collect(),
+            address_group_importance: self
+                .address_group_importance_accumulators
+                .into_iter()
+                .map(|(replaced_group, acc)| acc.finish_group_importance(replaced_group))
+                .collect(),
             mean_pre_wo_l2: mean(&self.prompts.iter().map(|p| p.pre_wo_l2).collect::<Vec<_>>()),
             mean_wo_visible_l2: mean(
                 &self
@@ -1061,13 +1117,19 @@ impl OraclePqPointAccumulator {
 #[derive(Debug)]
 struct AddressProbeAccumulator {
     name: String,
+    selected_group_keys: Vec<String>,
     prompts: Vec<AddressProbePromptReport>,
 }
 
 impl AddressProbeAccumulator {
     fn new(name: &str) -> Self {
+        Self::new_with_keys(name, &[])
+    }
+
+    fn new_with_keys(name: &str, selected_group_keys: &[String]) -> Self {
         Self {
             name: name.to_string(),
+            selected_group_keys: selected_group_keys.to_vec(),
             prompts: Vec::new(),
         }
     }
@@ -1090,6 +1152,7 @@ impl AddressProbeAccumulator {
             .sort_by(|a, b| b.kl.partial_cmp(&a.kl).unwrap_or(std::cmp::Ordering::Equal));
         AddressProbeReport {
             name: self.name,
+            selected_group_keys: self.selected_group_keys,
             prompts: self.prompts.len(),
             positions,
             group_accuracy: correct_groups as f64 / total_groups as f64,
@@ -1130,6 +1193,37 @@ impl AddressProbeAccumulator {
         AddressCorruptionReport {
             label: self.name,
             oracle_groups_kept,
+            prompts: self.prompts.len(),
+            positions,
+            group_accuracy: correct_groups as f64 / total_groups as f64,
+            exact_address_accuracy: bool_rate(self.prompts.iter().map(|p| p.exact_address_match)),
+            mean_kl: mean(&kls),
+            p95_kl: percentile(kls.clone(), 0.95),
+            max_kl: kls.iter().copied().fold(0.0, f64::max),
+            top1_agreement: bool_rate(self.prompts.iter().map(|p| p.top1_agree)),
+            top5_contains_baseline_top1: bool_rate(
+                self.prompts
+                    .iter()
+                    .map(|p| p.baseline_top1_in_predicted_top5),
+            ),
+            worst_examples: self.prompts.into_iter().take(8).collect(),
+        }
+    }
+
+    fn finish_group_importance(mut self, replaced_group: usize) -> AddressGroupImportanceReport {
+        let kls = self.prompts.iter().map(|p| p.kl).collect::<Vec<_>>();
+        let positions = self.prompts.iter().map(|p| p.positions).sum::<usize>();
+        let total_groups = self
+            .prompts
+            .iter()
+            .map(|p| p.groups_total)
+            .sum::<usize>()
+            .max(1);
+        let correct_groups = self.prompts.iter().map(|p| p.groups_correct).sum::<usize>();
+        self.prompts
+            .sort_by(|a, b| b.kl.partial_cmp(&a.kl).unwrap_or(std::cmp::Ordering::Equal));
+        AddressGroupImportanceReport {
+            replaced_group,
             prompts: self.prompts.len(),
             positions,
             group_accuracy: correct_groups as f64 / total_groups as f64,
@@ -2489,9 +2583,12 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         HashMap::new()
     };
-    let address_probe_models = if args.address_probes {
+    let run_address_probes = args.address_probes || args.address_mixed_key_probe;
+    let address_probe_models = if run_address_probes {
         if !args.mode_d_check {
-            return Err("--address-probes requires --mode-d-check".into());
+            return Err(
+                "--address-probes/--address-mixed-key-probe requires --mode-d-check".into(),
+            );
         }
         eprintln!("Fitting graph-native address probes");
         fit_address_probe_models(
@@ -2504,6 +2601,7 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
             &means,
             &pca_bases,
             &codebooks,
+            args.address_mixed_key_probe,
         )?
     } else {
         HashMap::new()
@@ -2511,8 +2609,11 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.address_corruption_sweep && !args.mode_d_check {
         return Err("--address-corruption-sweep requires --mode-d-check".into());
     }
-    let majority_codes = if args.address_corruption_sweep {
-        eprintln!("Fitting per-group majority codes for address corruption sweep");
+    if args.address_group_importance && !args.mode_d_check {
+        return Err("--address-group-importance requires --mode-d-check".into());
+    }
+    let majority_codes = if args.address_corruption_sweep || args.address_group_importance {
+        eprintln!("Fitting per-group majority codes for address diagnostics");
         fit_majority_codes_for_codebooks(
             &mut weights,
             &index,
@@ -2641,7 +2742,7 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
                     (None, None, None, None, None)
                 };
 
-                if args.address_probes {
+                if run_address_probes {
                     let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
                         format!(
                             "missing Mode D table for address probes L{} H{} {:?}",
@@ -2680,6 +2781,74 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
                             .expect("oracle PQ accumulator missing")
                             .add_address_probe(
                                 &probe_model.name,
+                                &probe_model.selected_group_keys,
+                                AddressProbePromptReport {
+                                    id: label.to_string(),
+                                    stratum: stratum.to_string(),
+                                    kl: kl_logp(&baseline_logp, &predicted_logp),
+                                    positions: oracle_codes_by_position.len(),
+                                    groups_correct: address_match.groups_correct,
+                                    groups_total: address_match.groups_total,
+                                    exact_address_match: address_match.exact_address_match,
+                                    top1_agree: baseline_top1 == predicted_top1,
+                                    baseline_top1_in_predicted_top5: predicted_top5
+                                        .contains(&baseline_top1),
+                                },
+                            );
+                    }
+                }
+
+                if args.address_group_importance {
+                    let mode_d_table = mode_d_tables.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing Mode D table for address group importance L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    let group_majority = majority_codes.get(&(*head, config)).ok_or_else(|| {
+                        format!(
+                            "missing majority codes for address group importance L{} H{} {:?}",
+                            head.layer, head.head, config
+                        )
+                    })?;
+                    for replaced_group in 0..config.groups {
+                        let predicted_codes_by_position = oracle_codes_by_position
+                            .iter()
+                            .map(|codes| {
+                                codes
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(group, &code)| {
+                                        if group == replaced_group {
+                                            group_majority[group]
+                                        } else {
+                                            code
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>();
+                        let address_match = address_match_report(
+                            &oracle_codes_by_position,
+                            &predicted_codes_by_position,
+                        );
+                        let predicted_hidden = forward_q4k_predicted_address_mode_d_head(
+                            &mut weights,
+                            &token_ids,
+                            &index,
+                            *head,
+                            mode_d_table,
+                            &predicted_codes_by_position,
+                        )?;
+                        let predicted_logits = final_logits(&weights, &predicted_hidden);
+                        let predicted_logp = log_softmax(&predicted_logits);
+                        let predicted_top1 = argmax(&predicted_logits);
+                        let predicted_top5 = top_k_indices(&predicted_logits, 5);
+                        accumulators
+                            .get_mut(&(*head, config))
+                            .expect("oracle PQ accumulator missing")
+                            .add_address_group_importance(
+                                replaced_group,
                                 AddressProbePromptReport {
                                     id: label.to_string(),
                                     stratum: stratum.to_string(),
@@ -2839,7 +3008,9 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
         pq_iters: args.pq_iters,
         mode_d_check: args.mode_d_check,
         address_probes: args.address_probes,
+        address_mixed_key_probe: args.address_mixed_key_probe,
         address_corruption_sweep: args.address_corruption_sweep,
+        address_group_importance: args.address_group_importance,
         selected_heads,
         heads: head_reports,
     };
@@ -3685,6 +3856,8 @@ struct AddressProbeModel {
     name: String,
     group_majority: Vec<usize>,
     group_maps: Vec<HashMap<String, usize>>,
+    group_train_accuracy: Vec<f64>,
+    selected_group_keys: Vec<String>,
 }
 
 impl AddressProbeModel {
@@ -4034,6 +4207,7 @@ fn fit_address_probe_models(
     means: &HashMap<HeadId, StaticHeadMeans>,
     pca_bases: &HashMap<HeadId, ZPcaBasis>,
     codebooks: &HashMap<(HeadId, PqConfig), PqCodebook>,
+    include_mixed_key_probe: bool,
 ) -> Result<HashMap<(HeadId, PqConfig), Vec<AddressProbeModel>>, Box<dyn std::error::Error>> {
     let names = address_probe_names();
     let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
@@ -4139,6 +4313,7 @@ fn fit_address_probe_models(
         for name in &names {
             let mut group_majority = Vec::with_capacity(config.groups);
             let mut group_maps = Vec::with_capacity(config.groups);
+            let mut group_train_accuracy = Vec::with_capacity(config.groups);
             for group in 0..config.groups {
                 let majority = majority_counts
                     .get(&(*head, *config, group))
@@ -4146,6 +4321,8 @@ fn fit_address_probe_models(
                     .unwrap_or(0);
                 group_majority.push(majority);
                 let mut map = HashMap::new();
+                let mut correct = 0usize;
+                let mut total = 0usize;
                 for ((map_head, map_config, map_name, map_group, key), counts) in key_counts.iter()
                 {
                     if map_head == head
@@ -4153,15 +4330,55 @@ fn fit_address_probe_models(
                         && map_name == name
                         && *map_group == group
                     {
-                        map.insert(key.clone(), argmax_usize(counts));
+                        let best = argmax_usize(counts);
+                        correct += counts[best];
+                        total += counts.iter().sum::<usize>();
+                        map.insert(key.clone(), best);
                     }
                 }
                 group_maps.push(map);
+                group_train_accuracy.push(if total == 0 {
+                    0.0
+                } else {
+                    correct as f64 / total as f64
+                });
             }
             probe_models.push(AddressProbeModel {
                 name: (*name).to_string(),
                 group_majority,
                 group_maps,
+                group_train_accuracy,
+                selected_group_keys: Vec::new(),
+            });
+        }
+        if include_mixed_key_probe && !probe_models.is_empty() {
+            let mut group_majority = Vec::with_capacity(config.groups);
+            let mut group_maps = Vec::with_capacity(config.groups);
+            let mut group_train_accuracy = Vec::with_capacity(config.groups);
+            let mut selected_group_keys = Vec::with_capacity(config.groups);
+            for group in 0..config.groups {
+                let best_idx = probe_models
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| {
+                        a.group_train_accuracy[group]
+                            .partial_cmp(&b.group_train_accuracy[group])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0);
+                let best = &probe_models[best_idx];
+                group_majority.push(best.group_majority[group]);
+                group_maps.push(best.group_maps[group].clone());
+                group_train_accuracy.push(best.group_train_accuracy[group]);
+                selected_group_keys.push(best.name.clone());
+            }
+            probe_models.push(AddressProbeModel {
+                name: "mixed_best_simple_key".to_string(),
+                group_majority,
+                group_maps,
+                group_train_accuracy,
+                selected_group_keys,
             });
         }
         models.insert((*head, *config), probe_models);

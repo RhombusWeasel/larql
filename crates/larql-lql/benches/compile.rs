@@ -88,6 +88,8 @@ fn make_compile_bench_vindex(tag: &str, with_down_weights: bool) -> PathBuf {
         down_top_k: 1,
         has_model_weights: with_down_weights,
         model_config: None,
+        fp4: None,
+        ffn_layout: None,
     };
     index.save_vindex(&dir, &mut config).unwrap();
 

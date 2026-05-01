@@ -25,6 +25,26 @@ pub struct WalkTrace {
     pub layers: Vec<(usize, Vec<WalkHit>)>,
 }
 
+/// Storage class for the index's primary FFN payload.
+///
+/// Walk-path equivalence audits and downstream tooling use this to bucket
+/// paths by the precision of the data they walk against, without having
+/// to re-derive the right grouping from the `has_*` flags. New storage
+/// formats should update [`GateIndex::primary_storage_bucket`]'s default
+/// impl so consumers automatically pick up the right bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageBucket {
+    /// f32 / f16 features. Walk paths land within float-noise of the
+    /// dense matmul reference (cos ≥ 0.99999 territory on f16 vindexes).
+    Exact,
+    /// Q4_0 / Q4_K / Q6_K interleaved or dequant. Walk paths carry
+    /// per-block dequant noise (cos ≥ 0.99 territory).
+    Quantized,
+    /// FP4 / FP8 storage. Walk paths carry per-block FP4 dequant noise
+    /// (cos ≥ 0.98 territory).
+    Fp4,
+}
+
 /// Trait for gate-based feature lookup.
 ///
 /// Both `VectorIndex` (base, readonly) and `PatchedVindex` (with overlay)
@@ -518,6 +538,36 @@ pub trait GateIndex: Send + Sync {
             }
         }
         all.into_iter().collect()
+    }
+
+    /// Bucket the index's primary FFN storage falls into. Encapsulates the
+    /// `has_*`-flag logic so audits and tooling (e.g. `walk_path_audit`)
+    /// don't scatter flag-checks across their bucketing logic.
+    ///
+    /// Priority mirrors `ffn_row_dot`'s dispatch chain (FP4 first, then
+    /// native f32, then Q4K), so the bucket reflects what data the
+    /// unified row dispatch will *actually* walk on a mixed-format vindex
+    /// — not just which flags happen to be set.
+    ///
+    /// New storage formats should update this default impl so downstream
+    /// consumers automatically pick up the right bucket. Override only
+    /// when an implementer wants to pin the bucket explicitly (rare).
+    fn primary_storage_bucket(&self) -> StorageBucket {
+        if self.has_fp4_storage() {
+            StorageBucket::Fp4
+        } else if self.has_interleaved()
+            || self.has_full_mmap_ffn()
+            || self.has_down_features()
+        {
+            // Native f32 mmap available; ffn_row_* dispatch prefers it
+            // over Q4K, so sparse on a mixed (f32 + Q4K) vindex walks
+            // f32 features and lands in the Exact bucket.
+            StorageBucket::Exact
+        } else if self.has_interleaved_q4k() || self.has_interleaved_q4() {
+            StorageBucket::Quantized
+        } else {
+            StorageBucket::Exact
+        }
     }
 }
 
