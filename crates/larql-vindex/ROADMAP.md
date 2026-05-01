@@ -231,6 +231,113 @@ all 34 layers; layer-level resume would skip 30
 truncation to the last clean layer boundary, which is more delicate
 than the phase flag.
 
+### Round-4 cleanup audit (2026-05-01) — magic strings, magic numbers, modularity
+
+**Status**: Findings landed 2026-05-01; nothing shipped yet. Tracks
+the same cadence as the round-1/2/3 cleanups (see Completed). Each
+sub-item is independently shippable; M1 is the highest-value pick
+because it matches the audit pattern that already ran once.
+
+#### M1. Two filenames bypass `format::filenames` ⚠ active
+**Impact**: Same class of bug `format::filenames` was created to
+prevent — a typo silently triggers a fallback codepath
+(file "doesn't exist") and bugs go undiagnosed.
+**Effort**: 30 min
+**Sites**: `up_weights.bin` / `down_weights.bin` literals in
+- `quant/convert_q4k.rs:174-175,239-240`
+- `format/checksums.rs:38-39`
+- `format/weights/write_f32.rs:365,369,387,401,416,431,445`
+- `format/huggingface/mod.rs:40-41`
+
+Add `UP_WEIGHTS_BIN` / `DOWN_WEIGHTS_BIN` to `format/filenames.rs`
+and route the literals through them. Round-2 added 8 missed constants
+the same way; this completes the sweep.
+
+#### M2. `"Q4_K"` / `"Q6_K"` tag strings duplicated outside the registry
+**Impact**: A typo in `attn.rs` would mismatch
+`quant::registry::lookup` without a compile error.
+**Effort**: 15 min
+**Sites**: `index/storage/attn.rs:267,291,322,347,354,376` builds
+`serde_json::json!` manifests with raw `"Q4_K"` / `"Q6_K"` strings.
+`QuantBlockFormat::format_tag()` already returns these — switch
+the manifest construction to call it.
+
+#### M3. Default `c_score` / confidence fallback scattered
+**Impact**: A future tune of the default would have to touch four
+independent sites; today they can drift apart silently.
+**Effort**: 15 min
+**Sites**: `0.95` / `0.9` literals at
+- `describe.rs:80`
+- `vindexfile/mod.rs:122`
+- `patch/overlay.rs:499`
+- `patch/overlay_apply.rs:71` (the `confidence.unwrap_or(0.9)` left
+  in place during the lossy-patch fix on 2026-05-01)
+
+Lift to a single `DEFAULT_C_SCORE` constant.
+
+#### M4. K-quant block size 256 hardcoded locally
+**Impact**: `larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS = 256`
+already exists and is referenced once at `format/load.rs:336`. Five
+other sites duplicate the literal.
+**Effort**: 30 min
+**Sites**:
+- `quant/registry.rs:109,117` (`block_elements: 256`)
+- `config/quantization.rs:114`
+- `format/weights/write_q4k/mod.rs:49,74` (`pad_to_256` /
+  `pad_rows_to_256` — the 256 is in the function name)
+
+Either route through `K_QUANT_BLOCK_ELEMS` or define a local
+re-export. The pad helpers should generalise to `pad_to(_, n)` and
+take the constant.
+
+#### M5. `144` / `148` Q4_K block-byte stride documented as anonymous numbers
+**Impact**: The 148-byte legacy stride is the historical bug shape;
+`registry.rs:228-231` documents the comparison with a comment but
+both numbers are anonymous. A `LEGACY_BLOCK_Q4_K_STRIDE = 148`
+constant would make the test self-documenting.
+**Effort**: 15 min
+
+#### M6. `index/compute/gate_knn.rs` is the largest non-test file
+**Impact**: 962 non-test lines, ~25 methods on a single
+`impl VectorIndex` block, mixing four concerns. Hurts navigability
+and grep-ability.
+**Effort**: Medium (half-day)
+**Status**: Not started — split along these axes:
+- `gate_knn/dispatch.rs` — `gate_knn`, `gate_knn_expert`,
+  `gate_knn_adaptive`, `gate_knn_q4`, `walk`
+- `gate_knn/hnsw_lifecycle.rs` — `enable_hnsw` / `disable_hnsw` /
+  `build_hnsw_*` / `warmup_hnsw_*` / `install_hnsw_layer` /
+  `get_or_build_hnsw*`
+- `gate_knn/scores_batch.rs` — `gate_scores_batch*`,
+  `gate_scores_2d_*`
+
+Sibling pattern matches what `index/storage/ffn_store/` already does
+(`fp4.rs`, `q4k_cache.rs` declared at the bottom of `mod.rs`).
+
+#### M7. `index/storage/ffn_store/mod.rs` is 740 non-test lines
+**Impact**: ~30 methods covering load + accessors for `down_features`,
+`up_features`, and three interleaved variants (f32 / Q4_0 / Q4_K).
+Same shape as M6 but with the sibling pattern already half-done
+(`fp4.rs`, `q4k_cache.rs` already split out).
+**Effort**: Medium (half-day)
+**Status**: Not started — finish the split: `down.rs`, `up.rs`,
+`interleaved.rs`, `interleaved_q4.rs`, `interleaved_q4k.rs`. `mod.rs`
+keeps the `FfnStore` struct, the manifest helper, and the new
+`ffn_layer_byte_offset` shared helper added 2026-05-01.
+
+#### M8. `extract/build.rs` 808 non-test lines after partial extraction
+**Impact**: `build_helpers.rs` / `streaming.rs` / `build_from_vectors.rs`
+already split out (round-1 cleanup); the `BuildContext` 6-stage
+pipeline could finish the job (one file per stage).
+**Effort**: Medium
+**Status**: Second-pass cleanup — not urgent.
+
+#### M9. `index/storage/lm_head.rs` 521 non-test / 482 test lines
+**Impact**: Less urgent than M6/M7 because half the file is test
+code, which would naturally co-locate with each split file.
+**Effort**: Small
+**Status**: Lowest priority of the modularity items.
+
 ## P2: Forward-looking
 
 ### Parallelize gate KNN for batch inference ✅ shipped 2026-04-25

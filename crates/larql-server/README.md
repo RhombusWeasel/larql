@@ -6,7 +6,7 @@ and serves it over the network. No GPU, no ML framework, no Python. One
 binary.
 
 ```bash
-larql-server output/gemma3-4b.vindex --port 8080
+larql-server output/gemma3-4b-v2.vindex --port 8080
 # Serving google/gemma-3-4b-it (348K features, 1967 probe-confirmed)
 # Listening: http://0.0.0.0:8080
 ```
@@ -56,7 +56,7 @@ larql serve "hf://chrishayuk/gemma-3-4b-it-vindex" --port 8080
 larql serve --dir ./vindexes/ --port 8080
 
 # With auth + TLS
-larql serve output/gemma3-4b.vindex --api-key "sk-abc123" --tls-cert cert.pem --tls-key key.pem
+larql serve output/gemma3-4b-v2.vindex --api-key "sk-abc123" --tls-cert cert.pem --tls-key key.pem
 ```
 
 ## CLI Options
@@ -145,7 +145,8 @@ cargo run -p larql-server --example server_demo
 cargo run -p larql-server --example embed_demo
 ```
 
-Synthetic release benchmark, current local run on 2026-04-26:
+Synthetic release benchmark, captured 2026-04-26 (re-validated
+2026-05-01 — within noise):
 
 ```bash
 cargo run -p larql-server --example server_bench --release
@@ -201,9 +202,11 @@ Reference numbers on M3 Max (single in-process shard, layer 15, top-K=8;
 | TCP HTTP + f16 | 1.05 ms | 29.6 ms (f16 conv CPU dominates on loopback) |
 | UDS + f16 | 0.71 ms | 21.7 ms |
 
-Reference numbers on M3 Max with the per-layer Q4_K layout
-(`forward_moe` warm 1.91 ms, 30-layer sweep 56 ms, steady RSS 9.7 GB)
-are in `ROADMAP.md` → "Live perf snapshot → Remote MoE expert path".
+Full perf snapshot (per-layer breakdown, RSS, vindex load time, etc.)
+is in `ROADMAP.md` → "Live perf snapshot → Remote MoE expert path".
+The numbers above are the 2026-05-01 baseline; the ROADMAP also tracks
+the historical progression (4.86 ms → 1.91 ms → 0.80 ms `forward_moe`
+warm across the 2026-04-26 + 2026-05-01 sessions).
 
 ## Recommended setups
 
@@ -279,22 +282,33 @@ Per-shard URL scheme decides transport:
 | `POST /v1/experts/layer-batch-f16` | `application/x-larql-experts-layer-f16` | Same shape with f16 residual + response. Halves wire bytes; opt-in with `LARQL_MOE_WIRE_F16=1` for LAN deployments where bandwidth matters more than the 9 µs/call f32↔f16 conversion CPU. |
 | `POST /v1/expert/batch` (legacy) | `application/x-larql-expert` | Pre-2026-05-01 path: K (layer, expert_id, residual) items per call. Still served for back-compat. |
 
-#### Performance reference (M3 Max, single local gRPC shard, Gemma 4 26B-A4B)
+#### Performance reference (M3 Max, single local shard, Gemma 4 26B-A4B)
 
-| Path | Per-layer | tok/s | Notes |
-|---|---|---|---|
-| In-process `cpu_moe_forward` floor | 0.39 ms | (compute floor only — no client) | What the server's expert dispatch achieves with no HTTP cost |
-| HTTP unary (legacy `/v1/expert/batch`) | 0.85 ms | 17.7 | TCP/HTTP, K residual copies on the wire |
-| gRPC unary | 0.83 ms | 17.7 | Persistent HTTP/2; ties HTTP at this scale |
-| **gRPC + SPLIT (overlap, default)** | 0.83 ms | **19.7** | Dense FFN GPU work overlaps with MoE RPC. ~12% over unary. |
-| UDS + HTTP/1.1 | ~0.70 ms | 18.2 | ~150 µs/call faster than TCP loopback HTTP |
+End-to-end `larql run` decode tok/s, 100-token poem, 3-run average.
+Each row uses the indicated transport for `--moe-shards`. Wire format
+is f32 unless noted; SPLIT (overlap with dense FFN GPU compute) is
+default-on for `grpc://` shards.
 
-End-to-end ~19.7 tok/s = 64 ms/tok, of which ~23 ms is MoE (across all 30
-layers) and ~41 ms is attention + dense FFN + lm_head + sampling on the
-client side.
+| Transport | Wire | tok/s |
+|---|---|---|
+| `http://` (TCP HTTP, layer-batch endpoint) | f32 | **17.8** |
+| `grpc://` + `LARQL_MOE_NO_SPLIT=1` (unary) | f32 | 17.7 |
+| **`grpc://` + SPLIT overlap (default)** | f32 | **19.7** |
+| `unix:///path/to/sock` (UDS HTTP/1.1) | f32 | 18.2 |
+
+End-to-end ~19.7 tok/s = ~64 ms/tok, of which ~23 ms is MoE (30 layers
+× ~0.8 ms/layer) and ~41 ms is attention + dense FFN + lm_head +
+sampling on the client side.
+
+For per-call latency breakdowns of each transport / wire combination,
+see the `bench_expert_server` table in **Examples and Benchmarks**
+above (those are micro-benchmark numbers — synthetic input, no decode
+loop). The two reference tables agree within run-to-run noise.
 
 For multi-host topologies (LAN-class RTT ≥ 100 µs), see
-`ROADMAP.md → F-FLY` for the planned fly.io validation.
+`ROADMAP.md → F-FLY` for the planned fly.io validation. The TCP
+HTTP / UDS / f16-wire choices behave very differently on real
+networks vs loopback.
 
 ### Per-layer FFN format
 
@@ -402,7 +416,7 @@ List top tokens across knowledge layers.
 #### GET /v1/stats
 
 Model and index statistics, plus live W2 / Q4K cache state for
-operator verification (see ROADMAP / ADR-009).
+operator verification (see ROADMAP for the W2 retrofit story).
 
 ```json
 {
@@ -635,7 +649,7 @@ Enabled on every server (including `--ffn-only` and default mode). The primary u
 
 ```bash
 # Start an embed-only server
-larql-server output/gemma3-4b.vindex --embed-only --port 8082
+larql-server output/gemma3-4b-v2.vindex --embed-only --port 8082
 
 # Serving google/gemma-3-4b-it — mode: embed-service
 # Loaded: embeddings (1.3 GB), lm_head (tied), tokenizer
@@ -727,7 +741,7 @@ The tokenizer alone takes ~244 MB for the Gemma 262K-vocab BPE model.
 All endpoints are available over gRPC using Protocol Buffers. Enable with `--grpc-port`:
 
 ```bash
-larql serve output/gemma3-4b.vindex --port 8080 --grpc-port 50051
+larql serve output/gemma3-4b-v2.vindex --port 8080 --grpc-port 50051
 ```
 
 Proto definition: `proto/vindex.proto`. Services: `Describe`, `Walk`, `Select`, `Infer`, `GetRelations`, `GetStats`, `WalkFfn`, `Health`, `StreamDescribe` (server-streaming).
@@ -779,7 +793,7 @@ Always accessible (exempt from API key auth).
 When `--api-key` is set, all endpoints (except `/v1/health`) require a Bearer token:
 
 ```bash
-larql serve output/gemma3-4b.vindex --api-key "sk-abc123"
+larql serve output/gemma3-4b-v2.vindex --api-key "sk-abc123"
 ```
 
 ```bash
@@ -793,7 +807,7 @@ Requests without a valid token receive 401 Unauthorized.
 Per-IP token bucket rate limiting. Supports `N/sec`, `N/min`, `N/hour` formats. `/v1/health` is exempt.
 
 ```bash
-larql serve output/gemma3-4b.vindex --rate-limit "100/min"
+larql serve output/gemma3-4b-v2.vindex --rate-limit "100/min"
 ```
 
 Excess requests receive `429 Too Many Requests`. By default the limiter uses
@@ -806,7 +820,7 @@ used as the bucket key; the proxy must strip untrusted forwarding headers.
 Cache DESCRIBE responses in memory with a configurable TTL. Useful for popular entities queried repeatedly.
 
 ```bash
-larql serve output/gemma3-4b.vindex --cache-ttl 300  # 5 minute cache
+larql serve output/gemma3-4b-v2.vindex --cache-ttl 300  # 5 minute cache
 ```
 
 Cache keys include: model ID, entity, band, limit, min_score. Expired entries are evicted automatically.
