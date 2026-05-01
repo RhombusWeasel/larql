@@ -444,7 +444,8 @@ prior two fusions; kept opt-in for completeness.
 | + `LARQL_FUSED_QK_NORM_ROPE=1` | ~10.35 ms | -0.10 ms |
 | + `residual_norm_store` (always-on) | ~10.07 ms | -0.38 ms |
 | + `LARQL_FUSED_POST_ATTN_NORM=1` | ~10.02 ms | -0.43 ms |
-| + `LARQL_FUSED_POST_FFN_NORM=1` | **~9.67 ms** | **-0.78 ms** |
+| + `LARQL_FUSED_POST_FFN_NORM=1` | ~9.67 ms | -0.78 ms |
+| + `LARQL_FUSED_KV_APPEND_ATTEND=1` | **~9.46 ms** | **-0.99 ms** |
 
 **End-to-end tok/s** (Gemma 3 4B, 30 tokens, warm GPU):
 
@@ -455,15 +456,26 @@ prior two fusions; kept opt-in for completeness.
 | + 2 fusions stacked | 73 |
 | + 3 fusions stacked | 71-72 (in noise) |
 | + 4 fusions stacked (env-gated) | 74-75 |
-| **All 4 fusions default-on** (shipped 2026-05-01) | **72-74** |
+| All 4 fusions default-on (shipped 2026-05-01) | 72-74 |
+| **+ kv_append+attend fused** (shipped 2026-05-01) | **74-75** |
 | Ollama gemma3:4b | 96-104 |
 
-**Default-on shipped state** (no env vars needed): all four fusions
+**kv_append+attend fusion measurement** (Gemma 3 4B, warm GPU, n=2):
+- on:  GPU fwd 11.55 ms avg, 74.4 tok/s
+- off: GPU fwd 11.76 ms avg, 72.7 tok/s
+- delta: -0.21 ms GPU, +1.7 tok/s — matches expected dispatch saving
+  (one TG per Q-head, cooperative K/V row write at pos = T-1, then
+  `threadgroup_barrier(mem_device)`, then standard attention).
+  Multiple Q-head TGs sharing one kv_head redundantly write the same
+  row — idempotent, race-safe.
+
+**Default-on shipped state** (no env vars needed): all five fusions
 land their measured savings without flag friction. End-to-end
-~72-74 tok/s sustained, generates "Paris" correctly. Opt-out flags
+~74-75 tok/s sustained, generates "Paris" correctly. Opt-out flags
 still wired (`LARQL_FUSED_QK_NORM_ROPE=0`, `LARQL_FUSED_POST_ATTN_NORM=0`,
-`LARQL_FUSED_POST_FFN_NORM=0`) for diagnostic A/B if regressions
-ever surface. The fifth fusion (Q6_K geglu+down) remains broken
+`LARQL_FUSED_POST_FFN_NORM=0`, `LARQL_FUSED_KV_APPEND_ATTEND=0`)
+for diagnostic A/B if regressions ever surface. The Q6_K geglu+down
+fusion remains broken
 and dead-code — needs kernel-level parity test against
 `cpu/ops/q4_common::q6k_matvec` to localise the bug before re-engaging.
 
@@ -489,27 +501,25 @@ end-to-end → projects to **77-80 tok/s**. Smaller than the original
 3.5 ms gap but the only one of G-1..G-3' the corrected diagnosis
 actually supports.
 
-**Current per-layer dispatch count** (~10-11 dispatches × 34 layers):
+**Current per-layer dispatch count** (~9-10 dispatches × 34 layers):
 1. fused input_norm + QKV proj (1)
-2. QK_norm (1)
-3. RoPE batched Q+K (1)
-4. V_norm (Gemma 4 only) (0-1)
-5. KV append (1)
-6. KV attend (1)
-7. O proj (1)
-8. post_attn residual + ffn_norm (fused) (1)
-9. gate + up (fused) (1)
-10. GEGLU (1)
-11. down (1)
-12. post_ffn residual (1)
+2. fused QK_norm + RoPE (1, was 2)
+3. V_norm (Gemma 4 only) (0-1)
+4. fused KV append + attend (1, was 2 — shipped 2026-05-01)
+5. O proj (1)
+6. fused post_attn residual + ffn_norm + h_post_attn store (1, was 3)
+7. gate + up (fused) (1)
+8. GEGLU (1)
+9. down (1)
+10. fused post_ffn norm + residual (1, was 2)
 
-**Where to fuse** (in priority order, smallest scope first):
-- Fuse `QK_norm` + `RoPE` + `V_norm` into one batched kernel
-  (reads/writes Q,K,V buffers — no inter-dispatch round-trip).
-  Saves ~2 dispatches/layer × 34 = ~68 dispatches/tok.
-- Fuse `KV append` + `KV attend` (`kv_attend` already reads cache;
-  could append the new K/V row in the same kernel before attending).
-  Saves 1 dispatch/layer × 34 = 34/tok.
+**Where to fuse next** (in priority order, smallest scope first):
+- ~~Fuse `QK_norm` + `RoPE`~~ — shipped 2026-05-01, saves 1 dispatch/layer.
+- ~~Fuse `KV append` + `KV attend`~~ — shipped 2026-05-01, saves 1
+  dispatch/layer × 34 = 34/tok, measured -0.21 ms.
+- Fold `V_norm` (Gemma 4 only) into `qk_norm_rope_fused` so all three
+  per-head normalisations are one dispatch. Saves 1 dispatch/layer
+  × 34 = 34/tok on Gemma 4 only.
 - Fuse `GEGLU` + `down`: existing `q4k_geglu_silu_down` /
   `q4k_geglu_gelu_tanh_down` kernels exist but are disabled
   (`encode_ffn.rs::use_fused = false` per a NaN finding on certain
@@ -519,6 +529,11 @@ actually supports.
   go through the slow path; the gate is empty for them. **G-FFN-1**
   (separate sub-item): rebuild the fused-down kernel for f16 down
   to actually engage. Saves 1-2 dispatches/layer × 34 = 34-68/tok.
+- Fuse `O_proj` with `post_attn_residual_norm_store` — O_proj writes
+  attn_out into a buffer that `post_attn_residual_norm_store`
+  immediately reads. One TG per row could matvec then sum the
+  residual in registers before the RMS reduction. 1 dispatch/layer
+  × 34 = 34/tok.
 
 **Total savings if all three land**: ~140 dispatches × 7 µs ≈ 1 ms.
 Combined with no-loss retention of the v5 lm_head fix, **end-to-end

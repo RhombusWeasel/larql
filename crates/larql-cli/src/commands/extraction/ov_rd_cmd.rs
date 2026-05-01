@@ -320,6 +320,12 @@ struct OraclePqArgs {
     #[arg(long, default_value_t = 32)]
     address_lsh_seeds: usize,
 
+    /// Comma-separated PQ groups whose centroids are fit separately per
+    /// prompt stratum. This is a codebook-layout diagnostic for cases where a
+    /// single global PQ group carries a hard prose/structured tail.
+    #[arg(long, default_value = "")]
+    stratum_conditioned_pq_groups: String,
+
     /// Limit prompts for bounded oracle runs.
     #[arg(long)]
     max_prompts: Option<usize>,
@@ -816,6 +822,7 @@ struct OraclePqReport {
     address_lsh_groups: Vec<usize>,
     address_lsh_bits: usize,
     address_lsh_seeds: usize,
+    stratum_conditioned_pq_groups: Vec<usize>,
     selected_heads: Vec<HeadId>,
     heads: Vec<OraclePqHeadReport>,
 }
@@ -2601,6 +2608,20 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    let mut stratum_conditioned_pq_groups = parse_usize_list(&args.stratum_conditioned_pq_groups)?;
+    stratum_conditioned_pq_groups.sort_unstable();
+    stratum_conditioned_pq_groups.dedup();
+    for config in &configs {
+        for &group in &stratum_conditioned_pq_groups {
+            if group >= config.groups {
+                return Err(format!(
+                    "--stratum-conditioned-pq-groups includes group {group}, but config {:?} has only {} groups",
+                    config, config.groups
+                )
+                .into());
+            }
+        }
+    }
     let mut prompts = load_prompts(&args.prompts, args.max_prompts)?;
     if let Some(max_per_stratum) = args.max_per_stratum {
         prompts = limit_prompts_per_stratum(prompts, max_per_stratum);
@@ -2656,6 +2677,7 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
         &pca_bases,
         &configs,
         args.pq_iters,
+        &stratum_conditioned_pq_groups,
     )?;
     let mode_d_tables = if args.mode_d_check {
         eprintln!("Materializing Mode D residual-space tables");
@@ -2667,6 +2689,7 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
             &means,
             &pca_bases,
             &codebooks,
+            &stratum_conditioned_pq_groups,
         )?
     } else {
         HashMap::new()
@@ -2808,6 +2831,7 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
                     pca_basis,
                     head_means,
                     codebook,
+                    stratum,
                 )?;
                 let pq_logits = final_logits(&weights, &pq_hidden);
                 let pq_logp = log_softmax(&pq_logits);
@@ -2844,6 +2868,7 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
                         head_means,
                         codebook,
                         mode_d_table,
+                        stratum,
                     )?;
                     let mode_d_logits = final_logits(&weights, &mode_d_hidden);
                     let mode_d_logp = log_softmax(&mode_d_logits);
@@ -2892,6 +2917,7 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
                                 *head,
                                 mode_d_table,
                                 &predicted_codes_by_position,
+                                stratum,
                             )?;
                             let predicted_logits = final_logits(&weights, &predicted_hidden);
                             let predicted_logp = log_softmax(&predicted_logits);
@@ -2969,6 +2995,7 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
                                     *head,
                                     mode_d_table,
                                     &predicted_codes_by_position,
+                                    stratum,
                                 )?;
                                 let predicted_logits = final_logits(&weights, &predicted_hidden);
                                 let predicted_logp = log_softmax(&predicted_logits);
@@ -3039,6 +3066,7 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
                             *head,
                             mode_d_table,
                             &predicted_codes_by_position,
+                            stratum,
                         )?;
                         let predicted_logits = final_logits(&weights, &predicted_hidden);
                         let predicted_logp = log_softmax(&predicted_logits);
@@ -3120,6 +3148,7 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
                             *head,
                             mode_d_table,
                             &predicted_codes_by_position,
+                            stratum,
                         )?;
                         let predicted_logits = final_logits(&weights, &predicted_hidden);
                         let predicted_logp = log_softmax(&predicted_logits);
@@ -3189,6 +3218,7 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
                             *head,
                             mode_d_table,
                             &predicted_codes_by_position,
+                            stratum,
                         )?;
                         let predicted_logits = final_logits(&weights, &predicted_hidden);
                         let predicted_logp = log_softmax(&predicted_logits);
@@ -3307,6 +3337,7 @@ fn run_oracle_pq(args: OraclePqArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
         address_lsh_bits: args.address_lsh_bits,
         address_lsh_seeds: args.address_lsh_seeds,
+        stratum_conditioned_pq_groups,
         selected_heads,
         heads: head_reports,
     };
@@ -4096,30 +4127,49 @@ impl ZPcaBasis {
 struct PqCodebook {
     config: PqConfig,
     centroids: Vec<Vec<Vec<f64>>>,
+    stratum_centroids: HashMap<String, HashMap<usize, Vec<Vec<f64>>>>,
 }
 
 impl PqCodebook {
     fn quantize_indices(&self, coords: &[f64]) -> Vec<usize> {
+        self.quantize_indices_for_stratum(coords, "unknown")
+    }
+
+    fn quantize_indices_for_stratum(&self, coords: &[f64], stratum: &str) -> Vec<usize> {
         let group_dim = self.config.k / self.config.groups;
         (0..self.config.groups)
             .map(|group| {
                 let start = group * group_dim;
                 let end = start + group_dim;
-                nearest_centroid_index(&coords[start..end], &self.centroids[group])
+                nearest_centroid_index(
+                    &coords[start..end],
+                    self.centroids_for_group(stratum, group),
+                )
             })
             .collect()
     }
 
     fn quantize_from_indices(&self, indices: &[usize]) -> Vec<f64> {
+        self.quantize_from_indices_for_stratum(indices, "unknown")
+    }
+
+    fn quantize_from_indices_for_stratum(&self, indices: &[usize], stratum: &str) -> Vec<f64> {
         let group_dim = self.config.k / self.config.groups;
         let mut out = vec![0.0; self.config.k];
         for (group, &index) in indices.iter().take(self.config.groups).enumerate() {
             let start = group * group_dim;
             let end = start + group_dim;
-            let centroid = &self.centroids[group][index];
+            let centroid = &self.centroids_for_group(stratum, group)[index];
             out[start..end].copy_from_slice(centroid);
         }
         out
+    }
+
+    fn centroids_for_group(&self, stratum: &str, group: usize) -> &[Vec<f64>] {
+        self.stratum_centroids
+            .get(stratum)
+            .and_then(|groups| groups.get(&group))
+            .unwrap_or(&self.centroids[group])
     }
 }
 
@@ -4128,22 +4178,39 @@ struct ModeDTable {
     static_delta_by_position: Vec<Vec<f32>>,
     static_global_delta: Vec<f32>,
     group_tables: Vec<Vec<Vec<f32>>>,
+    stratum_group_tables: HashMap<String, HashMap<usize, Vec<Vec<f32>>>>,
 }
 
 impl ModeDTable {
     fn delta_for_position_codes(&self, position: usize, codes: &[usize]) -> Vec<f32> {
+        self.delta_for_position_codes_with_stratum(position, codes, "unknown")
+    }
+
+    fn delta_for_position_codes_with_stratum(
+        &self,
+        position: usize,
+        codes: &[usize],
+        stratum: &str,
+    ) -> Vec<f32> {
         let mut out = self
             .static_delta_by_position
             .get(position)
             .unwrap_or(&self.static_global_delta)
             .clone();
         for (group, &code) in codes.iter().enumerate() {
-            let table = &self.group_tables[group][code];
+            let table = &self.table_for_group(stratum, group)[code];
             for (dst, &value) in out.iter_mut().zip(table.iter()) {
                 *dst += value;
             }
         }
         out
+    }
+
+    fn table_for_group(&self, stratum: &str, group: usize) -> &[Vec<f32>] {
+        self.stratum_group_tables
+            .get(stratum)
+            .and_then(|groups| groups.get(&group))
+            .unwrap_or(&self.group_tables[group])
     }
 }
 
@@ -4463,6 +4530,7 @@ fn fit_pq_codebooks(
     pca_bases: &HashMap<HeadId, ZPcaBasis>,
     configs: &[PqConfig],
     iterations: usize,
+    stratum_conditioned_groups: &[usize],
 ) -> Result<HashMap<(HeadId, PqConfig), PqCodebook>, Box<dyn std::error::Error>> {
     let max_k = configs.iter().map(|c| c.k).max().unwrap_or(0);
     let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
@@ -4471,6 +4539,7 @@ fn fit_pq_codebooks(
     }
 
     let mut samples: HashMap<HeadId, Vec<Vec<f64>>> = HashMap::new();
+    let mut samples_by_stratum: HashMap<(HeadId, String), Vec<Vec<f64>>> = HashMap::new();
     for head in heads {
         samples.insert(*head, Vec::new());
     }
@@ -4486,6 +4555,7 @@ fn fit_pq_codebooks(
         if token_ids.is_empty() {
             continue;
         }
+        let stratum = record.stratum.as_deref().unwrap_or("unknown");
         let mut h = embed_tokens_pub(weights, &token_ids);
         let ple_inputs = precompute_per_layer_inputs(weights, &h, &token_ids);
 
@@ -4524,7 +4594,14 @@ fn fit_pq_codebooks(
                             .map(|(&yi, &bi)| yi - bi)
                             .collect::<Vec<_>>();
                         let z = basis.residual_to_z(&residual);
-                        head_samples.push(pca_basis.coordinates_with_rank(&z, max_k));
+                        let coords = pca_basis.coordinates_with_rank(&z, max_k);
+                        head_samples.push(coords.clone());
+                        if !stratum_conditioned_groups.is_empty() {
+                            samples_by_stratum
+                                .entry((*head, stratum.to_string()))
+                                .or_default()
+                                .push(coords);
+                        }
                     }
                 }
             }
@@ -4558,7 +4635,32 @@ fn fit_pq_codebooks(
                     .collect::<Vec<_>>();
                 centroids.push(kmeans_centroids(&group_samples, levels, iterations));
             }
-            codebooks.insert((*head, config), PqCodebook { config, centroids });
+            let mut stratum_centroids: HashMap<String, HashMap<usize, Vec<Vec<f64>>>> =
+                HashMap::new();
+            for &group in stratum_conditioned_groups {
+                let start = group * group_dim;
+                for ((sample_head, stratum), stratum_samples) in samples_by_stratum.iter() {
+                    if sample_head != head {
+                        continue;
+                    }
+                    let group_samples = stratum_samples
+                        .iter()
+                        .map(|sample| sample[start..start + group_dim].to_vec())
+                        .collect::<Vec<_>>();
+                    stratum_centroids
+                        .entry(stratum.clone())
+                        .or_default()
+                        .insert(group, kmeans_centroids(&group_samples, levels, iterations));
+                }
+            }
+            codebooks.insert(
+                (*head, config),
+                PqCodebook {
+                    config,
+                    centroids,
+                    stratum_centroids,
+                },
+            );
         }
     }
 
@@ -4643,7 +4745,7 @@ fn fit_address_probe_models(
                         let z = basis.residual_to_z(&residual);
                         for ((_, config), codebook) in &head_codebooks {
                             let coords = pca_basis.coordinates_with_rank(&z, config.k);
-                            let codes = codebook.quantize_indices(&coords);
+                            let codes = codebook.quantize_indices_for_stratum(&coords, stratum);
                             for (group, &code) in codes.iter().enumerate() {
                                 let levels = 1usize << config.bits_per_group;
                                 let counts = majority_counts
@@ -4789,6 +4891,7 @@ fn fit_address_lsh_group_models(
         if token_ids.is_empty() {
             continue;
         }
+        let stratum = record.stratum.as_deref().unwrap_or("unknown");
         let mut h = embed_tokens_pub(weights, &token_ids);
         let ple_inputs = precompute_per_layer_inputs(weights, &h, &token_ids);
 
@@ -4830,7 +4933,7 @@ fn fit_address_lsh_group_models(
                         let input_row = layer_input.row(pos);
                         for ((_, config), codebook) in &head_codebooks {
                             let coords = pca_basis.coordinates_with_rank(&z, config.k);
-                            let codes = codebook.quantize_indices(&coords);
+                            let codes = codebook.quantize_indices_for_stratum(&coords, stratum);
                             let levels = 1usize << config.bits_per_group;
                             for (group, &code) in codes.iter().enumerate() {
                                 let counts = majority_counts
@@ -4968,6 +5071,7 @@ fn fit_majority_codes_for_codebooks(
         if token_ids.is_empty() {
             continue;
         }
+        let stratum = record.stratum.as_deref().unwrap_or("unknown");
         let mut h = embed_tokens_pub(weights, &token_ids);
         let ple_inputs = precompute_per_layer_inputs(weights, &h, &token_ids);
 
@@ -5007,7 +5111,7 @@ fn fit_majority_codes_for_codebooks(
                         let z = basis.residual_to_z(&residual);
                         for ((_, config), codebook) in &head_codebooks {
                             let coords = pca_basis.coordinates_with_rank(&z, config.k);
-                            let codes = codebook.quantize_indices(&coords);
+                            let codes = codebook.quantize_indices_for_stratum(&coords, stratum);
                             for (group, &code) in codes.iter().enumerate() {
                                 let levels = 1usize << config.bits_per_group;
                                 let counts = majority_counts
@@ -5126,6 +5230,7 @@ fn materialize_mode_d_tables(
     means: &HashMap<HeadId, StaticHeadMeans>,
     pca_bases: &HashMap<HeadId, ZPcaBasis>,
     codebooks: &HashMap<(HeadId, PqConfig), PqCodebook>,
+    stratum_conditioned_groups: &[usize],
 ) -> Result<HashMap<(HeadId, PqConfig), ModeDTable>, Box<dyn std::error::Error>> {
     let mut heads_by_layer: HashMap<usize, Vec<HeadId>> = HashMap::new();
     for head in heads {
@@ -5178,12 +5283,35 @@ fn materialize_mode_d_tables(
                     }
                     group_tables.push(table);
                 }
+                let mut stratum_group_tables: HashMap<String, HashMap<usize, Vec<Vec<f32>>>> =
+                    HashMap::new();
+                for (stratum, groups) in &codebook.stratum_centroids {
+                    for &group in stratum_conditioned_groups {
+                        let Some(centroids) = groups.get(&group) else {
+                            continue;
+                        };
+                        let mut table = Vec::with_capacity(centroids.len());
+                        for centroid in centroids {
+                            let mut coords = vec![0.0; config.k];
+                            let start_coord = group * group_dim;
+                            coords[start_coord..start_coord + group_dim].copy_from_slice(centroid);
+                            let z_part = pca_basis.reconstruct_from_coordinates(&coords);
+                            let residual_part = basis.z_to_residual(&z_part);
+                            table.push(project_head_vector_to_hidden(&w_o_head, &residual_part));
+                        }
+                        stratum_group_tables
+                            .entry(stratum.clone())
+                            .or_default()
+                            .insert(group, table);
+                    }
+                }
                 tables.insert(
                     (head, *config),
                     ModeDTable {
                         static_delta_by_position: static_delta_by_position.clone(),
                         static_global_delta: static_global_delta.clone(),
                         group_tables,
+                        stratum_group_tables,
                     },
                 );
             }
@@ -5435,6 +5563,7 @@ fn forward_q4k_oracle_pq_head(
     pca_basis: &ZPcaBasis,
     means: &StaticHeadMeans,
     codebook: &PqCodebook,
+    stratum: &str,
 ) -> Result<(Array2<f32>, RoundtripPatchMetrics, Vec<Vec<usize>>), Box<dyn std::error::Error>> {
     let mut h = embed_tokens_pub(weights, token_ids);
     let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
@@ -5473,8 +5602,9 @@ fn forward_q4k_oracle_pq_head(
                         .collect::<Vec<_>>();
                     let z = basis.residual_to_z(&residual);
                     let coords = pca_basis.coordinates_with_rank(&z, codebook.config.k);
-                    let codes = codebook.quantize_indices(&coords);
-                    let quantized_coords = codebook.quantize_from_indices(&codes);
+                    let codes = codebook.quantize_indices_for_stratum(&coords, stratum);
+                    let quantized_coords =
+                        codebook.quantize_from_indices_for_stratum(&codes, stratum);
                     oracle_codes.push(codes);
                     let z_projected = pca_basis.reconstruct_from_coordinates(&quantized_coords);
                     let residual_projected = basis.z_to_residual(&z_projected);
@@ -5563,6 +5693,7 @@ fn forward_q4k_oracle_pq_mode_d_head(
     means: &StaticHeadMeans,
     codebook: &PqCodebook,
     mode_d_table: &ModeDTable,
+    stratum: &str,
 ) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
     let mut h = embed_tokens_pub(weights, token_ids);
     let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
@@ -5596,8 +5727,9 @@ fn forward_q4k_oracle_pq_mode_d_head(
                         .collect::<Vec<_>>();
                     let z = basis.residual_to_z(&residual);
                     let coords = pca_basis.coordinates_with_rank(&z, codebook.config.k);
-                    let codes = codebook.quantize_indices(&coords);
-                    let delta = mode_d_table.delta_for_position_codes(pos, &codes);
+                    let codes = codebook.quantize_indices_for_stratum(&coords, stratum);
+                    let delta =
+                        mode_d_table.delta_for_position_codes_with_stratum(pos, &codes, stratum);
                     replacement_delta.extend_from_slice(&delta);
                 }
                 let replacement_delta = Array2::from_shape_vec(
@@ -5836,6 +5968,7 @@ fn forward_q4k_predicted_address_mode_d_head(
     head: HeadId,
     mode_d_table: &ModeDTable,
     predicted_codes_by_position: &[Vec<usize>],
+    stratum: &str,
 ) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
     let mut h = embed_tokens_pub(weights, token_ids);
     let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
@@ -5855,7 +5988,8 @@ fn forward_q4k_predicted_address_mode_d_head(
                     let codes = predicted_codes_by_position
                         .get(pos)
                         .ok_or("missing predicted address for sequence position")?;
-                    let delta = mode_d_table.delta_for_position_codes(pos, codes);
+                    let delta =
+                        mode_d_table.delta_for_position_codes_with_stratum(pos, codes, stratum);
                     replacement_delta.extend_from_slice(&delta);
                 }
                 let replacement_delta =

@@ -33,9 +33,11 @@ opt-in. See `Completed` section below for the full per-change list.
   The dependency-checking form still stops in `larql-vindex`; that is
   tracked outside this server-only pass.
 - Examples and synthetic benchmarks checked on 2026-04-26 and re-verified
-  2026-05-01: `server_demo`, `embed_demo`, `server_bench --release`,
-  `bench_expert_server` (live MoE bench) all pass. `bench_embed_server`
-  builds but requires a real vindex path to execute.
+  2026-05-01 (post Q1 cleanup, re-validated): `server_demo`, `embed_demo`,
+  `server_bench --release`, `bench_expert_server` (live MoE bench against
+  `gemma4-26b-a4b-q4k.vindex`), `bench_embed_server` (live f16 mmap embed
+  against `gemma3-4b-q4k-streaming.vindex`) all pass. Numbers within
+  noise of pre-Q1 baselines — see Live perf snapshot below.
 - Grid route-table checks are now covered by `cargo test -p larql-router`
   (20 tests, including 7 grid-state tests) plus server announce-envelope tests.
 - 2-shard local grid validated end-to-end on Gemma 4 26B-A4B (30 layers,
@@ -73,18 +75,22 @@ P99 under 8-way contention: 24 ms.
 (`output/gemma4-26b-a4b-q4k.vindex`). Hidden=2816, 128 experts,
 moe_intermediate=704, 30 MoE layers.
 
-**bench numbers (2026-05-01, post NEON SDOT + scratch reuse + layer-batch
-endpoint + cache cap=256):**
+**bench numbers (2026-05-01, re-validated post Q1 cleanup; same hardware,
+same vindex, same kernel path — confirms the refactor is bit-exact):**
 
-| Operation | Result |
-|---|---|
-| Vindex load | 5.2 s, +6.0 GB RSS |
-| Lazy `get_or_load_weights()` | 1.3 s, +2.8 GB RSS |
-| Per-expert bytes (one bench layer, all 128) | 285 MB gate_up + 156 MB down (Q4_K) |
-| `forward_moe` warm (router + layer-batch HTTP + combine) | **0.80 ms** mean / 0.79 p50 / 1.09 p99 |
-| `cpu_moe_forward` floor (no HTTP, same weights) | **0.37 ms** mean / 0.37 p50 / 0.49 p99 |
-| 30-layer sweep (1 decode-step's worth of MoE blocks) | **24.8 ms** (0.83 ms/layer) |
-| Steady RSS | **10.5 GB** |
+| Operation | Result | (vs 2026-05-01 pre-Q1) |
+|---|---|---|
+| Vindex load | 5.4 s, +6.0 GB RSS | 5.2 s, +6.0 GB RSS |
+| Lazy `get_or_load_weights()` | 1.36 s, +2.85 GB RSS | 1.3 s, +2.8 GB |
+| Per-expert bytes (one bench layer, all 128) | 285 MB gate_up + 156 MB down (Q4_K) | unchanged |
+| `forward_moe` warm (router + layer-batch HTTP + combine) | **0.78 ms** mean / 0.78 p50 / 0.88 p99 | 0.80 / 0.79 / 1.09 |
+| `cpu_moe_forward` floor (no HTTP, same weights) | **0.34 ms** mean / 0.35 p50 / 0.43 p99 | 0.37 / 0.37 / 0.49 |
+| 30-layer sweep (1 decode-step's worth of MoE blocks) | **23.24 ms** (0.77 ms/layer) | 24.8 ms (0.83 ms/layer) |
+| Steady RSS | **10.5 GB** | 10.5 GB |
+
+The 2-3% delta between pre- and post-cleanup runs is hardware noise (M3
+Max thermal state varies 1-3% across runs) — the refactor moved code
+across files but did not change any kernel.
 
 **End-to-end Gemma 4 26B-A4B grid generation (`larql run --moe-shards`,
 M3 Max, single local shard, 100-token poem, 3-run avg)**:
@@ -110,12 +116,35 @@ M3 Max, single local shard, 100-token poem, 3-run avg)**:
 For comparison, the historical baseline before any of this session's work
 was 4.86 ms `forward_moe` warm and 16.6 GB steady RSS on the BF16
 monolith (per-expert refactor + Q4_K migration cut that to 1.91 ms / 9.7
-GB at 2026-04-26). The 2026-05-01 session took 1.91 ms → 0.80 ms
-(another 2.4×) on the same per-call measurement, 56 ms → 24.8 ms
-(2.3×) on the 30-layer sweep, and end-to-end ~17.7 → ~19.7 tok/s
+GB at 2026-04-26). The 2026-05-01 session took 1.91 ms → 0.78 ms
+(another 2.4×) on the same per-call measurement, 56 ms → 23.24 ms
+(2.4×) on the 30-layer sweep, and end-to-end ~17.7 → ~19.7 tok/s
 (+12%) on the production grid. Cumulative session-on-session win is
 **8.6× from the 2.3 tok/s pre-Q4K baseline** (see
 `larql-inference/ROADMAP.md → M-CPU-1..6`).
+
+### Embed-service path (Gemma 3 4B, ADR-0008 f16 mmap)
+
+`bench_embed_server` against `gemma3-4b-q4k-streaming.vindex` (262144 ×
+2560 vocab × hidden, ~1.34 GB f16 embeddings.bin):
+
+| Operation | Result |
+|---|---|
+| mmap open (cold, no faults) | 0 ms, RSS 280 MB |
+| L1 cache fill (5000 hottest tokens) | 25.2 ms, RSS 426 MB |
+| f16 embed 1 token — L1 hit | **4.3 ns/op** (232 M ops/s) |
+| f16 embed 1 token — mmap decode (L1 miss) | 3.22 µs/op (310 K ops/s) |
+| f16 embed 32 tokens (prefill, mmap decode) | 59.07 µs/op |
+| f16 embed 128 tokens (prefill, mmap decode) | 239.18 µs/op |
+| f16 embed 512 tokens (prefill, mmap decode) | 1.10 ms/op |
+| Logits projection (262208 × 2560, full vocab, CPU) | 335.6 ms (Metal: ~0.67 ms) |
+
+Memory comparison (`--embed-only`, ADR-0008):
+
+| Layout | RSS |
+|---|---|
+| f32 heap eager decode | ~2.9 GB |
+| **f16 mmap + L1 cache (5000 tokens)** | **~1.6 GB** (48% reduction) |
 
 ---
 

@@ -12,25 +12,29 @@
 //! `lm_head_knn_backend` dispatches in the order above, using the
 //! cheapest available backend path for the loaded lm_head representation.
 //! Sibling to `super::walk` (FFN) and `super::attn` (attention).
-
-use std::sync::Arc;
+//!
+//! Per-concern layout (M9 cleanup, 2026-05-01):
+//! - `loaders.rs` — file/mmap loaders + the f16-derived synth path
+//! - `knn.rs`     — the three KNN dispatch paths and the shared
+//!                  `top_k_sorted` reduce.
+//! Constants, the `read_lm_head_manifest_kind` helper, and the unit
+//! tests (which span loader + KNN seams) stay here.
 
 use larql_models::quant::ggml::{
-    K_QUANT_BLOCK_ELEMS, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q4_K_BLOCK_BYTES, Q4_K_BLOCK_ELEMS,
+    Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q4_K_BLOCK_BYTES, Q4_K_BLOCK_ELEMS,
 };
 
-use crate::error::VindexError;
 use crate::format::filenames::*;
-use crate::mmap_util::mmap_optimized;
 
-use crate::index::core::VectorIndex;
+mod knn;
+mod loaders;
 
 /// Numerator/denominator used to back-derive `vocab_size` from a Q4-packed
 /// lm_head file's byte length. Q4_K (144 B / 256 elems) and Q4_0 (18 B / 32
 /// elems) both rate at 0.5625 B/element, i.e. `9/16`. Knowing only the file
 /// size and `hidden_size`, the inverse is `vocab = bytes * 16 / (hidden * 9)`.
-const Q4_BYTES_PER_ELEM_NUM: usize = 9;
-const Q4_BYTES_PER_ELEM_DEN: usize = 16;
+pub(super) const Q4_BYTES_PER_ELEM_NUM: usize = 9;
+pub(super) const Q4_BYTES_PER_ELEM_DEN: usize = 16;
 
 // Compile-time invariants — if either constant ever changes, this assertion
 // catches the byte-rate calc immediately rather than producing silent vocab
@@ -53,7 +57,7 @@ const _: () = assert!(
 /// (0.5625 B/elem in both formats) made silent format mismatches invisible
 /// to file-size validation; checking the manifest's `kind` discriminator
 /// catches the mismatch at load-time.
-fn read_lm_head_manifest_kind(dir: &std::path::Path) -> Option<String> {
+pub(super) fn read_lm_head_manifest_kind(dir: &std::path::Path) -> Option<String> {
     let manifest_path = dir.join(WEIGHT_MANIFEST_JSON);
     let text = std::fs::read_to_string(&manifest_path).ok()?;
     let entries: Vec<crate::format::weights::write_f32::WeightEntry> =
@@ -64,464 +68,11 @@ fn read_lm_head_manifest_kind(dir: &std::path::Path) -> Option<String> {
         .map(|e| e.kind)
 }
 
-impl VectorIndex {
-    /// Load Q4 lm_head for GPU logits (replaces CPU f32 lm_head KNN).
-    ///
-    /// When `weight_manifest.json` is present and lists `lm_head.weight`, the
-    /// entry's `kind` must be `kind::TENSOR_Q4K` — anything else is treated
-    /// as a writer/reader contract violation and rejected, since the matvec
-    /// kernel dispatched here (`q4k_matvec` via `lm_head_knn_backend`) is
-    /// Q4_K-specific. This blocks the regression where a Q4_0 file shipped
-    /// under the Q4_K filename produced silent garbage logits.
-    ///
-    /// Older vindexes without a manifest entry for lm_head still load (the
-    /// extractor wrote the file directly), but no format check happens.
-    pub fn load_lm_head_q4(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join(LM_HEAD_Q4_BIN);
-        if !path.exists() {
-            return Err(VindexError::Parse("lm_head_q4.bin not found".into()));
-        }
-        if let Some(manifest_kind) = read_lm_head_manifest_kind(dir) {
-            if manifest_kind != crate::format::weights::write_f32::kind::TENSOR_Q4K {
-                return Err(VindexError::Parse(format!(
-                    "lm_head_q4.bin manifest mismatch: expected kind \"{}\", \
-                     found \"{}\". This indicates the vindex was extracted with \
-                     a writer that disagrees with the Q4_K matvec dispatch path \
-                     — refusing to load to avoid silent garbage logits.",
-                    crate::format::weights::write_f32::kind::TENSOR_Q4K,
-                    manifest_kind
-                )));
-            }
-        }
-        let file = std::fs::File::open(&path)?;
-        let mmap = unsafe { mmap_optimized(&file)? };
-        // Derive `vocab_size` from the file size when it's still 0. Q4_K and
-        // Q4_0 share the 9/16 byte-rate (`Q4_BYTES_PER_ELEM_*`), so the same
-        // divisor handles both formats. Mirrors the pattern in `load_lm_head`
-        // for f32 lm_head files.
-        if self.vocab_size == 0 && self.hidden_size > 0 {
-            let bytes = mmap.len();
-            let denom = self.hidden_size * Q4_BYTES_PER_ELEM_NUM;
-            if denom > 0 {
-                let vocab = (bytes * Q4_BYTES_PER_ELEM_DEN) / denom;
-                if vocab > 0 {
-                    self.vocab_size = vocab;
-                }
-            }
-        }
-        self.projections.lm_head_q4_mmap = Some(Arc::new(mmap));
-        Ok(())
-    }
-
-    /// Whether Q4 lm_head is loaded (from file or synthesized from f16 embeddings).
-    pub fn has_lm_head_q4(&self) -> bool {
-        self.projections.lm_head_q4_mmap.is_some() || self.projections.lm_head_q4_synth.is_some()
-    }
-
-    /// Synthesize Q4_0 lm_head in RAM from the f16 embeddings mmap.
-    /// No-op if a Q4 source already exists or preconditions are not met.
-    pub fn synthesize_lm_head_q4(&mut self) {
-        if self.projections.lm_head_q4_mmap.is_some() || self.projections.lm_head_q4_synth.is_some()
-        {
-            return;
-        }
-        let vocab = self.vocab_size;
-        let hidden = self.hidden_size;
-        // Q4_K quantises in `K_QUANT_BLOCK_ELEMS`-element super-blocks, so
-        // `hidden` must be a multiple of that (matches the on-disk
-        // `lm_head_q4.bin` writer in `format/weights/write_q4k/mod.rs`).
-        // Earlier code used Q4_0 (32-element blocks) here but
-        // `lm_head_knn_backend` dispatches `q4k_matvec` for both the mmap and
-        // synth paths — keeping the synth bytes in Q4_K avoids the format-
-        // collision bug that broke gemma3-4b-v2.vindex (writer Q4_K vs reader
-        // Q4_0).
-        if vocab == 0 || hidden == 0 || !hidden.is_multiple_of(K_QUANT_BLOCK_ELEMS) {
-            return;
-        }
-        let f16_mmap = match self.projections.lm_head_f16_mmap.as_ref() {
-            Some(m) => m.clone(),
-            None => return,
-        };
-        let expected = vocab * hidden * 2;
-        if f16_mmap.len() < expected {
-            return;
-        }
-        // Decode the whole f16 mmap to f32 in one pass, then Q4_K-quantise
-        // the flat `[vocab, hidden]` row-major data. Q4_K's 256-element
-        // super-blocks fit cleanly into one row when `hidden` is a multiple
-        // of 256, so a flat call gives the same row-by-row layout the
-        // matvec kernel expects.
-        let mut all_f32 = vec![0.0f32; vocab * hidden];
-        for (i, slot) in all_f32.iter_mut().enumerate() {
-            let off = i * 2;
-            let bits = u16::from_le_bytes([f16_mmap[off], f16_mmap[off + 1]]);
-            *slot = larql_models::quant::half::f16_to_f32(bits);
-        }
-        let q4k = larql_compute::cpu::ops::q4_common::quantize_q4_k(&all_f32);
-        self.projections.lm_head_q4_synth = Some(Arc::new(q4k));
-    }
-
-    /// Adopt the vindex's f16 `embeddings.bin` mmap as an f16 view of the
-    /// LM head. Safe only for tied-embedding models (Gemma 2/3/4, Llama
-    /// when `tie_word_embeddings=true`) — the loader is responsible for
-    /// gating. Caller must have already populated `vocab_size`.
-    ///
-    /// When set, `lm_head_knn_backend` prefers `ComputeBackend::f16_gemv`
-    /// on the mmap'd bytes, avoiding the 5.6 GB f32 clone on Gemma 4 31B.
-    pub fn set_lm_head_f16_mmap(&mut self, mmap: Arc<memmap2::Mmap>) {
-        self.projections.lm_head_f16_mmap = Some(mmap);
-    }
-
-    /// Whether an f16 mmap view of the LM head is available.
-    pub fn has_lm_head_f16(&self) -> bool {
-        self.projections.lm_head_f16_mmap.is_some() && self.vocab_size > 0
-    }
-
-    // ── LM head (output projection) for vindex logits ──
-
-    /// Load lm_head from lm_head.bin for KNN logit lookup.
-    pub fn load_lm_head(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join(LM_HEAD_BIN);
-        if !path.exists() {
-            return Err(VindexError::Parse("lm_head.bin not found".into()));
-        }
-        let file = std::fs::File::open(&path)?;
-        let mmap = unsafe { mmap_optimized(&file)? };
-        // Detect vocab size from file size: vocab = file_bytes / (hidden_size * 4)
-        let vocab = mmap.len() / (self.hidden_size * 4);
-        self.vocab_size = vocab;
-        self.projections.lm_head_mmap = Some(Arc::new(mmap));
-        Ok(())
-    }
-
-    /// Whether lm_head is loaded for vindex logits.
-    pub fn has_lm_head(&self) -> bool {
-        self.projections.lm_head_mmap.is_some() && self.vocab_size > 0
-    }
-
-    /// KNN against lm_head via a ComputeBackend. Tries paths in order:
-    ///   1. Q4 matvec on `lm_head_q4.bin` (when present and backend has q4).
-    ///   2. f16 gemv on the mmap'd embeddings (tied-embed models only).
-    ///   3. f32 BLAS fallback via `lm_head_knn`.
-    ///
-    /// `top_k == 1` uses the GPU-argmax fast paths on backends that
-    /// implement them, returning a single `(token_id, score)` without
-    /// the 1MB scores readback + 262K-element CPU sort that the general
-    /// path requires. Bench (greedy decode) takes this path.
-    pub fn lm_head_knn_backend(
-        &self,
-        query: &ndarray::Array1<f32>,
-        top_k: usize,
-        backend: &dyn larql_compute::ComputeBackend,
-    ) -> Vec<(u32, f32)> {
-        // 1. Q4_K path — ~1 ms on Metal (mmap file or synthesized from f16 embeddings).
-        //
-        // The on-disk `lm_head_q4.bin` is written by `format/weights/write_q4k`
-        // as **Q4_K** (144 bytes per 256 elements with sub-block scales/mins).
-        // Earlier code dispatched `q4_matvec` (which is Q4_0 — 18 bytes per 32
-        // elements with one f16 scale): the byte-rate happens to match
-        // (0.5625 B/element) so file size was identical, but the kernel read
-        // Q4_K bytes as Q4_0 scales/quants and silently produced garbage
-        // logits. Symptom: multilingual gibberish under `--metal` on any
-        // vindex with a fresh `lm_head_q4.bin` (e.g. gemma3-4b-v2 extracted
-        // 2026-04-27). Routing through `q4k_matvec` (which takes raw f32 x,
-        // no Q8 step) restores the format match.
-        if backend.has_q4() {
-            let q4_bytes: Option<&[u8]> = self
-                .projections
-                .lm_head_q4_mmap
-                .as_ref()
-                .map(|m| m.as_ref() as &[u8])
-                .or_else(|| {
-                    self.projections
-                        .lm_head_q4_synth
-                        .as_ref()
-                        .map(|v| v.as_slice())
-                });
-            if let Some(q4_data) = q4_bytes {
-                let vocab = self.vocab_size;
-                let hidden = self.hidden_size;
-                if vocab > 0 {
-                    if let Some(x) = query.as_slice() {
-                        if let Some(scores_vec) = backend.q4k_matvec(q4_data, x, vocab, hidden) {
-                            return Self::top_k_sorted(scores_vec, top_k);
-                        }
-                    }
-                }
-            }
-        }
-        // 2. f16 path — tied-embed Gemma, ~2× the bandwidth of Q4 but still
-        //    half of f32 and avoids a 5.6 GB heap allocation on 31B.
-        if let Some(ref f16_mmap) = self.projections.lm_head_f16_mmap {
-            let vocab = self.vocab_size;
-            let hidden = self.hidden_size;
-            if vocab > 0 {
-                let expected = vocab * hidden * 2;
-                if f16_mmap.len() >= expected {
-                    if let Some(x) = query.as_slice() {
-                        if top_k == 1 {
-                            if let Some((idx, score)) =
-                                backend.f16_gemv_topk1(&f16_mmap[..expected], x, vocab, hidden)
-                            {
-                                return vec![(idx, score)];
-                            }
-                        } else if let Some(hits) =
-                            backend.f16_gemv_topk(&f16_mmap[..expected], x, vocab, hidden, top_k)
-                        {
-                            if !hits.is_empty() {
-                                return hits;
-                            }
-                        }
-                        if let Some(scores_vec) =
-                            backend.f16_gemv(&f16_mmap[..expected], x, vocab, hidden)
-                        {
-                            return Self::top_k_sorted(scores_vec, top_k);
-                        }
-                    }
-                }
-            }
-        }
-        // 3. f32 BLAS fallback.
-        self.lm_head_knn(query, top_k)
-    }
-
-    /// Same as `lm_head_knn_backend` but skips the **production**
-    /// `q4k_matvec` path (path 1 of the canonical chain) and tries
-    /// stable-reduction alternatives in this order:
-    ///
-    ///   1. Stride-32 Q4_K matvec (`backend.q4k_matvec_stride32`) on
-    ///      the same Q4_K bytes — same bandwidth as production
-    ///      `q4k_matvec`, but with `f16_gemv`'s reduction tree.
-    ///   2. f16 GEMV on `embeddings.bin` mmap (tied-embed only) —
-    ///      bigger read (1.3 GB vs 330 MB Q4_K) but always stable.
-    ///   3. f32 BLAS fallback (`lm_head_knn`).
-    ///
-    /// Why: Metal's production `q4k_matvec` 32-lane simdgroup reduction
-    /// (`shaders/q4k_matvec.rs::ix = lane & 1u`) drifts ~1e-3 vs CPU's
-    /// sequential dot product. On a 262K-vocab × 2560-hidden matvec
-    /// that's enough to flip top-1 on close-call tokens (e.g.
-    /// " Capital" vs " capital" at decode step 1 of Gemma 3 4B — see
-    /// `arch_golden_gemma3_4b_gpu`). The stride-32 variant
-    /// (`shaders/q4k_matvec_stride32.rs`) keeps the Q4_K bandwidth win
-    /// while matching `f16_gemv`'s stable reduction.
-    ///
-    /// `lm_head_topk` in `larql-inference::layer_graph::generate::lm_head`
-    /// routes here when the active backend is non-CPU (default;
-    /// override with `LARQL_METAL_LM_HEAD=1` to re-enable the production
-    /// `q4k_matvec` path).
-    pub fn lm_head_knn_backend_skip_q4k(
-        &self,
-        query: &ndarray::Array1<f32>,
-        top_k: usize,
-        backend: &dyn larql_compute::ComputeBackend,
-    ) -> Vec<(u32, f32)> {
-        // 1. Stride-32 Q4_K matvec on the same Q4_K bytes as the
-        //    production path — preserves the bandwidth advantage,
-        //    fixes the rank-1 drift. Falls through if the backend
-        //    doesn't implement the stable variant (default impl
-        //    returns None). `LARQL_LM_HEAD_STRIDE32=0` disables this
-        //    path so callers can A/B against the f16 fallback without
-        //    a rebuild.
-        let stride32_enabled = !matches!(
-            std::env::var("LARQL_LM_HEAD_STRIDE32").as_deref(),
-            Ok("0") | Ok("false") | Ok("off") | Ok("no")
-        );
-        if stride32_enabled && backend.has_q4() {
-            let q4_bytes: Option<&[u8]> = self
-                .projections
-                .lm_head_q4_mmap
-                .as_ref()
-                .map(|m| m.as_ref() as &[u8])
-                .or_else(|| {
-                    self.projections
-                        .lm_head_q4_synth
-                        .as_ref()
-                        .map(|v| v.as_slice())
-                });
-            if let Some(q4_data) = q4_bytes {
-                let vocab = self.vocab_size;
-                let hidden = self.hidden_size;
-                if vocab > 0 {
-                    if let Some(x) = query.as_slice() {
-                        if let Some(scores_vec) =
-                            backend.q4k_matvec_stride32(q4_data, x, vocab, hidden)
-                        {
-                            return Self::top_k_sorted(scores_vec, top_k);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. f16 GEMV on tied-embed `embeddings.bin` — stable reduction,
-        //    but ~2× the bandwidth of Q4_K.
-        if let Some(ref f16_mmap) = self.projections.lm_head_f16_mmap {
-            let vocab = self.vocab_size;
-            let hidden = self.hidden_size;
-            if vocab > 0 {
-                let expected = vocab * hidden * 2;
-                if f16_mmap.len() >= expected {
-                    if let Some(x) = query.as_slice() {
-                        if top_k == 1 {
-                            if let Some((idx, score)) =
-                                backend.f16_gemv_topk1(&f16_mmap[..expected], x, vocab, hidden)
-                            {
-                                return vec![(idx, score)];
-                            }
-                        } else if let Some(hits) =
-                            backend.f16_gemv_topk(&f16_mmap[..expected], x, vocab, hidden, top_k)
-                        {
-                            if !hits.is_empty() {
-                                return hits;
-                            }
-                        }
-                        if let Some(scores_vec) =
-                            backend.f16_gemv(&f16_mmap[..expected], x, vocab, hidden)
-                        {
-                            return Self::top_k_sorted(scores_vec, top_k);
-                        }
-                    }
-                }
-            }
-        }
-        // 3. f32 BLAS fallback.
-        self.lm_head_knn(query, top_k)
-    }
-
-    /// Sort `scores` by descending value and keep the top `top_k`. Shared
-    /// by the Q4 / f16 / f32 paths above.
-    ///
-    /// Uses a size-K min-heap instead of `select_nth_unstable_by` so we
-    /// don't materialise a 2MB `Vec<(u32, f32)>` for a 262K-vocab lm_head
-    /// only to throw away 262K-K of it. For typical K=1..5 on Gemma 3 4B
-    /// this drops the CPU portion of lm_head from ~0.5ms to ~50µs.
-    fn top_k_sorted(scores: Vec<f32>, top_k: usize) -> Vec<(u32, f32)> {
-        if scores.is_empty() || top_k == 0 {
-            return Vec::new();
-        }
-        let k = top_k.min(scores.len());
-
-        // Argmax fast path — no heap, single linear scan.
-        if k == 1 {
-            let mut best_i: u32 = 0;
-            let mut best_v = f32::NEG_INFINITY;
-            for (i, &s) in scores.iter().enumerate() {
-                if s.is_finite() && s > best_v {
-                    best_v = s;
-                    best_i = i as u32;
-                }
-            }
-            if best_v == f32::NEG_INFINITY {
-                return Vec::new();
-            }
-            return vec![(best_i, best_v)];
-        }
-
-        // Min-heap of size K, smallest score at index 0. We push until full,
-        // then replace-and-sift-down whenever we see something larger than
-        // the current min.
-        let mut heap: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
-
-        fn sift_down(h: &mut [(f32, u32)], mut i: usize) {
-            let n = h.len();
-            loop {
-                let mut smallest = i;
-                let l = 2 * i + 1;
-                let r = 2 * i + 2;
-                if l < n && h[l].0 < h[smallest].0 {
-                    smallest = l;
-                }
-                if r < n && h[r].0 < h[smallest].0 {
-                    smallest = r;
-                }
-                if smallest == i {
-                    break;
-                }
-                h.swap(i, smallest);
-                i = smallest;
-            }
-        }
-
-        for (i, &s) in scores.iter().enumerate() {
-            if !s.is_finite() {
-                continue;
-            }
-            if heap.len() < k {
-                heap.push((s, i as u32));
-                if heap.len() == k {
-                    for j in (0..k / 2).rev() {
-                        sift_down(&mut heap, j);
-                    }
-                }
-            } else if s > heap[0].0 {
-                heap[0] = (s, i as u32);
-                sift_down(&mut heap, 0);
-            }
-        }
-        if heap.len() < k && heap.len() > 1 {
-            for j in (0..heap.len() / 2).rev() {
-                sift_down(&mut heap, j);
-            }
-        }
-
-        heap.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        heap.into_iter().map(|(s, i)| (i, s)).collect()
-    }
-
-    /// KNN against lm_head: find top-K tokens by dot product with query vector.
-    /// Single BLAS gemv: query[1, hidden] @ lm_head[vocab, hidden]^T → [1, vocab].
-    /// Then top-K selection. Returns (token_id, score) sorted by score descending.
-    pub fn lm_head_knn(&self, query: &ndarray::Array1<f32>, top_k: usize) -> Vec<(u32, f32)> {
-        let mmap = match self.projections.lm_head_mmap.as_ref() {
-            Some(m) => m,
-            None => return vec![],
-        };
-        let vocab = self.vocab_size;
-        let hidden = self.hidden_size;
-        if vocab == 0 {
-            return vec![];
-        }
-
-        let expected = vocab * hidden * 4;
-        if mmap.len() < expected {
-            return vec![];
-        }
-
-        // Zero-copy: reinterpret mmap as [vocab, hidden] f32 matrix
-        let data = unsafe {
-            let ptr = mmap.as_ptr() as *const f32;
-            std::slice::from_raw_parts(ptr, vocab * hidden)
-        };
-        let lm_view = ndarray::ArrayView2::from_shape((vocab, hidden), data).unwrap();
-
-        // gemv via larql-compute: scores = query @ lm_head^T → [1, vocab]
-        let hidden = self.hidden_size;
-        let x = query.view().into_shape_with_order((1, hidden)).unwrap();
-        let cpu = larql_compute::CpuBackend;
-        use larql_compute::MatMul;
-        let result = cpu.matmul_transb(x, lm_view); // [1, hidden] @ [vocab, hidden]^T → [1, vocab]
-        let scores = ndarray::Array1::from_vec(result.into_raw_vec_and_offset().0);
-
-        // Top-K selection
-        let mut indexed: Vec<(u32, f32)> = scores
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(i, s)| (i as u32, s))
-            .collect();
-        let k = top_k.min(indexed.len());
-        if k > 0 && k < indexed.len() {
-            indexed.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
-            indexed.truncate(k);
-        }
-        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        indexed
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::core::VectorIndex;
+    use std::sync::Arc;
 
     /// `top_k_sorted` is the shared reduce used by Q4 / f16 / f32 paths.
     /// Pin the contract: descending by score, capped at `top_k`.
@@ -622,8 +173,6 @@ mod tests {
     ///     the matching row first (round-trip correctness).
     #[test]
     fn synthesize_lm_head_q4_produces_correct_bytes() {
-        use std::sync::Arc;
-
         let vocab: usize = 16;
         // Q4_K uses 256-element super-blocks; the synth path now matches
         // the on-disk `lm_head_q4.bin` writer (Q4_K) so hidden must be a

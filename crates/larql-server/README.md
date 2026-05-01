@@ -180,7 +180,7 @@ cargo run -p larql-server --example embed_demo
 ```
 
 Synthetic release benchmark, captured 2026-04-26 (re-validated
-2026-05-01 — within noise):
+2026-05-01 post Q1 cleanup — within noise):
 
 ```bash
 cargo run -p larql-server --example server_bench --release
@@ -194,20 +194,34 @@ cargo run -p larql-server --example server_bench --release
 | `walk-ffn` batched 8 layers | 0.321 ms/op |
 | `describe` simulation | 0.298 ms/op |
 | `relations` simulation | 0.399 ms/op |
-| `embed` 512-token prefill | 0.114 ms/op |
-| `logits` dot, 1024 vocab × 256 hidden | 0.195 ms/op |
+| `embed` 512-token prefill | 0.115 ms/op |
+| `logits` dot, 1024 vocab × 256 hidden | 0.191 ms/op |
 
 These numbers measure in-process synthetic index operations, not network
 latency or real model weight paging. For a live vindex, use:
 
 ```bash
 cargo run --release -p larql-server --example bench_embed_server -- \
-  output/gemma3-4b-q4k-v2.vindex
+  output/gemma3-4b-q4k-streaming.vindex
 
 # Optional logits projection bench:
 cargo run --release -p larql-server --example bench_embed_server -- \
-  output/gemma3-4b-q4k-v2.vindex --logits
+  output/gemma3-4b-q4k-streaming.vindex --logits
 ```
+
+Live embed numbers (2026-05-01, ADR-0008 f16 mmap, Gemma 3 4B, 262144 ×
+2560 vocab × hidden):
+
+| Operation | Result |
+|---|---:|
+| f16 embed 1 token — L1 hit | **4.3 ns/op** (232 M ops/s) |
+| f16 embed 1 token — mmap decode (L1 miss) | 3.22 µs/op |
+| f16 embed 32 tokens (prefill) | 59 µs/op |
+| f16 embed 128 tokens (prefill) | 239 µs/op |
+| f16 embed 512 tokens (prefill) | 1.10 ms/op |
+| Logits projection (full vocab, CPU) | 335 ms (Metal: ~0.67 ms) |
+| RSS, `--embed-only` (f32 heap) | ~2.9 GB |
+| **RSS, `--embed-only` (f16 mmap + L1)** | **~1.6 GB** (48% reduction) |
 
 For a hybrid-MoE vindex (Gemma 4 26B-A4B etc.), `bench_expert_server`
 exercises the per-expert HTTP path end-to-end:
@@ -231,16 +245,18 @@ Reference numbers on M3 Max (single in-process shard, layer 15, top-K=8;
 
 | Config | `forward_moe` warm | 30-layer sweep |
 |---|---|---|
-| TCP HTTP + f32 (default) | 0.82 ms | 23.8 ms |
-| **UDS + f32** | **0.74 ms** | **21.4 ms** ← best on loopback |
+| TCP HTTP + f32 (default) | **0.78 ms** | **23.24 ms** (0.77 ms/layer) |
+| `cpu_moe_forward` floor (no HTTP) | 0.34 ms | — |
+| UDS + f32 | 0.74 ms | 21.4 ms ← best on loopback |
 | TCP HTTP + f16 | 1.05 ms | 29.6 ms (f16 conv CPU dominates on loopback) |
 | UDS + f16 | 0.71 ms | 21.7 ms |
 
 Full perf snapshot (per-layer breakdown, RSS, vindex load time, etc.)
 is in `ROADMAP.md` → "Live perf snapshot → Remote MoE expert path".
-The numbers above are the 2026-05-01 baseline; the ROADMAP also tracks
-the historical progression (4.86 ms → 1.91 ms → 0.80 ms `forward_moe`
-warm across the 2026-04-26 + 2026-05-01 sessions).
+The numbers above are the 2026-05-01 baseline (re-validated post Q1
+cleanup); the ROADMAP also tracks the historical progression
+(4.86 ms → 1.91 ms → 0.78 ms `forward_moe` warm across the 2026-04-26
++ 2026-05-01 sessions).
 
 ## Recommended setups
 
@@ -331,8 +347,8 @@ default-on for `grpc://` shards.
 | `unix:///path/to/sock` (UDS HTTP/1.1) | f32 | 18.2 |
 
 End-to-end ~19.7 tok/s = ~64 ms/tok, of which ~23 ms is MoE (30 layers
-× ~0.8 ms/layer) and ~41 ms is attention + dense FFN + lm_head +
-sampling on the client side.
+× ~0.77 ms/layer per the post-cleanup re-validation) and ~41 ms is
+attention + dense FFN + lm_head + sampling on the client side.
 
 For per-call latency breakdowns of each transport / wire combination,
 see the `bench_expert_server` table in **Examples and Benchmarks**
@@ -1069,7 +1085,7 @@ cargo run -p larql-server --example server_bench --release
 
 # Live embed benchmark (requires a real vindex)
 cargo run --release -p larql-server --example bench_embed_server -- \
-  output/gemma3-4b-q4k-v2.vindex
+  output/gemma3-4b-q4k-streaming.vindex
 
 # Live MoE expert benchmark — measures cpu_moe_forward floor + forward_moe
 # HTTP RTT + 30-layer sweep against a real hybrid-MoE vindex
