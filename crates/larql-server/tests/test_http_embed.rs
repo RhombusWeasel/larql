@@ -1052,6 +1052,45 @@ async fn http_openai_chat_logprobs_request_field_is_accepted() {
 }
 
 #[tokio::test]
+async fn http_openai_completions_repetition_penalties_are_accepted() {
+    // F19: frequency_penalty + presence_penalty land in SamplingConfig
+    // and clamp to [-2.0, 2.0]. Synthetic model 503s but the field
+    // parses cleanly through to the inference gate.
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({
+            "prompt": "hi",
+            "temperature": 0.7,
+            "frequency_penalty": 1.5,
+            "presence_penalty": -0.3,
+            "max_tokens": 4
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn http_openai_chat_repetition_penalties_are_accepted() {
+    let app = single_model_router(state(vec![model("gemma")]));
+    let resp = post_json(
+        app,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.5,
+            "frequency_penalty": 1.0,
+            "presence_penalty": 0.5,
+            "max_tokens": 4
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
 async fn http_openai_completions_logprobs_request_field_is_accepted() {
     let app = single_model_router(state(vec![model("gemma")]));
     let resp = post_json(

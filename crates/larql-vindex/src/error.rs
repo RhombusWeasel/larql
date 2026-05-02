@@ -14,6 +14,12 @@ pub enum VindexError {
     Parse(String),
     #[error("unsupported dtype: {0}")]
     UnsupportedDtype(String),
+    #[error("unsupported architecture '{family}' for {surface}: {feature} is not implemented")]
+    UnsupportedArchitecture {
+        family: String,
+        feature: String,
+        surface: String,
+    },
     #[error("requires extract level '{needed}' but vindex was built at '{have}'")]
     InsufficientExtractLevel {
         needed: ExtractLevel,
@@ -28,6 +34,10 @@ pub enum VindexError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FAMILY_DEEPSEEK: &str = "deepseek";
+    const FEATURE_MLA: &str = "multi-head latent attention (MLA)";
+    const SURFACE_Q4K_WEIGHT_WRITER: &str = "q4k weight writer";
 
     #[test]
     fn not_a_directory_includes_path() {
@@ -65,6 +75,19 @@ mod tests {
         let s = e.to_string();
         assert!(s.contains("unsupported dtype"), "{s}");
         assert!(s.contains("bfloat16"), "{s}");
+    }
+
+    #[test]
+    fn unsupported_architecture_includes_context() {
+        let e = VindexError::UnsupportedArchitecture {
+            family: FAMILY_DEEPSEEK.into(),
+            feature: FEATURE_MLA.into(),
+            surface: SURFACE_Q4K_WEIGHT_WRITER.into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains(FAMILY_DEEPSEEK), "{s}");
+        assert!(s.contains(FEATURE_MLA), "{s}");
+        assert!(s.contains(SURFACE_Q4K_WEIGHT_WRITER), "{s}");
     }
 
     #[test]

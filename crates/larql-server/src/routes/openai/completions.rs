@@ -109,6 +109,15 @@ pub struct CompletionsRequest {
     /// End-user id — logged via tracing if set, otherwise no-op.
     #[serde(default)]
     pub user: Option<String>,
+    /// OpenAI repetition penalty: subtract `freq * count(token)` from
+    /// each candidate's logit before softmax. Range `[-2.0, 2.0]`;
+    /// values outside that band are clamped server-side.
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    /// OpenAI presence penalty: subtract `presence * 1` from any token
+    /// that's already appeared. Range `[-2.0, 2.0]`.
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -182,9 +191,13 @@ pub async fn handle_completions(
     }
 
     let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-    let temperature = req.temperature;
-    let top_p = req.top_p;
-    let seed = req.seed;
+    let sampling_params = super::util::SamplingParams {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        seed: req.seed,
+        frequency_penalty: req.frequency_penalty,
+        presence_penalty: req.presence_penalty,
+    };
     let stop_strings: Vec<String> = req
         .stop
         .as_ref()
@@ -218,9 +231,7 @@ pub async fn handle_completions(
             model_arc,
             prompt,
             max_tokens,
-            temperature,
-            top_p,
-            seed,
+            sampling_params,
             stop_strings,
             model_id,
         )
@@ -235,9 +246,7 @@ pub async fn handle_completions(
                 &model_arc,
                 &prompts,
                 max_tokens,
-                temperature,
-                top_p,
-                seed,
+                sampling_params,
                 &stop_strings,
                 echo,
                 logprobs_requested,
@@ -269,9 +278,7 @@ fn stream_completions(
     model: Arc<LoadedModel>,
     prompt: String,
     max_tokens: usize,
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    seed: Option<u64>,
+    sampling_params: super::util::SamplingParams,
     stop_strings: Vec<String>,
     model_id: String,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -300,8 +307,7 @@ fn stream_completions(
             return;
         }
 
-        let (sampling, eos) =
-            super::util::build_sampling_eos(temperature, top_p, seed, &stop_strings);
+        let (sampling, eos) = super::util::build_sampling_eos(sampling_params, &stop_strings);
 
         let patched = model.patched.blocking_read();
         let index = patched.base();
@@ -392,9 +398,7 @@ fn run_completions_loop(
     model: &LoadedModel,
     prompts: &[String],
     max_tokens: usize,
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    seed: Option<u64>,
+    sampling_params: super::util::SamplingParams,
     stop_strings: &[String],
     echo: bool,
     logprobs_requested: Option<usize>,
@@ -434,8 +438,7 @@ fn run_completions_loop(
         // deterministically — `SamplingConfig::with_seed` keeps the same
         // RNG seed across each prompt, which is what callers expect when
         // a seed is provided.
-        let (sampling, eos) =
-            super::util::build_sampling_eos(temperature, top_p, seed, stop_strings);
+        let (sampling, eos) = super::util::build_sampling_eos(sampling_params, stop_strings);
 
         let result = larql_inference::layer_graph::generate_with_sampling(
             weights,
@@ -556,10 +559,7 @@ mod tests {
 
     #[test]
     fn build_completion_logprobs_aligns_offsets_and_arrays() {
-        let toks = vec![
-            ("Paris".to_string(), 1.0),
-            (" is".to_string(), 1.0),
-        ];
+        let toks = vec![("Paris".to_string(), 1.0), (" is".to_string(), 1.0)];
         let lp = build_completion_logprobs(&toks);
         assert_eq!(lp.tokens, vec!["Paris".to_string(), " is".to_string()]);
         assert_eq!(lp.token_logprobs.len(), 2);

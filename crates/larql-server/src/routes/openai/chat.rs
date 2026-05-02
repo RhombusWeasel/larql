@@ -313,9 +313,13 @@ pub async fn handle_chat_completions(
         .as_ref()
         .map(|s| s.as_slice().to_vec())
         .unwrap_or_default();
-    let temperature = req.temperature;
-    let top_p = req.top_p;
-    let seed = req.seed;
+    let sampling_params = super::util::SamplingParams {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        seed: req.seed,
+        frequency_penalty: req.frequency_penalty,
+        presence_penalty: req.presence_penalty,
+    };
     let model_id = req.model.clone().unwrap_or_else(|| model.id.clone());
     let model_arc = model.clone();
     let messages = req.messages;
@@ -333,9 +337,7 @@ pub async fn handle_chat_completions(
             model_arc,
             messages,
             max_tokens,
-            temperature,
-            top_p,
-            seed,
+            sampling_params,
             stop_strings,
             constrained_schema,
             model_id,
@@ -349,9 +351,7 @@ pub async fn handle_chat_completions(
             &model_arc,
             &messages,
             max_tokens,
-            temperature,
-            top_p,
-            seed,
+            sampling_params,
             &stop_strings,
             constrained_schema,
         )
@@ -434,9 +434,7 @@ fn stream_chat_completion(
     model: Arc<LoadedModel>,
     messages: Vec<ChatMessage>,
     max_tokens: usize,
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    seed: Option<u64>,
+    sampling_params: super::util::SamplingParams,
     stop_strings: Vec<String>,
     constrained_schema: Option<Schema>,
     model_id: String,
@@ -511,7 +509,7 @@ fn stream_chat_completion(
         };
 
         let result = if let Some(schema) = constrained_schema {
-            let _ = (temperature, top_p, seed); // accepted but no-op for constrained
+            let _ = sampling_params; // accepted but no-op for constrained (greedy)
             let mask = build_constrained_mask(&model.tokenizer, schema);
             larql_inference::layer_graph::generate_constrained_streaming(
                 weights,
@@ -526,8 +524,7 @@ fn stream_chat_completion(
                 on_token,
             )
         } else {
-            let (sampling, eos) =
-                super::util::build_sampling_eos(temperature, top_p, seed, &stop_strings);
+            let (sampling, eos) = super::util::build_sampling_eos(sampling_params, &stop_strings);
             larql_inference::layer_graph::generate_streaming(
                 weights,
                 &model.tokenizer,
@@ -608,9 +605,7 @@ fn run_chat_completion(
     model: &LoadedModel,
     messages: &[ChatMessage],
     max_tokens: usize,
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    seed: Option<u64>,
+    sampling_params: super::util::SamplingParams,
     stop_strings: &[String],
     constrained_schema: Option<Schema>,
 ) -> Result<ChatGenerationOutput, ServerError> {
@@ -645,7 +640,7 @@ fn run_chat_completion(
     let num_layers = weights.num_layers;
 
     let result = if let Some(schema) = constrained_schema {
-        let _ = (temperature, top_p, seed); // accepted but no-op for constrained
+        let _ = sampling_params; // accepted but no-op for constrained (greedy)
         let mask = build_constrained_mask(&model.tokenizer, schema);
         larql_inference::layer_graph::generate_constrained(
             weights,
@@ -659,8 +654,7 @@ fn run_chat_completion(
             mask,
         )
     } else {
-        let (sampling, eos) =
-            super::util::build_sampling_eos(temperature, top_p, seed, stop_strings);
+        let (sampling, eos) = super::util::build_sampling_eos(sampling_params, stop_strings);
         larql_inference::layer_graph::generate_with_sampling(
             weights,
             &model.tokenizer,
@@ -1061,10 +1055,7 @@ mod tests {
 
     #[test]
     fn build_chat_logprobs_emits_one_entry_per_token() {
-        let toks = vec![
-            ("Paris".to_string(), 1.0),
-            (".".to_string(), 1.0),
-        ];
+        let toks = vec![("Paris".to_string(), 1.0), (".".to_string(), 1.0)];
         let lp = build_chat_logprobs(&toks);
         assert_eq!(lp.content.len(), 2);
         assert_eq!(lp.content[0].token, "Paris");

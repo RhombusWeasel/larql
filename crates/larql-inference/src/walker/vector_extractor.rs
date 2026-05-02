@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use super::utils::{current_date, decode_token, partial_top_k, partial_top_k_column};
 use crate::error::InferenceError;
-use crate::model::{load_model_dir, resolve_model_path, ModelWeights};
+use crate::model::{load_model_dir_validated, resolve_model_path, ModelWeights};
 
 // Re-export shared vector types from larql-models.
 pub use larql_models::{
@@ -184,7 +184,7 @@ pub struct VectorExtractor {
 impl VectorExtractor {
     pub fn load(model: &str) -> Result<Self, InferenceError> {
         let model_path = resolve_model_path(model)?;
-        let weights = load_model_dir(&model_path)?;
+        let weights = load_model_dir_validated(&model_path)?;
 
         let tokenizer_path = model_path.join(TOKENIZER_JSON);
         if !tokenizer_path.exists() {

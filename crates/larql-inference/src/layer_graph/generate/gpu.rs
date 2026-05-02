@@ -394,9 +394,14 @@ where
     let mut detok = Detokenizer::new(tokenizer);
     detok.seed(token_ids);
 
+    // Running list of token ids the model has emitted so far. Fed
+    // into the sampler's repetition-penalty path; empty on the first
+    // pick (no history yet).
+    let mut generated_ids: Vec<u32> = Vec::with_capacity(max_tokens);
+
     let knn_k = lmhead_k_for_sampling(&sampling);
     let first_hits = lm_head_topk(index, weights, &h_1d, knn_k, backend);
-    let first_pick = sampler.sample_from_topk(&first_hits);
+    let first_pick = sampler.sample_from_topk_with_history(&first_hits, &generated_ids);
     if let Some(picked_id) = first_pick {
         // Detokenizer.push emits the cumulative-decode delta — handles HF
         // leading-space (`▁`) correctly across SP and BPE tokenizers.
@@ -413,6 +418,7 @@ where
             weights.arch.final_logit_softcapping(),
         );
         on_token(picked_id, &tok_str, prob);
+        generated_ids.push(picked_id);
         tokens.push((tok_str, prob));
     }
 
@@ -599,7 +605,7 @@ where
             let step_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
             decode_ms.push(step_ms);
 
-            if let Some(picked_id) = sampler.sample_from_topk(&hits) {
+            if let Some(picked_id) = sampler.sample_from_topk_with_history(&hits, &generated_ids) {
                 let t4 = std::time::Instant::now();
                 let tok_str = detok.push(picked_id);
                 let detok_ms = t4.elapsed().as_secs_f64() * 1000.0;
@@ -628,6 +634,7 @@ where
                 t_detok += detok_ms;
                 on_token(picked_id, &tok_str, prob);
                 tokens.push((tok_str, prob));
+                generated_ids.push(picked_id);
                 current_token_id = picked_id;
                 if is_eos {
                     break;

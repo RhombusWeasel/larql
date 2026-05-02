@@ -15,6 +15,7 @@
 //! - `load`:      reconstruct `ModelWeights` from a vindex directory
 //!                (`load_model_weights`, `find_tokenizer_path`).
 
+mod capabilities;
 pub mod load;
 pub mod manifest;
 pub mod write_f32;

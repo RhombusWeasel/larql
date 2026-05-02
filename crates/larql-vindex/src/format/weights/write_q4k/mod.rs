@@ -16,6 +16,7 @@ use crate::error::VindexError;
 use crate::extract::callbacks::IndexBuildCallbacks;
 use crate::format::filenames::*;
 
+use super::capabilities::{ensure_standard_attention_supported, SURFACE_Q4K_WEIGHT_WRITER};
 use super::write_f32::{kind, WeightEntry, WeightSource};
 
 // ── Q4_K / Q6_K streaming writer ──────────────────────────────────────────
@@ -149,6 +150,7 @@ pub fn write_model_weights_q4k_with_opts(
     let start = std::time::Instant::now();
 
     let arch = source.arch();
+    ensure_standard_attention_supported(arch, SURFACE_Q4K_WEIGHT_WRITER)?;
     let num_layers = source.num_layers();
 
     // ── attn_weights_q4k.bin ──

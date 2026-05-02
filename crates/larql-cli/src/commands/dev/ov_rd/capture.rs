@@ -11,7 +11,7 @@ use larql_vindex::{
 };
 use ndarray::{s, Array2};
 
-use super::input::{load_prompts, parse_layer_spec};
+use super::input::{limit_prompts_per_stratum, load_prompts, parse_layer_spec};
 use super::reports::{CaptureReport, HeadReport};
 use super::runtime::{insert_q4k_layer_tensors, remove_layer_tensors};
 use super::stats::RunningHeadStats;
@@ -37,6 +37,10 @@ pub(super) struct CaptureArgs {
     /// Limit prompts for smoke runs.
     #[arg(long)]
     max_prompts: Option<usize>,
+
+    /// Limit prompts per stratum after loading the prompt file.
+    #[arg(long)]
+    max_per_stratum: Option<usize>,
 
     /// Limit token positions per prompt for smoke runs.
     #[arg(long)]
@@ -77,7 +81,10 @@ pub(super) fn run_capture(args: CaptureArgs) -> Result<(), Box<dyn std::error::E
     };
     let capture_layer = |layer: usize| layers.contains(&layer);
 
-    let prompts = load_prompts(&args.prompts, args.max_prompts)?;
+    let mut prompts = load_prompts(&args.prompts, args.max_prompts)?;
+    if let Some(max_per_stratum) = args.max_per_stratum {
+        prompts = limit_prompts_per_stratum(prompts, max_per_stratum);
+    }
     eprintln!("Prompts: {}", prompts.len());
     eprintln!("Layers: {:?}", layers);
 

@@ -24,6 +24,7 @@ use crate::extract::callbacks::IndexBuildCallbacks;
 use crate::format::filenames::*;
 use crate::format::load::load_vindex_config;
 
+use super::capabilities::{ensure_standard_attention_supported, SURFACE_F32_WEIGHT_WRITER};
 use larql_models::ModelWeights;
 
 /// Manifest `kind` discriminators — wire-format strings written into
@@ -283,6 +284,7 @@ pub fn write_model_weights_with_opts(
         .unwrap_or(crate::config::dtype::StorageDtype::F32);
 
     let arch = source.arch();
+    ensure_standard_attention_supported(arch, SURFACE_F32_WEIGHT_WRITER)?;
     let num_layers = source.num_layers();
     let mut entries: Vec<WeightEntry> = Vec::new();
 

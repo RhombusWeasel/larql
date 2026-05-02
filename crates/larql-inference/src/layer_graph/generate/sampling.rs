@@ -202,8 +202,7 @@ impl Sampler {
                     if c == 0 {
                         *s
                     } else {
-                        s - self.cfg.frequency_penalty * (c as f32)
-                            - self.cfg.presence_penalty
+                        s - self.cfg.frequency_penalty * (c as f32) - self.cfg.presence_penalty
                     }
                 })
                 .collect()
@@ -242,11 +241,7 @@ fn token_counts(generated: &[u32]) -> std::collections::HashMap<u32, usize> {
 /// Apply OpenAI-style repetition penalties to a full-vocab logit slice.
 /// Returns a fresh `Vec<f32>` with the modified logits — leaves the
 /// original intact for callers that want to compare or fall back.
-fn apply_repetition_penalty(
-    logits: &[f32],
-    generated: &[u32],
-    cfg: SamplingConfig,
-) -> Vec<f32> {
+fn apply_repetition_penalty(logits: &[f32], generated: &[u32], cfg: SamplingConfig) -> Vec<f32> {
     let counts = token_counts(generated);
     let freq = cfg.frequency_penalty;
     let pres = cfg.presence_penalty;
@@ -426,6 +421,48 @@ mod tests {
     fn empty_logits_returns_none() {
         let mut s = Sampler::new(SamplingConfig::greedy());
         assert_eq!(s.sample(&[]), None);
+    }
+
+    #[test]
+    fn frequency_penalty_pushes_repeated_token_below_argmax() {
+        // Without penalty: argmax = 1 (score 5.0). With a large
+        // frequency penalty applied to id 1 after it's been emitted
+        // twice, the next-best token (id 0, score 3.0) wins.
+        let cfg = SamplingConfig::greedy().with_frequency_penalty(2.0);
+        let mut s = Sampler::new(cfg);
+        let history = [1u32, 1u32]; // id 1 has count = 2
+                                    // Penalty: 5.0 - 2.0 * 2 = 1.0. Now id 0 (3.0) > id 1 (1.0).
+        assert_eq!(s.sample_with_history(&logits_3(), &history), Some(0));
+    }
+
+    #[test]
+    fn presence_penalty_pushes_any_repeated_token() {
+        // Presence applies once per id regardless of count.
+        let cfg = SamplingConfig::greedy().with_presence_penalty(3.0);
+        let mut s = Sampler::new(cfg);
+        let history = [1u32]; // id 1 seen once
+                              // Penalty: 5.0 - 3.0 = 2.0. Id 0 (3.0) wins.
+        assert_eq!(s.sample_with_history(&logits_3(), &history), Some(0));
+    }
+
+    #[test]
+    fn no_penalty_when_history_is_empty() {
+        // Penalty fields set, but history is empty → behaves as plain greedy.
+        let cfg = SamplingConfig::greedy()
+            .with_frequency_penalty(5.0)
+            .with_presence_penalty(5.0);
+        let mut s = Sampler::new(cfg);
+        assert_eq!(s.sample_with_history(&logits_3(), &[]), Some(1));
+    }
+
+    #[test]
+    fn topk_repetition_penalty_applies_to_hit_scores() {
+        let hits = vec![(1u32, 5.0f32), (0u32, 3.0f32), (2u32, 1.0f32)];
+        let cfg = SamplingConfig::greedy().with_frequency_penalty(2.0);
+        let mut s = Sampler::new(cfg);
+        // Without penalty argmax id is 1; with penalty applied twice
+        // (history has two 1s), score 5.0 - 4.0 = 1.0; id 0 wins.
+        assert_eq!(s.sample_from_topk_with_history(&hits, &[1, 1]), Some(0));
     }
 
     #[test]

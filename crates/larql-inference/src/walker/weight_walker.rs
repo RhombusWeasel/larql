@@ -14,7 +14,7 @@ use larql_vindex::format::filenames::*;
 
 use super::utils::{count_threshold, decode_token, partial_top_k_column, top_entities};
 use crate::error::InferenceError;
-use crate::model::{load_model_dir, resolve_model_path, ModelWeights};
+use crate::model::{load_model_dir_validated, resolve_model_path, ModelWeights};
 
 /// Result of walking a single layer.
 #[derive(Debug, Clone)]
@@ -106,7 +106,7 @@ struct RawEdge {
 impl WeightWalker {
     pub fn load(model: &str) -> Result<Self, InferenceError> {
         let model_path = resolve_model_path(model)?;
-        let weights = load_model_dir(&model_path)?;
+        let weights = load_model_dir_validated(&model_path)?;
 
         let tokenizer_path = model_path.join(TOKENIZER_JSON);
         if !tokenizer_path.exists() {

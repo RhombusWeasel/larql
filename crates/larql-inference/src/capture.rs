@@ -9,7 +9,9 @@ use std::path::Path;
 
 use crate::error::InferenceError;
 use crate::forward::trace_forward;
-use crate::model::{load_model_dir, load_model_dir_walk_only, resolve_model_path, ModelWeights};
+use crate::model::{
+    load_model_dir_validated, load_model_dir_walk_only_validated, resolve_model_path, ModelWeights,
+};
 use crate::tokenizer::load_tokenizer;
 
 /// Configuration for residual/activation capture.
@@ -72,7 +74,7 @@ impl InferenceModel {
     /// Load a model from a path or HuggingFace model ID.
     pub fn load(model: &str) -> Result<Self, InferenceError> {
         let model_path = resolve_model_path(model)?;
-        let weights = load_model_dir(&model_path)?;
+        let weights = load_model_dir_validated(&model_path)?;
         let tokenizer = load_tokenizer(&model_path)?;
 
         Ok(Self {
@@ -89,7 +91,7 @@ impl InferenceModel {
     /// couldn't hold the full f32-decoded model in memory.
     pub fn load_walk_only(model: &str) -> Result<Self, InferenceError> {
         let model_path = resolve_model_path(model)?;
-        let weights = load_model_dir_walk_only(&model_path)?;
+        let weights = load_model_dir_walk_only_validated(&model_path)?;
         let tokenizer = load_tokenizer(&model_path)?;
         Ok(Self {
             weights,

@@ -51,7 +51,7 @@ pub struct AttentionWalker {
 impl AttentionWalker {
     pub fn load(model: &str) -> Result<Self, InferenceError> {
         let model_path = resolve_model_path(model)?;
-        let weights = crate::model::load_model_dir(&model_path)?;
+        let weights = crate::model::load_model_dir_validated(&model_path)?;
 
         let tokenizer_path = model_path.join(TOKENIZER_JSON);
         if !tokenizer_path.exists() {

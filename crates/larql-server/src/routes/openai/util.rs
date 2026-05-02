@@ -207,22 +207,36 @@ mod tests {
         assert_eq!(v["error"]["type"], "server_error");
     }
 
+    fn p() -> SamplingParams {
+        SamplingParams::default()
+    }
+
     #[test]
     fn build_sampling_eos_defaults_to_greedy() {
-        let (sampling, _eos) = build_sampling_eos(None, None, None, &[]);
+        let (sampling, _eos) = build_sampling_eos(p(), &[]);
         assert!(sampling.is_greedy());
     }
 
     #[test]
     fn build_sampling_eos_zero_temperature_is_greedy() {
-        let (sampling, _eos) = build_sampling_eos(Some(0.0), Some(0.9), Some(7), &[]);
+        let params = SamplingParams {
+            temperature: Some(0.0),
+            top_p: Some(0.9),
+            seed: Some(7),
+            ..p()
+        };
+        let (sampling, _eos) = build_sampling_eos(params, &[]);
         // Zero temperature collapses to greedy regardless of top_p / seed.
         assert!(sampling.is_greedy());
     }
 
     #[test]
     fn build_sampling_eos_temperature_enables_sampling() {
-        let (sampling, _eos) = build_sampling_eos(Some(0.7), None, None, &[]);
+        let params = SamplingParams {
+            temperature: Some(0.7),
+            ..p()
+        };
+        let (sampling, _eos) = build_sampling_eos(params, &[]);
         assert!(!sampling.is_greedy());
         assert!((sampling.temperature - 0.7).abs() < 1e-6);
         assert!(sampling.top_p.is_none());
@@ -232,40 +246,96 @@ mod tests {
     #[test]
     fn build_sampling_eos_top_p_only_with_temperature() {
         // top_p with temperature > 0 → applied.
-        let (sampling, _eos) = build_sampling_eos(Some(0.8), Some(0.9), None, &[]);
+        let on = SamplingParams {
+            temperature: Some(0.8),
+            top_p: Some(0.9),
+            ..p()
+        };
+        let (sampling, _eos) = build_sampling_eos(on, &[]);
         assert_eq!(sampling.top_p, Some(0.9));
 
         // top_p with temperature == 0 → ignored (greedy can't nucleus).
-        let (sampling, _eos) = build_sampling_eos(Some(0.0), Some(0.9), None, &[]);
+        let off = SamplingParams {
+            temperature: Some(0.0),
+            top_p: Some(0.9),
+            ..p()
+        };
+        let (sampling, _eos) = build_sampling_eos(off, &[]);
         assert!(sampling.top_p.is_none());
     }
 
     #[test]
     fn build_sampling_eos_top_p_out_of_range_dropped() {
         // OpenAI rejects top_p > 1.0; we silently drop instead of erroring.
-        let (sampling, _eos) = build_sampling_eos(Some(0.8), Some(1.5), None, &[]);
+        let high = SamplingParams {
+            temperature: Some(0.8),
+            top_p: Some(1.5),
+            ..p()
+        };
+        let (sampling, _eos) = build_sampling_eos(high, &[]);
         assert!(sampling.top_p.is_none());
-        let (sampling, _eos) = build_sampling_eos(Some(0.8), Some(-0.1), None, &[]);
+        let neg = SamplingParams {
+            temperature: Some(0.8),
+            top_p: Some(-0.1),
+            ..p()
+        };
+        let (sampling, _eos) = build_sampling_eos(neg, &[]);
         assert!(sampling.top_p.is_none());
     }
 
     #[test]
     fn build_sampling_eos_seed_carried_through() {
-        let (sampling, _eos) = build_sampling_eos(Some(0.7), None, Some(42), &[]);
+        let params = SamplingParams {
+            temperature: Some(0.7),
+            seed: Some(42),
+            ..p()
+        };
+        let (sampling, _eos) = build_sampling_eos(params, &[]);
         assert_eq!(sampling.seed, Some(42));
     }
 
     #[test]
     fn build_sampling_eos_negative_temperature_clamped() {
-        let (sampling, _eos) = build_sampling_eos(Some(-0.5), None, None, &[]);
+        let params = SamplingParams {
+            temperature: Some(-0.5),
+            ..p()
+        };
+        let (sampling, _eos) = build_sampling_eos(params, &[]);
         assert!(sampling.is_greedy());
     }
 
     #[test]
+    fn build_sampling_eos_repetition_penalties_carry_through() {
+        let params = SamplingParams {
+            temperature: Some(0.7),
+            frequency_penalty: Some(1.5),
+            presence_penalty: Some(-0.5),
+            ..p()
+        };
+        let (sampling, _eos) = build_sampling_eos(params, &[]);
+        assert!((sampling.frequency_penalty - 1.5).abs() < 1e-6);
+        assert!((sampling.presence_penalty - (-0.5)).abs() < 1e-6);
+        assert!(sampling.has_repetition_penalty());
+    }
+
+    #[test]
+    fn build_sampling_eos_repetition_penalties_clamped_to_openai_range() {
+        // OpenAI documents [-2.0, 2.0]; values outside get clamped.
+        let params = SamplingParams {
+            temperature: Some(0.7),
+            frequency_penalty: Some(5.0),
+            presence_penalty: Some(-10.0),
+            ..p()
+        };
+        let (sampling, _eos) = build_sampling_eos(params, &[]);
+        assert!((sampling.frequency_penalty - 2.0).abs() < 1e-6);
+        assert!((sampling.presence_penalty - (-2.0)).abs() < 1e-6);
+    }
+
+    #[test]
     fn build_sampling_eos_stop_strings_added() {
-        let (_, eos_baseline) = build_sampling_eos(None, None, None, &[]);
-        let (_, eos) = build_sampling_eos(None, None, None, &["\n\n".into(), "STOP".into()]);
-        // Caller's stop strings are appended on top of the baseline.
+        let (_, eos_baseline) = build_sampling_eos(p(), &[]);
+        let (_, eos) = build_sampling_eos(p(), &["\n\n".into(), "STOP".into()]);
         assert_eq!(eos.stop_strings.len(), eos_baseline.stop_strings.len() + 2);
         assert!(eos.stop_strings.iter().any(|s| s == "\n\n"));
         assert!(eos.stop_strings.iter().any(|s| s == "STOP"));
@@ -273,9 +343,8 @@ mod tests {
 
     #[test]
     fn build_sampling_eos_empty_stop_strings_skipped() {
-        let (_, eos_baseline) = build_sampling_eos(None, None, None, &[]);
-        let (_, eos) = build_sampling_eos(None, None, None, &["".into(), "x".into()]);
-        // Empty needles are skipped; only "x" should be added.
+        let (_, eos_baseline) = build_sampling_eos(p(), &[]);
+        let (_, eos) = build_sampling_eos(p(), &["".into(), "x".into()]);
         assert_eq!(eos.stop_strings.len(), eos_baseline.stop_strings.len() + 1);
         assert!(eos.stop_strings.iter().any(|s| s == "x"));
         assert!(!eos.stop_strings.iter().any(|s| s.is_empty()));

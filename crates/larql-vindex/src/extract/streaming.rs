@@ -56,7 +56,7 @@ pub fn build_vindex_streaming(
     std::fs::create_dir_all(output_dir)?;
 
     // Detect architecture
-    let arch = larql_models::detect_architecture(model_dir)
+    let arch = larql_models::detect_architecture_validated(model_dir)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
     let prefixes = arch.key_prefixes_to_strip();
     let cfg = arch.config();
