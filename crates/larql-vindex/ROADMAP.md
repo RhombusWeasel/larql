@@ -115,6 +115,32 @@ RSS 16.6 → 9.7 GB. Disk 58 → 16 GB.
 
 ## P1: Active
 
+### Architecture-independent extraction and weight writing
+
+**Status**: Planned.
+
+The extraction stack should preserve architecture facts from
+`ModelArchitecture` or explicit source metadata all the way into `index.json`
+and the weight manifests. Avoid accepting a model by family name while silently
+dropping tensors required by that family.
+
+Work items:
+
+- [ ] Replace `extract/build_from_vectors.rs` model-name heuristics
+  (`contains("gemma")`, `contains("llama")`) with explicit architecture
+  metadata or a validated architecture/config input.
+- [ ] Add an architecture capability check before weight writing. If an
+  architecture uses attention forms not represented by Q/K/V/O manifests
+  (for example MLA), fail with a targeted unsupported-architecture error until
+  that layout is implemented.
+- [ ] Extend f32/Q4K weight writers beyond standard Q/K/V/O when a concrete
+  non-standard architecture contract is added.
+- [ ] Add fixture tests that prove unknown/custom families do not inherit
+  Gemma/Llama defaults through string matching.
+
+Acceptance: vector-only and model-backed extracts should agree on family,
+embedding scale, layer bands, and required tensor coverage for the same model.
+
 ### Perf round-4 (2026-04-25): three concrete wins identified
 
 End-to-end decode is 86.7 % GPU forward — vindex itself is a thin

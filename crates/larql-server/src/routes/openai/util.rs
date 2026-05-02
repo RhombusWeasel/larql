@@ -84,6 +84,19 @@ pub fn error_chunk(msg: &str) -> String {
     serde_json::json!({"error": {"message": msg, "type": "server_error"}}).to_string()
 }
 
+/// Sampling parameters extracted from an OpenAI completions /
+/// chat-completions request. Grouped into a struct so the
+/// [`build_sampling_eos`] signature stays readable as we add
+/// repetition penalties / future fields.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SamplingParams {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub seed: Option<u64>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+}
+
 /// Build the sampling + EOS config from OpenAI request parameters.
 ///
 /// - `temperature`: 0.0 (or `None`) → greedy. Otherwise temperature
@@ -92,28 +105,35 @@ pub fn error_chunk(msg: &str) -> String {
 ///   deterministic.
 /// - `top_p`: nucleus filter; only applied when temperature > 0.
 /// - `seed`: deterministic RNG. Same seed + same inputs = same tokens.
+/// - `frequency_penalty` / `presence_penalty`: OpenAI repetition
+///   penalties applied to per-token logits before softmax. Clamped to
+///   `[-2.0, 2.0]` to match OpenAI's documented range.
 /// - `stop`: extends the model's built-in EOS stop strings; first
 ///   match halts generation mid-stream (not post-trimmed).
 pub fn build_sampling_eos(
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    seed: Option<u64>,
+    params: SamplingParams,
     stop_strings: &[String],
 ) -> (larql_inference::SamplingConfig, larql_inference::EosConfig) {
-    let temp = temperature.unwrap_or(0.0).max(0.0);
+    let temp = params.temperature.unwrap_or(0.0).max(0.0);
     let mut sampling = if temp > 0.0 {
         larql_inference::SamplingConfig::temperature(temp)
     } else {
         larql_inference::SamplingConfig::greedy()
     };
-    if let Some(p) = top_p {
+    if let Some(p) = params.top_p {
         // Only honour top_p when sampling is on; for greedy it's a no-op.
         if temp > 0.0 && (0.0..=1.0).contains(&p) {
             sampling = sampling.with_top_p(p);
         }
     }
-    if let Some(s) = seed {
+    if let Some(s) = params.seed {
         sampling = sampling.with_seed(s);
+    }
+    if let Some(f) = params.frequency_penalty {
+        sampling = sampling.with_frequency_penalty(f.clamp(-2.0, 2.0));
+    }
+    if let Some(p) = params.presence_penalty {
+        sampling = sampling.with_presence_penalty(p.clamp(-2.0, 2.0));
     }
     let mut eos = larql_inference::EosConfig::builtin();
     for s in stop_strings {

@@ -164,6 +164,29 @@ KNN journal/retrieval overlay, compose FFN overlay, and compiled/baked weights.
 
 ---
 
+## P1 — Model architecture independence hardening
+
+Driver: keep LARQL from becoming "Gemma-shaped with exceptions." The core
+`ModelArchitecture` trait is the right boundary, but several production paths
+still infer family from strings, pass scalar attention geometry through
+per-layer pipelines, or advertise architectures whose extraction/inference
+contracts are incomplete.
+
+| # | Item | Crate | Status |
+|---|------|-------|--------|
+| AI1 | Gate supported architecture families by executable contracts: extraction, vindex weight writing, forward/decode, trace, and prompt rendering | larql-models + larql-vindex + larql-inference | planned |
+| AI2 | Implement or explicitly reject MLA architectures in vindex writers and inference; DeepSeek is detected today but `mla_*` tensors are not consumed outside `larql-models` | larql-models + larql-vindex + larql-inference | planned |
+| AI3 | Remove scalar attention-geometry fallbacks from backend decode APIs; allocate KV/cache/scratch from `FullPipelineLayer` per-layer shapes everywhere | larql-compute + larql-inference | planned |
+| AI4 | Replace vector-only extraction's model-name family guesses with explicit metadata or validated architecture input | larql-vindex | planned |
+| AI5 | Roll validated loading/detection through inference, extraction, CLI, and server entry points where missing config should fail fast | larql-models consumers | planned |
+
+Acceptance target: adding a new transformer architecture should require changes
+inside `larql-models::architectures/*` and explicit capability decisions at
+storage/forward boundaries, not incidental string matches or hidden Gemma/Llama
+defaults in extraction and decode.
+
+---
+
 ## Critical path (P0 — what blocks the demo)
 
 Items in order. Each depends on the one above it.

@@ -83,6 +83,35 @@ Once fixed, expect the gRPC grid to jump from 3.5 tok/s → ~9-11 tok/s
 (measured during the bug investigation: server compute is 95% of token
 time, Metal experts give 3-4× speedup vs CPU experts).
 
+---
+
+## Open: Per-layer backend shape contract
+
+**Status**: Planned as of 2026-05-02.
+
+`FullPipelineLayer` already carries per-layer attention geometry, RoPE, norms,
+FFN type, and activation. The backend APIs should make that the only shape
+contract. Several decode/prefill signatures still accept scalar
+`num_q_heads`, `num_kv_heads`, `head_dim`, `q_dim`, `kv_dim`, and `rope_base`
+values that are usually first-layer defaults. That creates a fallback path
+where heterogeneous architectures can allocate uniform KV/cache state.
+
+Work items:
+
+- [ ] Replace uniform `create_kv_cache(num_layers, max_seq, num_kv_heads,
+  head_dim)` fallbacks in decode paths with per-layer cache construction from
+  `layers`.
+- [ ] Introduce a compact decode shape/context struct, or derive all shape
+  values inside the backend from `FullPipelineLayer`, to reduce parameter drift.
+- [ ] Add tests covering mixed per-layer KV/head geometry without requiring
+  caller-side preallocation.
+- [ ] Keep scalar helpers only for legacy/uniform compatibility and mark them
+  clearly as such.
+
+Acceptance: callers should not need to know whether a model has uniform,
+sliding/global, or otherwise heterogeneous attention geometry before invoking a
+backend decode path.
+
 ## Current state (2026-04-28, M3 Max, real vindex)
 
 | Engine | tok/s | ms/tok | Notes |

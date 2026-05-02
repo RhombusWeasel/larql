@@ -19,6 +19,21 @@ Recommended next sequence:
 
 `larql-models` now exposes validated APIs. Update downstream inference, vindex extraction, CLI, and server entry points to use `detect_*_validated` or `load_*_validated` where invalid configs should fail fast.
 
+### Architecture capability contracts
+**Effort**: Medium  
+**Status**: Not started
+
+Detection currently says which family a config belongs to, but it does not
+state which downstream surfaces are actually implemented for that family.
+Add an explicit capability contract so extraction, vindex weight writing,
+inference, trace, and prompt rendering can fail loudly instead of accepting an
+architecture whose tensors are not consumed by the active path.
+
+Immediate driver: DeepSeek is correctly detected as MoE + MLA and exposes
+`mla_*` tensor keys, but vindex writers and inference paths currently consume
+standard Q/K/V/O attention tensors only. Either implement the MLA extraction
+and forward contract, or report it as unsupported at the boundary.
+
 ### Note on quant/dequant crate split
 **Decision**: `larql-models/quant/` is **format deserialization** (GGUF/safetensors → f32). `larql-compute` has **compute operations** (quantized matvec, Metal shaders). The split is correct. The `f16_to_f32` copies in `larql-compute/cpu/ops/q4k_matvec.rs` and `q6k_matvec.rs` are intentional — CPU reference impls for Metal shader testing, isolated by design. `larql-compute` is dev-only dep; don't flip that direction.
 

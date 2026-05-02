@@ -40,6 +40,15 @@ pub struct SamplingConfig {
     /// Seed for the RNG. Same seed + same logits = same token. `None` =
     /// non-deterministic (entropy from the OS).
     pub seed: Option<u64>,
+    /// OpenAI `frequency_penalty`: subtract `freq * count(token)` from
+    /// each candidate's logit before softmax. Penalises tokens that
+    /// appear often in the generated text so far. Range typically
+    /// `[-2.0, 2.0]` (positive = discourage repetition).
+    pub frequency_penalty: f32,
+    /// OpenAI `presence_penalty`: subtract `presence * 1` from any
+    /// token that's already appeared at least once. Penalises *any*
+    /// repeated token regardless of frequency.
+    pub presence_penalty: f32,
 }
 
 impl Default for SamplingConfig {
@@ -55,6 +64,8 @@ impl SamplingConfig {
             top_k: None,
             top_p: None,
             seed: None,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
         }
     }
 
@@ -65,7 +76,24 @@ impl SamplingConfig {
             top_k: None,
             top_p: None,
             seed: None,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
         }
+    }
+
+    pub fn with_frequency_penalty(mut self, p: f32) -> Self {
+        self.frequency_penalty = p;
+        self
+    }
+
+    pub fn with_presence_penalty(mut self, p: f32) -> Self {
+        self.presence_penalty = p;
+        self
+    }
+
+    /// True iff repetition penalties are active (either field non-zero).
+    pub fn has_repetition_penalty(&self) -> bool {
+        self.frequency_penalty != 0.0 || self.presence_penalty != 0.0
     }
 
     pub fn with_top_k(mut self, k: usize) -> Self {
@@ -117,13 +145,28 @@ impl Sampler {
     /// Pick a token id from full-vocab logits. Returns `None` only when
     /// every entry is non-finite or the input is empty.
     pub fn sample(&mut self, logits: &[f32]) -> Option<u32> {
+        self.sample_with_history(logits, &[])
+    }
+
+    /// Sample with awareness of previously-generated token ids so
+    /// repetition penalties (`frequency_penalty`, `presence_penalty`)
+    /// can be applied before softmax. Pass `generated: &[]` when no
+    /// history is relevant (equivalent to [`Self::sample`]).
+    pub fn sample_with_history(&mut self, logits: &[f32], generated: &[u32]) -> Option<u32> {
         if logits.is_empty() {
             return None;
         }
+        let penalised: Vec<f32>;
+        let logits_ref: &[f32] = if self.cfg.has_repetition_penalty() && !generated.is_empty() {
+            penalised = apply_repetition_penalty(logits, generated, self.cfg);
+            &penalised
+        } else {
+            logits
+        };
         if self.cfg.is_greedy() {
-            return argmax(logits);
+            return argmax(logits_ref);
         }
-        let probs = apply_filters(logits, self.cfg);
+        let probs = apply_filters(logits_ref, self.cfg);
         if probs.is_empty() {
             return None;
         }
@@ -136,14 +179,47 @@ impl Sampler {
     /// `cfg.top_k` is clamped to `hits.len()` (the KNN already truncated);
     /// temperature and top-p still apply.
     pub fn sample_from_topk(&mut self, hits: &[(u32, f32)]) -> Option<u32> {
+        self.sample_from_topk_with_history(hits, &[])
+    }
+
+    /// Top-k sample with repetition-penalty support. The penalty
+    /// adjusts the per-hit score in-place before normal filtering, so
+    /// hits whose token id has already been emitted slide down the
+    /// distribution.
+    pub fn sample_from_topk_with_history(
+        &mut self,
+        hits: &[(u32, f32)],
+        generated: &[u32],
+    ) -> Option<u32> {
         if hits.is_empty() {
             return None;
         }
+        let scored: Vec<f32> = if self.cfg.has_repetition_penalty() && !generated.is_empty() {
+            let counts = token_counts(generated);
+            hits.iter()
+                .map(|(id, s)| {
+                    let c = *counts.get(id).unwrap_or(&0);
+                    if c == 0 {
+                        *s
+                    } else {
+                        s - self.cfg.frequency_penalty * (c as f32)
+                            - self.cfg.presence_penalty
+                    }
+                })
+                .collect()
+        } else {
+            hits.iter().map(|(_, s)| *s).collect()
+        };
         if self.cfg.is_greedy() {
-            return Some(hits[0].0);
+            // Re-pick argmax in case the penalty shifted ordering.
+            let (idx, _) = scored
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.is_finite())
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))?;
+            return Some(hits[idx].0);
         }
-        let scores: Vec<f32> = hits.iter().map(|(_, s)| *s).collect();
-        let probs = apply_filters(&scores, self.cfg);
+        let probs = apply_filters(&scored, self.cfg);
         if probs.is_empty() {
             return Some(hits[0].0);
         }
@@ -151,6 +227,41 @@ impl Sampler {
         let pick = multinomial(&probs, rng);
         Some(hits[pick].0)
     }
+}
+
+/// Build a `token_id → count` map. Tiny helper used by both penalty
+/// paths; allocations dominate here only for very long histories.
+fn token_counts(generated: &[u32]) -> std::collections::HashMap<u32, usize> {
+    let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for &id in generated {
+        *counts.entry(id).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// Apply OpenAI-style repetition penalties to a full-vocab logit slice.
+/// Returns a fresh `Vec<f32>` with the modified logits — leaves the
+/// original intact for callers that want to compare or fall back.
+fn apply_repetition_penalty(
+    logits: &[f32],
+    generated: &[u32],
+    cfg: SamplingConfig,
+) -> Vec<f32> {
+    let counts = token_counts(generated);
+    let freq = cfg.frequency_penalty;
+    let pres = cfg.presence_penalty;
+    let mut out = logits.to_vec();
+    for (id, c) in counts {
+        let i = id as usize;
+        if i >= out.len() {
+            continue;
+        }
+        if !out[i].is_finite() {
+            continue;
+        }
+        out[i] -= freq * (c as f32) + pres;
+    }
+    out
 }
 
 // ── Internals ────────────────────────────────────────────────────────────

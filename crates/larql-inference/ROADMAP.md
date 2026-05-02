@@ -28,6 +28,30 @@ runtime contracts are stable.
 
 ---
 
+## Open: Model architecture independence hardening
+
+**Status**: Planned as of 2026-05-02.
+
+The forward stack already routes most behavior through `ModelArchitecture` and
+`FullPipelineLayer`, but a few paths still assume standard decoder attention
+or pass first-layer scalar geometry into backends that now support per-layer
+shape variation.
+
+Work items:
+
+| # | Item | Status |
+|---|------|--------|
+| A1 | Add a runtime capability gate for architectures whose attention is not executable by the active path, starting with MLA/DeepSeek | planned |
+| A2 | Remove scalar `num_q_heads`, `num_kv_heads`, `head_dim`, `q_dim`, `kv_dim`, and `rope_base` assumptions from decode/prefill call sites where `FullPipelineLayer` already carries per-layer values | planned |
+| A3 | Ensure all KV cache allocation paths use `layers[*].num_kv_heads` and `layers[*].head_dim`, not the caller's first-layer geometry fallback | planned |
+| A4 | Add architecture fixtures for heterogeneous geometry and unsupported-attention failures so GPU, CPU, trace, and vindex-backed paths agree | planned |
+
+Acceptance: a heterogeneous model should either run through every selected
+path using per-layer geometry, or fail before decode/extraction with a precise
+unsupported capability error.
+
+---
+
 ## P0: Best-in-class mechanistic interpretability engine
 
 **Status**: In progress as of 2026-05-02.
