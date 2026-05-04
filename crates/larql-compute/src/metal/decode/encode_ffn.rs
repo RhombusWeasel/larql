@@ -348,7 +348,9 @@ impl MetalBackend {
                 );
             } else if layer.down.format == crate::QuantFormat::Q4_K
                 && inter_padded <= 16384
-                && std::env::var("LARQL_FUSED_DOWN").map(|v| v != "0").unwrap_or(true)
+                && std::env::var("LARQL_FUSED_DOWN")
+                    .map(|v| v != "0")
+                    .unwrap_or(true)
             {
                 // Fused GEGLU+down for small-to-medium intermediate sizes.
                 //

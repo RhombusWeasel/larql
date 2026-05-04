@@ -693,14 +693,16 @@ impl RemoteMoeBackend {
                     }
                 }
                 let t_accum = t0.elapsed().as_secs_f64() * 1000.0;
-                eprintln!(
-                    "[predispatch/multi] route={:.1}ms dispatch={:.1}ms accum={:.1}ms  shards={} wire={}",
-                    t_route,
-                    t_dispatch - t_route,
-                    t_accum - t_dispatch,
-                    num_shards,
-                    if use_q8k { "q8k" } else { "f32" },
-                );
+                if std::env::var("LARQL_VERBOSE").is_ok() {
+                    eprintln!(
+                        "[predispatch/multi] route={:.1}ms dispatch={:.1}ms accum={:.1}ms  shards={} wire={}",
+                        t_route,
+                        t_dispatch - t_route,
+                        t_accum - t_dispatch,
+                        num_shards,
+                        if use_q8k { "q8k" } else { "f32" },
+                    );
+                }
                 // Post-experts norm (caller expects it applied).
                 for (l, h2) in h2_per_layer.iter_mut().enumerate() {
                     if !routers[l].post_experts_norm.is_empty() {

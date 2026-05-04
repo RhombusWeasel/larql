@@ -78,6 +78,24 @@ pub struct BenchArgs {
     #[arg(long, default_value = "streaming", value_name = "streaming|batch")]
     pub ffn_dispatch: String,
 
+    /// Bench the remote MoE expert path (Gemma 4 26B A4B etc.).
+    /// Shard map: `"START-END=URL,START-END=URL,..."`.
+    /// Example: `--moe-shards "0-63=http://a:8081,64-127=http://b:8082"`
+    #[arg(long, value_name = "SHARDS")]
+    pub moe_shards: Option<String>,
+
+    /// Dispatch strategy for --moe-shards.
+    ///   streaming  (default) — one round-trip per layer per token.
+    ///   batch      — all layers in one round-trip per token (approximate).
+    #[arg(long, default_value = "streaming", value_name = "streaming|batch")]
+    pub moe_dispatch: String,
+
+    /// Refinement iterations for `--moe-dispatch batch`.
+    /// 1 = one dispatch + two Metal passes (fast, approximate).
+    /// 2 = two dispatches + three passes (correct answer, ~half the speed).
+    #[arg(long, default_value = "2")]
+    pub moe_predispatch_iters: usize,
+
     /// Print per-stage timing breakdown for each engine (markov-rs only for now).
     #[arg(long)]
     pub profile: bool,
@@ -121,9 +139,10 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let want_cpu = requested_backends.contains(&"cpu");
     let want_engine = args.engine.is_some();
     let want_ffn = args.ffn.is_some();
-    if !want_metal && !want_cpu && args.ollama.is_none() && !want_engine && !want_ffn {
+    let want_moe = args.moe_shards.is_some();
+    if !want_metal && !want_cpu && args.ollama.is_none() && !want_engine && !want_ffn && !want_moe {
         return Err(
-            "no backends selected: pass --backends metal,cpu, --ollama, --engine, or --ffn".into(),
+            "no backends selected: pass --backends metal,cpu, --ollama, --engine, --ffn, or --moe-shards".into(),
         );
     }
 
@@ -269,6 +288,10 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(ref ffn_url) = args.ffn {
         rows.push(run_remote_ffn_bench(&vindex_path, &args, ffn_url)?);
+    }
+
+    if let Some(ref shards_str) = args.moe_shards {
+        rows.push(run_remote_moe_bench(&vindex_path, &args, shards_str)?);
     }
 
     print_table(&rows);
@@ -810,6 +833,138 @@ fn run_remote_ffn_bench(
             ffn_url
         ),
         prefill_ms,
+        avg_decode_ms,
+        tok_per_s,
+        stages: None,
+        ffn_rtt_ms,
+        attn_ms,
+        n_steps: n,
+        note,
+    })
+}
+
+/// Bench the remote MoE expert path. Attention + router run locally; expert
+/// blocks are dispatched to remote shards via `RemoteMoeBackend`.
+///
+/// Reports overall tok/s plus a breakdown:
+///   expert-rtt  — time spent in remote expert dispatch per token
+///   attn+       — remainder = local attn + router + dense FFN
+fn run_remote_moe_bench(
+    vindex_path: &std::path::Path,
+    args: &BenchArgs,
+    shards_str: &str,
+) -> Result<BenchRow, Box<dyn std::error::Error>> {
+    use larql_inference::ffn::moe_remote::{RemoteMoeBackend, ShardConfig};
+    use larql_inference::{generate_with_remote_moe, generate_with_remote_moe_batch};
+
+    // Parse "START-END=URL,..." shard map.
+    let mut configs: Vec<ShardConfig> = Vec::new();
+    for segment in shards_str.split(',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        let mut parts = segment.splitn(2, '=');
+        let range_str = parts
+            .next()
+            .ok_or_else(|| format!("malformed shard segment: {segment:?}"))?;
+        let url = parts
+            .next()
+            .ok_or_else(|| format!("missing URL in shard segment: {segment:?}"))?;
+        let (start, end_incl) = ShardConfig::parse_range(range_str)
+            .ok_or_else(|| format!("bad expert range {range_str:?} in --moe-shards"))?;
+        configs.push(ShardConfig::new(start, end_incl, url));
+    }
+    if configs.is_empty() {
+        return Err("--moe-shards: no valid shard segments".into());
+    }
+
+    let num_shards = configs.len();
+    let backend = larql_compute::default_backend();
+    eprintln!("Connecting to {} MoE shard(s)…", num_shards);
+    let remote = RemoteMoeBackend::connect(configs)
+        .map_err(|e| format!("failed to connect to MoE shards: {e}"))?;
+    eprintln!("  Attention:  {} (local)", backend.name());
+    eprintln!("  Router:     local");
+    eprintln!(
+        "  Experts:    remote  (sharded across {} endpoint{})",
+        num_shards,
+        if num_shards == 1 { "" } else { "s" }
+    );
+
+    let mut cb = larql_vindex::SilentLoadCallbacks;
+    let weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)
+        .map_err(|e| format!("failed to load client weights: {e}"))?;
+    let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)
+        .map_err(|e| format!("failed to load tokenizer: {e}"))?;
+    let mut index = larql_vindex::VectorIndex::load_vindex(vindex_path, &mut cb)
+        .map_err(|e| format!("failed to load vindex: {e}"))?;
+    index.load_attn_q4k(vindex_path)?;
+    index.load_interleaved_q4k(vindex_path)?;
+    let _ = index.load_lm_head_q4(vindex_path);
+
+    let wrapped_prompt =
+        larql_inference::chat::render_user_prompt(vindex_path, weights.arch.family(), &args.prompt)
+            .unwrap_or_else(|_| args.prompt.clone());
+    let prompt_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrapped_prompt)
+        .map_err(|e| format!("tokenise: {e}"))?;
+
+    let eos = larql_inference::layer_graph::generate::eos::EosConfig::from_vindex_dir(vindex_path);
+    let max_tokens = args.warmup + args.tokens;
+    let is_batch = args.moe_dispatch.trim() == "batch";
+    let iters = args.moe_predispatch_iters.max(1);
+
+    // Warmup.
+    let run_once = |n: usize| -> Result<larql_inference::layer_graph::grid::GridGenerateResult, String> {
+        if is_batch {
+            generate_with_remote_moe_batch(
+                &weights, &tokenizer, prompt_ids.clone(), n,
+                &index, &remote, &*backend, &eos, iters,
+            ).map_err(|e| e.to_string())
+        } else {
+            generate_with_remote_moe(
+                &weights, &tokenizer, prompt_ids.clone(), n,
+                &index, &remote, &*backend, &eos,
+            ).map_err(|e| e.to_string())
+        }
+    };
+
+    let _ = run_once(args.warmup.max(1));
+
+    let result = run_once(max_tokens)
+        .map_err(|e| format!("moe bench generate failed: {e}"))?;
+
+    let n_warm = args.warmup.min(result.decode_ms.len());
+    let measured = &result.decode_ms[n_warm..];
+    let measured_ffn = &result.ffn_rtt_ms[n_warm.min(result.ffn_rtt_ms.len())..];
+    let n = measured.len();
+
+    let (avg_decode_ms, tok_per_s, ffn_rtt_ms, attn_ms) = if n == 0 {
+        (0.0, 0.0, None, None)
+    } else {
+        let avg = measured.iter().sum::<f64>() / n as f64;
+        let avg_ffn = if measured_ffn.len() == n {
+            Some(measured_ffn.iter().sum::<f64>() / n as f64)
+        } else {
+            None
+        };
+        let avg_attn = avg_ffn.map(|f| (avg - f).max(0.0));
+        (avg, 1000.0 / avg, avg_ffn, avg_attn)
+    };
+
+    let note = if n < args.tokens {
+        format!("early stop @{}/{}", n, args.tokens)
+    } else {
+        String::new()
+    };
+
+    Ok(BenchRow {
+        backend: format!(
+            "remote-moe-{} ({} shards)",
+            if is_batch { "batch" } else { "stream" },
+            num_shards
+        ),
+        prefill_ms: 0.0,
         avg_decode_ms,
         tok_per_s,
         stages: None,
