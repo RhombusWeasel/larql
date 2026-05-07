@@ -91,6 +91,16 @@ pub struct ParityArgs {
     pub verbose: bool,
 }
 
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+pub fn run(_args: ParityArgs) -> Result<(), Box<dyn std::error::Error>> {
+    Err(
+        "`larql parity` requires the `metal` feature on macOS — Metal is the reference \
+         backend this command compares CPU output against."
+            .into(),
+    )
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn run(args: ParityArgs) -> Result<(), Box<dyn std::error::Error>> {
     if !COMPONENTS.contains(&args.component.as_str()) {
         return Err(format!(
@@ -528,6 +538,7 @@ fn run_moe_block(
 // the full sequence). This is sufficient to locate the first diverging layer
 // but not to compute precise numeric agreement.
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn run_layer_diff(
     path: &std::path::Path,
     config: &larql_vindex::VindexConfig,

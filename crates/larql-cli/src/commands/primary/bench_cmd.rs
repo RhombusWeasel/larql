@@ -354,10 +354,19 @@ fn run_larql(
             .map_err(|e| format!("tokenize: {e}"))?;
 
     let backend: Box<dyn larql_compute::ComputeBackend> = if metal {
-        let b = larql_compute::metal::MetalBackend::new().ok_or(
-            "Metal backend unavailable — rebuild with `--features metal` on an M-series Mac",
-        )?;
-        Box::new(b)
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let b = larql_compute::metal::MetalBackend::new().ok_or(
+                "Metal backend unavailable — rebuild with `--features metal` on an M-series Mac",
+            )?;
+            Box::new(b)
+        }
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        {
+            return Err(
+                "Metal backend requires the `metal` feature on macOS".into(),
+            );
+        }
     } else {
         Box::new(larql_compute::CpuBackend)
     };
