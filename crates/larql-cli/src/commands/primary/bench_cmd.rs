@@ -596,7 +596,7 @@ fn run_engine_q4k(
     backend: Box<dyn larql_inference::ComputeBackend>,
     args: &BenchArgs,
 ) -> Result<BenchRow, Box<dyn std::error::Error>> {
-    use larql_inference::forward::hidden_to_raw_logits;
+    
 
     // We need two backend instances: one owned by the engine, one for Q4K calls.
     let want_metal_q4k = args.backends.contains("metal");
@@ -723,7 +723,7 @@ fn run_remote_ffn_bench(
     let backend = larql_compute::default_backend();
 
     let mut cb = larql_vindex::SilentLoadCallbacks;
-    let mut weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)
+    let weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)
         .map_err(|e| format!("failed to load client weights: {e}"))?;
     let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)
         .map_err(|e| format!("failed to load tokenizer: {e}"))?;

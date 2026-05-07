@@ -20,9 +20,7 @@ use larql_compute::cpu::ops::moe::{cpu_moe_forward, run_single_expert_with_norm}
 use larql_compute::cpu::ops::q4_common::dequantize_q4_k;
 use larql_compute::{Activation, MoeLayerWeights, QuantFormat};
 use larql_models::weights::{per_layer_ffn_key, PER_LAYER_FFN_DOWN, PER_LAYER_FFN_GATE_UP};
-use larql_vindex::{load_model_weights_q4k, load_vindex_config, SilentLoadCallbacks};
 
-use crate::commands::primary::cache;
 
 // ── Component / backend taxonomies ────────────────────────────────────────────
 
