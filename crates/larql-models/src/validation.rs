@@ -389,7 +389,7 @@ fn validate_per_layer_overrides<A: ModelArchitecture + ?Sized>(
 
 fn validate_one_layer<A: ModelArchitecture + ?Sized>(
     arch: &A,
-    cfg: &ModelConfig,
+    _cfg: &ModelConfig,
     layer: usize,
     errors: &mut Vec<ConfigValidationError>,
 ) -> bool {
