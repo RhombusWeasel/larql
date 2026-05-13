@@ -25,7 +25,7 @@
 //! |---------|---------|------------|
 //! | CPU | (always) | BLAS f32, C kernel Q4 (ARM vdotq_s32), vector ops |
 //! | Metal | `metal` | Tiled f32, simdgroup Q4, multi-layer pipeline |
-//! | CUDA | (planned) | — |
+//! | CUDA | `cuda` | NVRTC-compiled kernels, warp-shuffled Q4, multi-layer pipeline |
 //!
 //! ## Quick start
 //!
@@ -55,7 +55,8 @@
 //!
 //! - `metal`: Metal GPU backend (macOS only). Adds optimised Q4 shaders,
 //!   multi-layer pipeline, zero-copy mmap buffers.
-//! - `cuda`: (planned) CUDA GPU backend.
+//! - `cuda`: CUDA GPU backend (Linux/Windows, requires NVIDIA GPU). Compiles
+//!   kernels at startup via NVRTC; falls back to CPU if CUDA is unavailable.
 
 extern crate blas_src;
 
@@ -65,6 +66,9 @@ pub mod pipeline;
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
+
+#[cfg(all(feature = "cuda", not(target_os = "macos")))]
+pub mod cuda;
 
 // ── Re-exports: pipeline types ──
 
@@ -110,6 +114,11 @@ pub use metal::{MetalBackend, MoeScratch};
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use ::metal::Buffer as MetalBuffer;
 
+/// Re-export of the cudarc `CudaSlice` type so downstream crates can hold
+/// cached GPU buffers without taking a direct dependency on `cudarc`.
+#[cfg(all(feature = "cuda", not(target_os = "macos")))]
+pub use cudarc::driver::CudaSlice;
+
 /// Create the best available backend.
 ///
 /// With `--features metal`: tries Metal GPU first, auto-calibrates the
@@ -129,6 +138,14 @@ pub fn default_backend() -> Box<dyn ComputeBackend> {
             return Box::new(m);
         }
         eprintln!("[compute] Metal not available, falling back to CPU");
+    }
+    #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+    {
+        if let Some(c) = cuda::CudaBackend::new() {
+            c.calibrate();
+            return Box::new(c);
+        }
+        eprintln!("[compute] CUDA not available, falling back to CPU");
     }
     Box::new(cpu::CpuBackend)
 }

@@ -18,7 +18,14 @@ impl VectorIndex {
     pub fn load_attn_q8(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
         let path = dir.join(ATTN_WEIGHTS_Q8_BIN);
         if !path.exists() {
-            return Err(VindexError::Parse("attn_weights_q8.bin not found".into()));
+            return Err(VindexError::Parse(format!(
+                "{} not found in vindex. \
+                 This vindex appears to be missing attention weights, which are required for inference. \
+                 The vindex may have been built with extract_level=browse (KNN-only) or needs to be re-extracted with attention weights. \
+                 For local extraction, use `larql extract <model> --level attention` (or `--level inference` for full weights). \
+                 If you downloaded this vindex from HuggingFace, ensure it was published with all required weight files.",
+                ATTN_WEIGHTS_Q8_BIN
+            )));
         }
         let file = std::fs::File::open(&path)?;
         let mmap = unsafe { mmap_optimized(&file)? };
@@ -74,7 +81,14 @@ impl VectorIndex {
     pub fn load_attn_q4k(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
         let path = dir.join(ATTN_WEIGHTS_Q4K_BIN);
         if !path.exists() {
-            return Err(VindexError::Parse("attn_weights_q4k.bin not found".into()));
+            return Err(VindexError::Parse(format!(
+                "{} not found in vindex. \
+                 This vindex appears to be missing attention weights, which are required for inference. \
+                 The vindex may have been built with extract_level=browse (KNN-only) or needs to be re-extracted with attention weights. \
+                 For local extraction, use `larql extract <model> --level attention` (or `--level inference` for full weights). \
+                 If you downloaded this vindex from HuggingFace, ensure it was published with all required weight files.",
+                ATTN_WEIGHTS_Q4K_BIN
+            )));
         }
         let file = std::fs::File::open(&path)?;
         let mmap = unsafe { mmap_optimized(&file)? };

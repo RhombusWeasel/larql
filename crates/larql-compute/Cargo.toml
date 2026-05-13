@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Compute backends for LARQL — CPU (BLAS), Metal (GPU), CUDA (planned). Owns matmul dispatch, Q4 kernels, buffer management."
+description = "Compute backends for LARQL — CPU (BLAS), Metal (GPU), CUDA (GPU). Owns matmul dispatch, Q4 kernels, buffer management."
 keywords = ["matmul", "metal", "gpu", "quantization", "blas"]
 categories = ["science"]
 
@@ -38,10 +38,18 @@ openblas-src = { version = "0.10", features = ["system"] }
 [features]
 default = []
 metal = ["dep:metal", "dep:objc"]
-# cuda = []  # Future: CUDA backend
+cuda = ["dep:cudarc"]
 
 [build-dependencies]
 cc = "1.0"
+
+# CUDA GPU (non-macOS, optional)
+# cudarc requires a CUDA version feature flag. cuda-13020 = CUDA 13.2.
+# For build convenience, we propagate the feature so `--features cuda` works.
+# Users on other CUDA versions can override with e.g.
+#   cargo build --features "cuda,cudarc/cuda-12080"
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+cudarc = { version = "0.19", optional = true, features = ["cuda-13020"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -71,7 +71,11 @@ pub fn open_inference_vindex(path: &Path) -> Result<VectorIndex, InferenceError>
     } else {
         return Err(InferenceError::Vindex(VindexError::Parse(format!(
             "no attention weights in vindex {path:?} \
-             (looked for {ATTN_Q4K_BIN}, {ATTN_Q8_BIN})"
+             (looked for {ATTN_Q4K_BIN}, {ATTN_Q8_BIN}). \
+             This vindex appears to be missing attention weights, which are required for inference. \
+             The vindex may have been built with extract_level=browse (KNN-only) or needs to be re-extracted with attention weights. \
+             For local extraction, use `larql extract <model> --level attention` (or `--level inference` for full weights). \
+             If you downloaded this vindex from HuggingFace, ensure it was published with all required weight files."
         ))));
     }
 
@@ -83,7 +87,11 @@ pub fn open_inference_vindex(path: &Path) -> Result<VectorIndex, InferenceError>
     } else {
         return Err(InferenceError::Vindex(VindexError::Parse(format!(
             "no FFN weights in vindex {path:?} \
-             (looked for {INTERLEAVED_Q4K_BIN}, {INTERLEAVED_Q4_BIN})"
+             (looked for {INTERLEAVED_Q4K_BIN}, {INTERLEAVED_Q4_BIN}). \
+             This vindex appears to be missing FFN weights, which are required for inference. \
+             The vindex may have been built with extract_level=browse (KNN-only) or attention-only. \
+             For local extraction, use `larql extract <model> --level inference` (or `--level all` for complete weights). \
+             If you downloaded this vindex from HuggingFace, ensure it was published with all required weight files."
         ))));
     }
 

@@ -95,6 +95,11 @@ pub fn predict_q4k_metal(
         h_vec = out;
     }
 
+    // Dump h_1d for comparison (do it BEFORE moving h_vec into Array2)
+    if let Ok(dir) = std::env::var("LARQL_CUDA_DUMP_LAYERS") {
+        let bytes: Vec<u8> = h_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _ = std::fs::write(format!("{dir}/cuda_h_before_final_norm.f32"), &bytes);
+    }
     let h_last = ndarray::Array2::from_shape_vec((1, hidden), h_vec).expect("residual shape");
     crate::forward::predict::logits_to_predictions_pub(weights, &h_last, tokenizer, top_k, 1.0)
 }

@@ -15,6 +15,13 @@ pub fn predict_q4k(
     index: &VectorIndex,
 ) -> PredictResult {
     let h = predict_q4k_hidden(weights, token_ids, index, None);
+    // Dump last position's hidden state for comparison
+    if let Ok(dir) = std::env::var("LARQL_CPU_DUMP_LAYERS") {
+        let last_row = h.row(h.shape()[0] - 1);
+        let slice = last_row.as_slice().unwrap_or(&[]);
+        let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _ = std::fs::write(format!("{dir}/cpu_h_before_final_norm.f32"), &bytes);
+    }
     crate::forward::predict::logits_to_predictions_pub(weights, &h, tokenizer, top_k, 1.0)
 }
 

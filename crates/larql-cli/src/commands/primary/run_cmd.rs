@@ -134,6 +134,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub metal: bool,
 
+    /// Use CUDA GPU backend for Q4K inference (Linux/Windows with NVIDIA GPU).
+    #[arg(long)]
+    pub cuda: bool,
+
     /// Verbose load / timing output.
     #[arg(short, long)]
     pub verbose: bool,
@@ -358,6 +362,7 @@ fn build_walk_args(
         down_top_k: 5,
         verbose: args.verbose,
         metal: args.metal,
+        cuda: args.cuda,
         ffn_remote: args.ffn.clone(),
         ffn_remote_timeout_secs: args.ffn_timeout_secs,
         ffn_dispatch: args.ffn_dispatch.clone(),
@@ -665,7 +670,9 @@ mod experts {
     enum Strategy {
         /// Q4_K vindex + Metal backend. KV-cached decode via `layer_graph::generate`.
         MetalQ4K,
-        /// Q4_K vindex, no Metal. Loops `predict_q4k` per token (O(N²)).
+        /// Q4_K vindex + CUDA backend. KV-cached decode via `layer_graph::generate`.
+        CudaQ4K,
+        /// Q4_K vindex, no GPU. Loops `predict_q4k` per token (O(N²)).
         CpuQ4K,
         /// Non-quantised vindex. CPU `generate_cached` with full f32 weights.
         CpuF32,
@@ -675,6 +682,7 @@ mod experts {
         fn name(&self) -> &'static str {
             match self {
                 Self::MetalQ4K => "metal-q4k",
+                Self::CudaQ4K => "cuda-q4k",
                 Self::CpuQ4K => "cpu-q4k",
                 Self::CpuF32 => "cpu-f32",
             }
@@ -725,8 +733,8 @@ mod experts {
             .map_err(|e| format!("tokenize: {e}"))?;
 
             let text = match self.strategy {
-                Strategy::MetalQ4K => {
-                    let q4_index = self.q4_index.as_ref().expect("metal-q4k needs q4_index");
+                Strategy::MetalQ4K | Strategy::CudaQ4K => {
+                    let q4_index = self.q4_index.as_ref().expect("gpu-q4k needs q4_index");
                     let backend = larql_compute::default_backend();
                     let cached_layers =
                         larql_inference::layer_graph::CachedLayerGraph::from_residuals(Vec::new());
@@ -904,12 +912,26 @@ mod experts {
         want_metal && larql_compute::default_backend().has_q4()
     }
 
+    /// Whether the active compute backend can serve Q4 work-sets via CUDA.
+    /// Wraps the impure `default_backend()` call so [`pick_strategy`] stays pure.
+    fn cuda_ready_for_q4(want_cuda: bool) -> bool {
+        want_cuda && larql_compute::default_backend().has_q4()
+    }
+
     /// Pure strategy selector: given the vindex quant format and whether
-    /// Metal is available + requested, pick a decode strategy.
-    fn pick_strategy(quant: larql_vindex::QuantFormat, metal_ready: bool) -> Strategy {
-        match (quant, metal_ready) {
-            (larql_vindex::QuantFormat::Q4K, true) => Strategy::MetalQ4K,
-            (larql_vindex::QuantFormat::Q4K, false) => Strategy::CpuQ4K,
+    /// Metal/CUDA is available + requested, pick a decode strategy.
+    /// Priority: CUDA > Metal > CPU (first available wins).
+    fn pick_strategy(quant: larql_vindex::QuantFormat, metal_ready: bool, cuda_ready: bool) -> Strategy {
+        match quant {
+            larql_vindex::QuantFormat::Q4K => {
+                if cuda_ready {
+                    Strategy::CudaQ4K
+                } else if metal_ready {
+                    Strategy::MetalQ4K
+                } else {
+                    Strategy::CpuQ4K
+                }
+            }
             _ => Strategy::CpuF32,
         }
     }
@@ -918,19 +940,20 @@ mod experts {
     fn load_runtime(vindex_path: &Path, args: &RunArgs) -> Result<Runtime, BoxErr> {
         let mut cb = SilentLoadCallbacks;
         let cfg = larql_vindex::load_vindex_config(vindex_path)?;
-        let strategy = pick_strategy(cfg.quant, metal_ready_for_q4(args.metal));
+        let strategy = pick_strategy(cfg.quant, metal_ready_for_q4(args.metal), cuda_ready_for_q4(args.cuda));
 
         if args.verbose {
             eprintln!(
-                "strategy: {} (quant={:?}, metal_requested={})",
+                "strategy: {} (quant={:?}, metal_requested={}, cuda_requested={})",
                 strategy.name(),
                 cfg.quant,
-                args.metal
+                args.metal,
+                args.cuda
             );
         }
 
         let (weights, q4_index) = match strategy {
-            Strategy::MetalQ4K | Strategy::CpuQ4K => {
+            Strategy::MetalQ4K | Strategy::CudaQ4K | Strategy::CpuQ4K => {
                 let weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)?;
                 let mut idx = VectorIndex::load_vindex(vindex_path, &mut cb)?;
                 idx.load_attn_q4k(vindex_path)?;
@@ -1099,34 +1122,53 @@ mod experts {
         // ── pick_strategy ──────────────────────────────────────────────────
 
         #[test]
-        fn pick_strategy_q4k_with_metal_picks_metal() {
+        fn pick_strategy_q4k_with_cuda_picks_cuda() {
+            // CUDA takes priority when available
             assert!(matches!(
-                pick_strategy(QuantFormat::Q4K, true),
+                pick_strategy(QuantFormat::Q4K, false, true),
+                Strategy::CudaQ4K
+            ));
+        }
+
+        #[test]
+        fn pick_strategy_q4k_with_metal_picks_metal() {
+            // Metal used when CUDA not available
+            assert!(matches!(
+                pick_strategy(QuantFormat::Q4K, true, false),
                 Strategy::MetalQ4K
             ));
         }
 
         #[test]
-        fn pick_strategy_q4k_without_metal_picks_cpu_q4k() {
+        fn pick_strategy_q4k_cuda_over_metal() {
+            // CUDA takes priority over Metal
             assert!(matches!(
-                pick_strategy(QuantFormat::Q4K, false),
+                pick_strategy(QuantFormat::Q4K, true, true),
+                Strategy::CudaQ4K
+            ));
+        }
+
+        #[test]
+        fn pick_strategy_q4k_without_gpu_picks_cpu_q4k() {
+            assert!(matches!(
+                pick_strategy(QuantFormat::Q4K, false, false),
                 Strategy::CpuQ4K
             ));
         }
 
         #[test]
-        fn pick_strategy_non_q4k_with_metal_falls_back_to_f32() {
-            // Metal can't help with non-Q4K weights — backend has no f32 path.
+        fn pick_strategy_non_q4k_with_gpu_falls_back_to_f32() {
+            // GPU backends can't help with non-Q4K weights — no f32 GPU path.
             assert!(matches!(
-                pick_strategy(QuantFormat::None, true),
+                pick_strategy(QuantFormat::None, true, true),
                 Strategy::CpuF32
             ));
         }
 
         #[test]
-        fn pick_strategy_non_q4k_without_metal_picks_cpu_f32() {
+        fn pick_strategy_non_q4k_without_gpu_picks_cpu_f32() {
             assert!(matches!(
-                pick_strategy(QuantFormat::None, false),
+                pick_strategy(QuantFormat::None, false, false),
                 Strategy::CpuF32
             ));
         }

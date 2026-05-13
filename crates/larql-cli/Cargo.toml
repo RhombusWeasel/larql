@@ -32,11 +32,17 @@ minijinja = "2"
 libc = "0.2"
 
 [features]
-default = ["metal"]
+# No default GPU backend — user must choose --metal (macOS) or --cuda (Linux/Windows)
+default = []
 metal = [
     "larql-compute/metal",
     "larql-inference/metal",
     "larql-vindex/metal",
+]
+cuda = [
+    "larql-compute/cuda",
+    "larql-inference/cuda",
+    "larql-vindex/cuda",
 ]
 
 [dev-dependencies]

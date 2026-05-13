@@ -56,11 +56,11 @@ pub struct WalkArgs {
     #[arg(long)]
     pub down_vectors: Option<PathBuf>,
 
-    /// Top-K features per layer for the gate KNN. Default: unlimited
-    /// (`usize::MAX`) — matches the server's `WalkFfn::new_unlimited`
-    /// behavior and sidesteps quality drift on stale/low-K vindexes.
-    /// Pass an explicit `N` to cap for speed/memory trade-offs.
-    #[arg(short = 'k', long, default_value_t = usize::MAX)]
+    /// Top-K features per layer for the gate KNN. Default: 10.
+    /// Lower values are faster but may miss important features; higher
+    /// values give more complete coverage at the cost of memory/time.
+    /// Use `-k 0` to disable the top-K filter entirely (returns all features).
+    #[arg(short = 'k', long, default_value_t = 10)]
     pub top_k: usize,
 
     /// Layers to walk. Comma-separated or range (e.g., "26,27,28" or "24-33").
@@ -110,6 +110,14 @@ pub struct WalkArgs {
     /// build with `--features metal` on an M-series Mac.
     #[arg(long)]
     pub metal: bool,
+
+    /// Run autoregressive generation through the CUDA Q4K pipeline:
+    /// fused `full_pipeline_q4` prefill + `decode_token` KV-cached decode.
+    /// Works for pre-norm (Llama, Mistral) and post-norm + QK-norm
+    /// (Gemma 3, Gemma 4) architectures. Requires a Q4K vindex and a
+    /// build with `--features cuda` on Linux/Windows with NVIDIA GPU.
+    #[arg(long)]
+    pub cuda: bool,
 
     /// Route the FFN to a remote `larql-server` via `POST /v1/walk-ffn`
     /// (with `full_output: true`). Attention still runs locally; the FFN
@@ -503,27 +511,38 @@ fn run_predict_q4k(
     q4_index.load_interleaved_q4k(vindex_path)?;
     let _ = q4_index.load_lm_head_q4(vindex_path);
 
-    // Metal Q4K path (`--metal`) routes autoregressive generation through the
+    // GPU Q4K path (`--metal` or `--cuda`) routes autoregressive generation through the
     // fused `full_pipeline_q4` prefill + `decode_token` KV-cached decode in
     // `layer_graph::generate`. Works for pre-norm (Llama/Mistral) and
     // post-norm + QK-norm (Gemma 3/4) architectures. CPU path below is the
-    // fallback for when the backend is absent or for diffing.
-    let start = Instant::now();
+    // fallback for when no GPU backend is available.
+    // Priority: CUDA > Metal > CPU (first available wins).
+    let _start = Instant::now();
+    let use_gpu = args.metal || args.cuda;
 
     // Autoregressive multi-token generation. For Q4K on CPU, we build
     // a per-layer CPU FfnBackend-compatible view and loop via the
-    // generic `generate_stream`. Metal shader autoregressive generation
+    // generic `generate_stream`. GPU shader autoregressive generation
     // is a separate path (see `larql-inference/src/layer_graph/generate.rs`)
-    // and is wired to `--metal`; that path is KV-cached and much faster.
-    if args.max_tokens > 1 && !args.metal {
+    // and is wired to `--metal`/`--cuda`; that path is KV-cached and much faster.
+    if args.max_tokens > 1 && !use_gpu {
         // CPU Q4K autoregressive: per-step, dequantise layer weights
         // just-in-time (`predict_q4k` does this internally) and loop.
-        // Not token-cached, so O(N²) but correct. For speed use --metal.
+        // Not token-cached, so O(N²) but correct. For speed use --metal/--cuda.
         return run_q4k_generate_cpu(weights, tokenizer, &token_ids, args, &q4_index);
     }
 
-    let result = if args.metal {
-        let backend = larql_compute::default_backend();
+    // Try the requested GPU backend (CUDA first, then Metal)
+    let backend = larql_compute::default_backend();
+    if args.cuda {
+        if !backend.has_q4() {
+            return Err(
+                "CUDA backend unavailable — rebuild with `--features cuda` \
+                and run on a machine with NVIDIA GPU."
+                    .into(),
+            );
+        }
+    } else if args.metal {
         if !backend.has_q4() {
             return Err(
                 "Metal backend unavailable — rebuild with `--features metal` \
@@ -531,12 +550,15 @@ fn run_predict_q4k(
                     .into(),
             );
         }
+    }
+
+    if use_gpu {
         vlog!(
             verbose,
-            "Backend: {} (Metal Q4K prefill + KV-cached decode)",
+            "Backend: {} (GPU Q4K prefill + KV-cached decode)",
             backend.name()
         );
-        // --metal + --max-tokens > 1: route to the existing shader
+        // --metal/--cuda + --max-tokens > 1: route to the existing shader
         // autoregressive generate() in `larql-inference/src/layer_graph`
         // (GPU prefill + KV-cached decode). That function returns its
         // own tokens list; we stream them and exit.
@@ -571,33 +593,28 @@ fn run_predict_q4k(
             }
             return Ok(());
         }
-        larql_inference::vindex::predict_q4k_metal(
+        let result = larql_inference::vindex::predict_q4k_metal(
             weights,
             tokenizer,
             &token_ids,
             args.predict_top_k,
             &q4_index,
             &*backend,
-        )
+        );
+        print_predictions("walk (q4k)", &result.predictions, verbose);
+        Ok(())
     } else {
         vlog!(verbose, "Backend: CPU (Accelerate + dequantise-per-layer)");
-        larql_inference::vindex::predict_q4k(
+        let result = larql_inference::vindex::predict_q4k(
             weights,
             tokenizer,
             &token_ids,
             args.predict_top_k,
             &q4_index,
-        )
-    };
-    vlog!(
-        verbose,
-        "Q4 forward pass: {:.2}s",
-        start.elapsed().as_secs_f64()
-    );
-
-    print_predictions("walk (q4k)", &result.predictions, verbose);
-
-    Ok(())
+        );
+        print_predictions("walk (q4k)", &result.predictions, verbose);
+        Ok(())
+    }
 }
 
 /// Q4_K + remote FFN: local attention (dequant per layer), FFN over HTTP.

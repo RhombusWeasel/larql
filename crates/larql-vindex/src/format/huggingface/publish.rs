@@ -244,31 +244,117 @@ impl PublishCallbacks for SilentPublishCallbacks {}
 // ═══════════════════════════════════════════════════════════════
 
 pub(super) fn get_hf_token() -> Result<String, VindexError> {
-    // Try environment variable first
+    // Try environment variables first. HF_TOKEN is the canonical name;
+    // HF_HUB_TOKEN is recognised by the Python huggingface_hub library too.
     if let Ok(token) = std::env::var("HF_TOKEN") {
         return Ok(token);
     }
+    if let Ok(token) = std::env::var("HF_HUB_TOKEN") {
+        return Ok(token);
+    }
 
-    // Try token file
+    // Try token files — both the legacy and the modern XDG-style locations
+    // that `huggingface-cli login` uses depending on version.
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let token_path = PathBuf::from(&home).join(".huggingface").join("token");
     if token_path.exists() {
         let token = std::fs::read_to_string(&token_path)?;
-        return Ok(token.trim().to_string());
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Ok(token);
+        }
     }
 
-    // Try newer cache location
     let token_path = PathBuf::from(&home)
         .join(".cache")
         .join("huggingface")
         .join("token");
     if token_path.exists() {
         let token = std::fs::read_to_string(&token_path)?;
-        return Ok(token.trim().to_string());
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+
+    // Fall back to git credential helper. The Python `huggingface_hub` library
+    // does this too — users who ran `huggingface-cli login` with the
+    // "login with git credential store" option will have their token here
+    // rather than in a flat file.
+    if let Ok(token) = git_credential_hf() {
+        return Ok(token);
     }
 
     Err(VindexError::Parse(
-        "HuggingFace token not found. Set HF_TOKEN or run `huggingface-cli login`.".into(),
+        "HuggingFace token not found. Set HF_TOKEN, run `huggingface-cli login`, \
+         or configure a git credential helper for huggingface.co.".into(),
+    ))
+}
+
+/// Ask git for a stored credential for huggingface.co.
+///
+/// The user may have run `huggingface-cli login` with the "login with git
+/// credential store" option, which stores the token in whatever git
+/// credential helper is configured (e.g. `credential-store`, `osxkeychain`,
+/// or a custom helper). We invoke `git credential fill` with the partial
+/// protocol/host and read back the `password` field, which the Python
+/// `huggingface_hub` library treats as the HF token.
+///
+/// Returns `Err` if git is not available, the credential helper doesn't
+/// have a match, or the output can't be parsed — the caller just falls
+/// back to the next token source.
+#[cfg(target_family = "unix")]
+fn git_credential_hf() -> Result<String, VindexError> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .arg("credential")
+        .arg("fill")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| VindexError::Parse(format!("git credential fill failed: {e}")))?;
+
+    // Send the partial query — protocol + host is enough for git to
+    // look up the credential.
+    {
+        let stdin = child.stdin.as_mut().ok_or_else(|| {
+            VindexError::Parse("git credential fill: couldn't open stdin".into())
+        })?;
+        write!(stdin, "protocol=https\nhost=huggingface.co\n\n")
+            .map_err(|e| VindexError::Parse(format!("git credential fill: write error: {e}")))?;
+    }
+
+    let output = child.wait_with_output()
+        .map_err(|e| VindexError::Parse(format!("git credential fill: {e}")))?;
+
+    if !output.status.success() {
+        return Err(VindexError::Parse(
+            "git credential fill: no credential found for huggingface.co".into(),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(value) = line.strip_prefix("password=") {
+            let token = value.trim().to_string();
+            if !token.is_empty() {
+                return Ok(token);
+            }
+        }
+    }
+
+    Err(VindexError::Parse(
+        "git credential fill: no password field in output".into(),
+    ))
+}
+
+#[cfg(not(target_family = "unix"))]
+fn git_credential_hf() -> Result<String, VindexError> {
+    // Windows git-credential-manager handles this differently;
+    // fall back to file/env sources only.
+    Err(VindexError::Parse(
+        "git credential helper not supported on this platform".into(),
     ))
 }
 

@@ -6,7 +6,7 @@
 //! 1. **HuggingFace hub cache** — `~/.cache/huggingface/hub/`, populated
 //!    by `larql pull` (and by `hf-hub` transitively). Layout:
 //!    ```
-//!    datasets--<owner>--<name>/snapshots/<sha>/{index.json,…}
+//!    {models|datasets}--<owner>--<name>/snapshots/<sha>/{index.json,…}
 //!    ```
 //! 2. **LARQL local cache** — `~/.cache/larql/local/`, populated by
 //!    `larql link <path>`. Each entry is a symlink (or directory) named
@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 /// Which cache an entry came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheSource {
-    /// `~/.cache/huggingface/hub/datasets--<owner>--<name>/`
+    /// `~/.cache/huggingface/hub/{models|datasets}--<owner>--<name>/`
     HuggingFace,
     /// `~/.cache/larql/local/<name>.vindex/`
     Local,
@@ -121,10 +121,15 @@ pub fn scan_hf_hub_at(hub: &Path) -> Result<Vec<CachedVindex>, Box<dyn std::erro
     for entry in std::fs::read_dir(hub)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with("datasets--") {
-            continue;
-        }
-        let repo = name.trim_start_matches("datasets--").replacen("--", "/", 1);
+        // HF hub cache entries are `{type}--{owner}--{name}/`, e.g.
+        // `models--chrishayuk--gemma-3-4b-it-vindex/` or
+        // `datasets--owner--name/`.  Vindex repos can be either type
+        // (the publish default is model), so accept both.
+        let (prefix, rest) = match name.split_once("--") {
+            Some((p, r)) if p == "models" || p == "datasets" => (p, r),
+            _ => continue,
+        };
+        let repo = rest.replacen("--", "/", 1);
         let snapshots = entry.path().join("snapshots");
         if !snapshots.is_dir() {
             continue;
@@ -353,7 +358,8 @@ mod tests {
     fn build_fake_hub(root: &Path, repos: &[&str]) {
         for repo in repos {
             let (owner, name) = repo.split_once('/').expect("owner/name");
-            let dir = root.join(format!("datasets--{owner}--{name}/snapshots/abc123"));
+            // Default to "models" — matches the publish default.
+            let dir = root.join(format!("models--{owner}--{name}/snapshots/abc123"));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join(INDEX_JSON), b"{}").unwrap();
             std::fs::write(dir.join("stub.bin"), vec![0u8; 1024]).unwrap();
@@ -393,7 +399,7 @@ mod tests {
     #[test]
     fn scan_skips_snapshots_without_index_json() {
         let tmp = tempfile::tempdir().unwrap();
-        let bare = tmp.path().join("datasets--foo--bar/snapshots/deadbeef");
+        let bare = tmp.path().join("models--foo--bar/snapshots/deadbeef");
         std::fs::create_dir_all(&bare).unwrap();
         std::fs::write(bare.join("not-a-vindex.txt"), b"hi").unwrap();
         let out = scan_hf_hub_at(tmp.path()).unwrap();

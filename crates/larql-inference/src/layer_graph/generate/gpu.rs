@@ -554,6 +554,12 @@ where
             crate::forward::apply_norm(weights, &h, weights.arch.final_norm_key(), norm_offset);
         h_final.row(seq_len - 1).to_owned()
     };
+    // Dump h_1d for comparison with CPU path
+    if let Ok(dir) = std::env::var("LARQL_CUDA_DUMP_LAYERS") {
+        let slice = h_1d.as_slice().unwrap_or(&[]);
+        let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _ = std::fs::write(format!("{dir}/cuda_h_1d.f32"), &bytes);
+    }
 
     // CPU-vs-Metal comparison mode (LARQL_METAL_COMPARE_CPU=1). Runs the
     // known-correct `predict_q4k` CPU path on the same prompt and diffs
